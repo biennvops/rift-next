@@ -166,6 +166,7 @@ struct BenchArgs {
 
 struct ServerContext {
     identity: NodeIdentity,
+    endpoint: Endpoint,
     device_name: String,
     platform: String,
     receive_dir: PathBuf,
@@ -226,6 +227,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
     })?;
     let context = Arc::new(ServerContext {
         identity,
+        endpoint: endpoint.clone(),
         device_name: args.endpoint.device_name.clone(),
         platform: args.endpoint.platform_name(),
         receive_dir,
@@ -340,6 +342,28 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                     "connection lost"
                 );
                 break;
+            }
+            message = protocol::read_value::<_, ControlMessage>(&mut control.recv) => {
+                match message {
+                    Ok(ControlMessage::Ping { nonce }) => {
+                        context.endpoint.network_change().await;
+                        let pong = ControlMessage::Pong { nonce };
+                        debug!(message = ?pong, "control message sent");
+                        protocol::write_value(&mut control.send, &pong)
+                            .await
+                            .context("unable to send ping response")?;
+                    }
+                    Ok(ControlMessage::Pong { nonce }) => {
+                        debug!(nonce, "unexpected pong received on server control stream");
+                    }
+                    Ok(message) => {
+                        debug!(message = ?message, "unhandled control message received");
+                    }
+                    Err(error) => {
+                        debug!(error = ?error, "control stream closed");
+                        break;
+                    }
+                }
             }
             result = connection.accept_uni() => {
                 let mut recv = result.context("unable to accept binary stream")?;
@@ -533,32 +557,33 @@ async fn fault_inject(args: FaultInjectArgs) -> Result<()> {
     info!("cutting the direct UDP path while the connection is live");
     proxy.cut();
     endpoint.network_change().await;
-    network::wait_for_selected_path(
-        &connection,
-        true,
-        Duration::from_secs(args.recovery_timeout_secs),
-    )
-    .await
-    .context("fault-injection connection did not recover over relay")?;
-    let mut probe = time::timeout(CONTROL_TIMEOUT, connection.open_uni())
+    let recovery_timeout = Duration::from_secs(args.recovery_timeout_secs);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let ping = ControlMessage::Ping { nonce };
+    protocol::write_value(&mut control.send, &ping)
         .await
-        .context("timed out opening post-recovery probe stream")?
-        .context("unable to open post-recovery probe stream")?;
-    time::timeout(CONTROL_TIMEOUT, async {
-        probe
-            .write_all(b"rift fault-injection recovery probe")
-            .await
-            .context("unable to write post-recovery probe")?;
-        probe
-            .finish()
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .context("unable to finish post-recovery probe")?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("post-recovery probe timed out")??;
+        .context("unable to send post-recovery ping")?;
+    let path_recovery = network::wait_for_selected_path(&connection, true, recovery_timeout);
+    let pong = time::timeout(recovery_timeout, protocol::read_value(&mut control.recv));
+    let (path_result, pong_result) = tokio::join!(path_recovery, pong);
+    path_result.context("fault-injection connection did not recover over relay")?;
+    let response: ControlMessage = pong_result
+        .context("timed out waiting for post-recovery pong")?
+        .context("unable to read post-recovery pong")?;
+    let ControlMessage::Pong {
+        nonce: response_nonce,
+    } = response
+    else {
+        bail!("expected Pong after fault-injection recovery, received {response:?}");
+    };
+    if response_nonce != nonce {
+        bail!("post-recovery pong nonce mismatch: expected {nonce}, received {response_nonce}");
+    }
     info!(
         remote_node_id = %connection.remote_id(),
+        nonce,
         "fault-injection connection remained usable after direct path loss"
     );
     if let Err(error) = control.send.finish() {

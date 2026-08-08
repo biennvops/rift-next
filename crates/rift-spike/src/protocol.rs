@@ -33,6 +33,12 @@ pub enum ControlMessage {
         byte_len: u64,
         blake3: [u8; 32],
     },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +316,18 @@ mod tests {
             .await
             .map_err(|error| FrameError::Payload(std::io::Error::other(error.to_string())))??;
         assert_eq!(received, sample_message());
+        Ok(())
+    }
+
+    #[test]
+    fn ping_and_pong_round_trip_through_control_framing() -> Result<(), FrameError> {
+        for message in [
+            ControlMessage::Ping { nonce: 7 },
+            ControlMessage::Pong { nonce: 7 },
+        ] {
+            let encoded = encode_message(&message)?;
+            assert_eq!(decode_message(&encoded)?, message);
+        }
         Ok(())
     }
 

@@ -213,6 +213,14 @@ async fn relay_only_endpoints_establish_an_authenticated_control_connection() ->
             ready_tx
                 .send(())
                 .map_err(|_| anyhow::anyhow!("relay sender dropped ready signal"))?;
+            let message: ControlMessage =
+                time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control.recv))
+                    .await
+                    .context("relay Ping timed out")??;
+            let ControlMessage::Ping { nonce } = message else {
+                anyhow::bail!("relay receiver expected Ping, received {message:?}");
+            };
+            protocol::write_value(&mut control.send, &ControlMessage::Pong { nonce }).await?;
             done_rx
                 .await
                 .map_err(|_| anyhow::anyhow!("relay sender dropped completion signal"))?;
@@ -245,6 +253,12 @@ async fn relay_only_endpoints_establish_an_authenticated_control_connection() ->
         ready_rx
             .await
             .map_err(|_| anyhow::anyhow!("relay receiver dropped ready signal"))?;
+        protocol::write_value(&mut control.send, &ControlMessage::Ping { nonce: 7 }).await?;
+        let response: ControlMessage =
+            time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control.recv))
+                .await
+                .context("relay Pong timed out")??;
+        assert_eq!(response, ControlMessage::Pong { nonce: 7 });
         done_tx
             .send(())
             .map_err(|_| anyhow::anyhow!("relay receiver dropped completion signal"))?;
