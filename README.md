@@ -14,6 +14,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+GitHub Actions runs these same three commands for every push and pull request. The repository pins Rust `1.91.0` in `rust-toolchain.toml`, and the Iroh dependencies are exact `1.0.3` requirements.
+
 The workspace contains the main executable and a local relay helper:
 
 ```text
@@ -90,6 +92,7 @@ cargo run -p rift-spike -- run \
   --data-dir /tmp/rift-relay-b \
   --relay-mode disabled \
   --relay-url 'https://127.0.0.1:54321/' \
+  --insecure-relay-tls \
   --relay-only \
   --device-name "Relay Node B"
 ```
@@ -101,12 +104,13 @@ cargo run -p rift-spike -- send \
   --data-dir /tmp/rift-relay-a \
   --relay-mode disabled \
   --relay-url 'https://127.0.0.1:54321/' \
+  --insecure-relay-tls \
   --relay-only \
   '<paste the relay-only peer descriptor here>' \
   /tmp/rift-payload.bin
 ```
 
-`--relay-only` removes Iroh's direct IP transports. The logs should show `path_kind="relay"`, and the transfer should still complete with a verified BLAKE3 hash. The local relay helper uses a self-signed certificate and `--relay-url` enables Iroh's insecure local-development TLS mode. Do not carry that trust configuration into production.
+`--relay-only` removes Iroh's direct IP transports. The logs should show `path_kind="relay"`, and the transfer should still complete with a verified BLAKE3 hash. The local relay helper uses a self-signed certificate; `--insecure-relay-tls` explicitly enables its development-only trust mode. A custom `--relay-url` without that flag keeps normal certificate verification, so production relay URLs cannot silently disable TLS verification.
 
 For an external relay experiment, omit `--relay-url` and use Iroh's configured relay set:
 
@@ -119,12 +123,12 @@ cargo run -p rift-spike -- run \
 
 The default mode uses n0's public relays. It requires DNS and outbound access to the relay infrastructure. A relay-only node cannot be dialed until `Iroh endpoint is online via relay` has appeared and its updated peer descriptor contains a `relay:` address. `staging` selects Iroh's staging relay set.
 
-## Reconnection experiment
+## Reconnect-after-close experiment
 
 Start a direct receiver as above, copy its descriptor, and run:
 
 ```bash
-cargo run -p rift-spike -- reconnect \
+cargo run -p rift-spike -- reconnect-after-close \
   --data-dir /tmp/rift-reconnect-a \
   --relay-mode disabled \
   --attempts 4 \
@@ -133,7 +137,24 @@ cargo run -p rift-spike -- reconnect \
   '<peer descriptor>'
 ```
 
-This experiment establishes and handshakes once, deliberately closes the connection to simulate an interruption, waits, and establishes/handshakes again. It logs `reconnect attempt`, `connection restored`, and `connection lost`. It is intentionally not a session-resumption implementation: the application must decide what state to replay after a new QUIC connection.
+This experiment establishes and handshakes once, deliberately closes the connection, waits, and establishes/handshakes again. It logs `reconnect attempt`, `connection restored`, and `connection lost`. It proves repeated connections with one persistent identity; it does not simulate a network failure or provide session resumption. The application must decide what state to replay after a new QUIC connection.
+
+## Live direct-path fault-injection experiment
+
+This experiment requires a peer descriptor containing both a direct IP address and a relay address. The receiver must be running with relay support and a non-relay-only configuration. For the local self-signed relay setup, start the receiver as in the relay-only example but omit `--relay-only`, then run:
+
+```bash
+cargo run -p rift-spike -- fault-inject \
+  --data-dir /tmp/rift-fault-a \
+  --relay-mode disabled \
+  --relay-url 'https://127.0.0.1:54321/' \
+  --insecure-relay-tls \
+  --fault-after-ms 1000 \
+  --recovery-timeout-secs 30 \
+  '<direct-plus-relay peer descriptor>'
+```
+
+`fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay and sends a post-recovery probe stream before reporting success. This is a deterministic local packet-loss/path-loss experiment; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
 
 ## Architecture implemented
 
@@ -156,7 +177,7 @@ Iroh Endpoint (ALPN: rift-next-spike/0)
 
 `identity.key` is created beneath the requested data directory. It contains an application storage envelope around Iroh's 32-byte `SecretKey`: a magic/version prefix, the secret bytes, and a BLAKE3 checksum. The envelope detects truncation, wrong format, and ordinary corruption; it does not introduce a second key or certificate system.
 
-The node ID is Iroh's public key rendered in its normal compact hexadecimal form. The displayed fingerprint is the first 16 bytes of `BLAKE3(node_id_bytes)`, rendered as 32 hex characters. It is deterministic and convenient for manual comparison, but is intentionally not a protocol-stable identity representation.
+The node ID is Iroh's public key rendered in its normal compact hexadecimal form. The displayed fingerprint is the first 16 bytes of `BLAKE3(node_id_bytes)`, rendered as 32 hex characters. It is deterministic and convenient for manual comparison, but is intentionally not a protocol-stable identity representation. First creation writes a fully-synced uniquely-created temporary file and atomically elects one winner for `identity.key`; concurrent starters that lose the election reload the winner's identity.
 
 ### Control plane
 
@@ -174,13 +195,13 @@ The application compares the `Hello.node_id` to the endpoint ID already authenti
 
 The sender hashes the file once to create metadata, then streams it in 64 KiB chunks while calculating a second hash. The receiver reads the metadata, writes into a temporary file, hashes while reading, checks the byte count and BLAKE3 digest, then renames the temporary file into the receive directory. A failed or truncated transfer does not become a completed output file.
 
-This is deliberately a two-pass sender because the receiver needs the expected content hash before bytes arrive. The receiver never buffers the complete payload in memory.
+This is deliberately a two-pass sender because the receiver needs the expected content hash before bytes arrive. Each receive uses a uniquely-created staging path, and promotion refuses an already-existing destination instead of overwriting it. The receiver never buffers the complete payload in memory.
 
 ## Tests and benchmark
 
 Unit tests cover identity creation/reload/corruption, fingerprint stability, frame round trips and malformed frames, unsupported versions, metadata, unsafe names, hash/length failures, and truncated payloads.
 
-`tests/networking.rs` launches two direct Iroh endpoints and verifies authenticated Hello/metadata/capabilities, a separate binary stream, receiver-side length/hash verification, and the acknowledgement. `tests/relay.rs` starts a local self-signed Iroh relay, forces both endpoints to relay-only, and verifies an authenticated control connection with a relay path. Both networking tests use events/channels and bounded timeouts rather than arbitrary synchronization sleeps.
+`tests/networking.rs` launches two direct Iroh endpoints and verifies authenticated Hello/metadata/capabilities, a separate binary stream, receiver-side length/hash verification, and the acknowledgement. `tests/relay.rs` starts a local self-signed Iroh relay, verifies a relay-only authenticated control connection, and runs a second direct-plus-relay scenario whose local UDP forwarder is cut under a live connection; the test observes relay selection and a post-outage control message. Both integration scenarios wrap the complete setup, handshake, stream, transfer, channel, and cleanup sequence in an outer deadline, with shorter stage deadlines for diagnostics.
 
 The explicit benchmark command is intentionally environment-dependent and has no pass/fail throughput threshold:
 
@@ -220,9 +241,10 @@ The numbers are a comparison seed, not a performance promise. Repeat the command
 
 - Direct local CLI transfer succeeded after including loopback in the copied local descriptor. The selected path was logged as `direct`.
 - A local relay-only transfer succeeded with no IP transport on either endpoint. The selected path was logged as `relay`, and the receiver verified the same length/hash as the sender.
-- The reconnect command established two separate authenticated connections using the same persisted sender identity. Each new connection required a new control handshake.
-- With direct and relay transports both enabled on a local custom relay, Iroh selected a direct path immediately and emitted path events for an additional direct candidate opening/closing. This host did not produce a relay-to-direct selected-path migration, so that topology-sensitive experiment remains a next-step matrix item; the relay-only run did force and verify the relay path.
-- The current environment could not resolve/reach n0's public relay hostnames. Iroh timed out its online wait and reported no address lookup information. This is an environment/infrastructure result, not evidence that public relay fallback is broken; the local relay test provides the deterministic fallback validation.
+- The `reconnect-after-close` command established two separate authenticated connections using the same persisted sender identity. Each new connection required a new control handshake; this remains deliberately distinct from a transport outage.
+- The live fault-injection scenario started with direct and relay addresses available, routed the direct candidate through a local UDP forwarder, cut that forwarder underneath the live QUIC connection, and observed Iroh select the relay. A post-outage probe stream completed, proving useful connectivity survived this local direct-path loss.
+- Ordinary direct-plus-relay local runs selected a direct path immediately and emitted path events for additional candidates. Interface changes, arbitrary packet-loss patterns, NAT/path changes, and public-relay outages remain topology matrix items beyond the deterministic local fault injector.
+- The current environment could not resolve/reach n0's public relay hostnames. Iroh timed out its online wait and reported no address lookup information. This is an environment/infrastructure result, not evidence that public relay fallback is broken; the local relay tests provide deterministic transport and fallback validation.
 - `Endpoint::online()` is useful for waiting until a relay address appears, but it can wait for external infrastructure. The CLI bounds it and continues for ordinary direct mode.
 - Dropping an endpoint without `Endpoint::close()` produces an Iroh diagnostic and aborts ungracefully. The normal CLI paths explicitly close endpoints; abrupt process termination during manual experiments will still produce that warning.
 
@@ -230,8 +252,8 @@ The numbers are a comparison seed, not a performance promise. Repeat the command
 
 1. Keep Iroh's endpoint ID as the cryptographic peer identity, but define a real pairing/trust policy before allowing arbitrary authenticated peers. The spike currently proves identity possession and manual fingerprint comparison only.
 2. Keep the control/data split. Add transfer IDs, resumability/idempotency rules, explicit cancellation, authorization, and durable application state only when the next milestone needs them.
-3. Treat a QUIC connection as disposable. Build reconnect and session replay at the Rift layer; use Iroh path events for diagnostics, not as a substitute for application state machines.
+3. Treat a QUIC connection as disposable at the application layer even though this spike now demonstrates one live direct-to-relay path migration. Build reconnect and session replay at the Rift layer; use Iroh path events for diagnostics, not as a substitute for application state machines.
 4. Choose the production address lookup/discovery model deliberately. A copied `EndpointAddr` JSON is ideal for this spike but is not an offline pairing/mailbox protocol.
-5. Make relay certificate trust a real configuration decision. The local helper's insecure self-signed mode is only for experiments; production relay URLs need normal CA or explicit pinned-root handling.
-6. Pin and periodically revalidate the Iroh API/version in the next milestone. The spike uses Iroh `1.0.3` and intentionally keeps its networking module thin so API changes remain visible.
+5. Make relay certificate trust a real configuration decision. The local helper's insecure self-signed mode requires `--insecure-relay-tls`; production relay URLs use normal CA verification or explicit pinned-root handling.
+6. Pin and periodically revalidate the Iroh API/version in the next milestone. The spike uses exact Iroh and Iroh Relay `1.0.3` requirements and intentionally keeps its networking module thin so API changes remain visible.
 7. Keep protocol and localhost transfer baselines in the regression suite, but collect networking numbers on representative machines and network topologies before imposing thresholds.
