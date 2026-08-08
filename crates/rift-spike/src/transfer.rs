@@ -11,7 +11,7 @@ use iroh::endpoint::SendStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    fs::{self, OpenOptions},
+    fs,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 
@@ -131,8 +131,7 @@ where
     fs::create_dir_all(receive_dir).await?;
 
     let output_path = receive_dir.join(&metadata.file_name);
-    let (temporary_path, temporary_file) =
-        create_temporary_file(receive_dir, &metadata.file_name).await?;
+    let (temporary_path, temporary_file) = create_temporary_file(receive_dir, &metadata.file_name)?;
     let mut temporary = StagedFile::new(temporary_path, temporary_file);
     let result = receive_to_temporary(recv, temporary.file_mut(), &metadata).await;
     temporary.close_file();
@@ -221,7 +220,7 @@ impl Drop for StagedFile {
     }
 }
 
-async fn create_temporary_file(
+fn create_temporary_file(
     receive_dir: &Path,
     file_name: &str,
 ) -> Result<(PathBuf, fs::File), TransferError> {
@@ -232,13 +231,12 @@ async fn create_temporary_file(
             std::process::id(),
             counter
         ));
-        match OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary_path)
-            .await
         {
-            Ok(file) => return Ok((temporary_path, file)),
+            Ok(file) => return Ok((temporary_path, fs::File::from_std(file))),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }

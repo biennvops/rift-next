@@ -350,144 +350,150 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
         mpsc::channel::<Result<transfer::TransferResult>>(MAX_CONCURRENT_TRANSFERS);
     let mut transfer_tasks = JoinSet::new();
 
-    loop {
-        tokio::select! {
-            close_reason = connection.closed() => {
-                info!(
-                    local_node_id = %context.identity.node_id(),
-                    remote_node_id = %remote_node_id,
-                    reason = ?close_reason,
-                    "connection lost"
-                );
-                break;
-            }
-            message = control_rx.recv() => {
-                match message {
-                    Some(Ok(ControlMessage::Ping { nonce })) => {
-                        let pong = ControlMessage::Pong { nonce };
-                        debug!(message = ?pong, "control message sent");
-                        time::timeout(
-                            CONTROL_TIMEOUT,
-                            protocol::write_value(&mut control_send, &pong),
-                        )
-                        .await
-                        .context("timed out sending ping response")?
-                        .context("unable to send ping response")?;
-                    }
-                    Some(Ok(ControlMessage::Pong { nonce })) => {
-                        debug!(nonce, "unexpected pong received on server control stream");
-                    }
-                    Some(Ok(message)) => {
-                        debug!(message = ?message, "unhandled control message received");
-                    }
-                    Some(Err(error)) => {
-                        debug!(error = ?error, "control stream closed");
-                        break;
-                    }
-                    None => {
-                        debug!("control reader stopped");
-                        break;
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                close_reason = connection.closed() => {
+                    info!(
+                        local_node_id = %context.identity.node_id(),
+                        remote_node_id = %remote_node_id,
+                        reason = ?close_reason,
+                        "connection lost"
+                    );
+                    break;
+                }
+                message = control_rx.recv() => {
+                    match message {
+                        Some(Ok(ControlMessage::Ping { nonce })) => {
+                            let pong = ControlMessage::Pong { nonce };
+                            debug!(message = ?pong, "control message sent");
+                            time::timeout(
+                                CONTROL_TIMEOUT,
+                                protocol::write_value(&mut control_send, &pong),
+                            )
+                            .await
+                            .context("timed out sending ping response")?
+                            .context("unable to send ping response")?;
+                        }
+                        Some(Ok(ControlMessage::Pong { nonce })) => {
+                            debug!(nonce, "unexpected pong received on server control stream");
+                        }
+                        Some(Ok(message)) => {
+                            debug!(message = ?message, "unhandled control message received");
+                        }
+                        Some(Err(error)) => {
+                            debug!(error = ?error, "control stream closed");
+                            break;
+                        }
+                        None => {
+                            debug!("control reader stopped");
+                            break;
+                        }
                     }
                 }
-            }
-            result = transfer_result_rx.recv() => {
-                match result {
-                    Some(Ok(result)) => {
-                        info!(
-                            local_node_id = %context.identity.node_id(),
-                            remote_node_id = %remote_node_id,
-                            bytes = result.byte_len,
-                            blake3 = %hex::encode(result.blake3),
-                            output = %result.output_path.display(),
-                            "binary transfer verified"
-                        );
-                        let ack = ControlMessage::TransferAck {
-                            byte_len: result.byte_len,
-                            blake3: result.blake3,
-                        };
-                        debug!(message = ?ack, "control message sent");
-                        time::timeout(
-                            CONTROL_TIMEOUT,
-                            protocol::write_value(&mut control_send, &ack),
-                        )
-                        .await
-                        .context("timed out sending transfer acknowledgement")?
-                        .context("unable to send transfer acknowledgement")?;
+                result = transfer_result_rx.recv() => {
+                    match result {
+                        Some(Ok(result)) => {
+                            info!(
+                                local_node_id = %context.identity.node_id(),
+                                remote_node_id = %remote_node_id,
+                                bytes = result.byte_len,
+                                blake3 = %hex::encode(result.blake3),
+                                output = %result.output_path.display(),
+                                "binary transfer verified"
+                            );
+                            let ack = ControlMessage::TransferAck {
+                                byte_len: result.byte_len,
+                                blake3: result.blake3,
+                            };
+                            debug!(message = ?ack, "control message sent");
+                            time::timeout(
+                                CONTROL_TIMEOUT,
+                                protocol::write_value(&mut control_send, &ack),
+                            )
+                            .await
+                            .context("timed out sending transfer acknowledgement")?
+                            .context("unable to send transfer acknowledgement")?;
+                        }
+                        Some(Err(error)) => {
+                            warn!(
+                                local_node_id = %context.identity.node_id(),
+                                remote_node_id = %remote_node_id,
+                                error = ?error,
+                                "binary transfer failed"
+                            );
+                        }
+                        None => {
+                            debug!("transfer result channel closed");
+                            break;
+                        }
                     }
-                    Some(Err(error)) => {
+                }
+                result = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
                         warn!(
                             local_node_id = %context.identity.node_id(),
                             remote_node_id = %remote_node_id,
                             error = ?error,
-                            "binary transfer failed"
+                            "binary transfer task failed to join"
                         );
                     }
-                    None => {
-                        debug!("transfer result channel closed");
-                        break;
-                    }
                 }
-            }
-            result = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
-                if let Some(Err(error)) = result {
-                    warn!(
+                result = connection.accept_uni() => {
+                    let mut recv = result.context("unable to accept binary stream")?;
+                    info!(
                         local_node_id = %context.identity.node_id(),
                         remote_node_id = %remote_node_id,
-                        error = ?error,
-                        "binary transfer task failed to join"
+                        "binary stream created"
                     );
-                }
-            }
-            result = connection.accept_uni() => {
-                let mut recv = result.context("unable to accept binary stream")?;
-                info!(
-                    local_node_id = %context.identity.node_id(),
-                    remote_node_id = %remote_node_id,
-                    "binary stream created"
-                );
-                if transfer_tasks.len() >= MAX_CONCURRENT_TRANSFERS {
-                    warn!(
-                        local_node_id = %context.identity.node_id(),
-                        remote_node_id = %remote_node_id,
-                        maximum = MAX_CONCURRENT_TRANSFERS,
-                        "too many concurrent binary transfers"
-                    );
-                    if let Err(error) = recv.stop(0_u32.into()) {
-                        debug!(error = ?error, "unable to stop excess binary stream");
-                    }
-                    continue;
-                }
-
-                let receive_dir = context.receive_dir.clone();
-                let transfer_result_tx = transfer_result_tx.clone();
-                transfer_tasks.spawn(async move {
-                    let result = match time::timeout(
-                        TRANSFER_TIMEOUT,
-                        transfer::receive_file(&mut recv, &receive_dir),
-                    )
-                    .await
-                    {
-                        Ok(result) => result.map_err(anyhow::Error::from),
-                        Err(_) => {
-                            let _ = recv.stop(0_u32.into());
-                            Err(anyhow::anyhow!(
-                                "binary transfer timed out after {TRANSFER_TIMEOUT:?}"
-                            ))
+                    if transfer_tasks.len() >= MAX_CONCURRENT_TRANSFERS {
+                        warn!(
+                            local_node_id = %context.identity.node_id(),
+                            remote_node_id = %remote_node_id,
+                            maximum = MAX_CONCURRENT_TRANSFERS,
+                            "too many concurrent binary transfers"
+                        );
+                        if let Err(error) = recv.stop(0_u32.into()) {
+                            debug!(error = ?error, "unable to stop excess binary stream");
                         }
-                    };
-                    let _ = transfer_result_tx.send(result).await;
-                });
+                        continue;
+                    }
+
+                    let receive_dir = context.receive_dir.clone();
+                    let transfer_result_tx = transfer_result_tx.clone();
+                    transfer_tasks.spawn(async move {
+                        let result = match time::timeout(
+                            TRANSFER_TIMEOUT,
+                            transfer::receive_file(&mut recv, &receive_dir),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map_err(anyhow::Error::from),
+                            Err(_) => {
+                                let _ = recv.stop(0_u32.into());
+                                Err(anyhow::anyhow!(
+                                    "binary transfer timed out after {TRANSFER_TIMEOUT:?}"
+                                ))
+                            }
+                        };
+                        let _ = transfer_result_tx.send(result).await;
+                    });
+                }
             }
         }
+        Ok(())
     }
+    .await;
 
     transfer_tasks.abort_all();
+    while transfer_tasks.join_next().await.is_some() {}
     control_reader.abort();
+    let _ = control_reader.await;
     if let Err(error) = control_send.finish() {
         debug!(error = %error, "control stream was already closed");
     }
     path_diagnostics.abort();
-    Ok(())
+    result
 }
 
 fn local_handshake(context: &ServerContext) -> LocalHandshake {
