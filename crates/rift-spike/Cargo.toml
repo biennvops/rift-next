@@ -1,0 +1,29 @@
+[package]
+name = "rift-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+default-run = "rift-spike"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+iroh.workspace = true
+iroh-relay.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

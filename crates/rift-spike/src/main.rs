@@ -1,0 +1,760 @@
+use std::{
+    hint::black_box,
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use iroh::{Endpoint, EndpointAddr, RelayUrl, endpoint::Incoming};
+use rift_spike::{
+    identity::NodeIdentity,
+    network::{self, NetworkConfig, RelayModeConfig},
+    protocol::{self, Capability, ControlChannel, ControlMessage, LocalHandshake},
+    transfer,
+};
+use tokio::{fs, io::AsyncWriteExt, signal, sync::oneshot, task::JoinSet, time};
+use tracing::{debug, info, warn};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "rift-spike",
+    about = "Rift vNext Iroh/QUIC networking prototype"
+)]
+struct Cli {
+    #[arg(long, global = true, default_value = "rift_spike=info,iroh=info")]
+    log: String,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Start a persistent node and accept control/data connections.
+    Run(RunArgs),
+    /// Connect, handshake, and stream one file to a running node.
+    Send(SendArgs),
+    /// Deliberately close and re-establish a control connection.
+    Reconnect(ReconnectArgs),
+    /// Run the explicit protocol and localhost transfer baseline.
+    Bench(BenchArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RelayModeArg {
+    Disabled,
+    Default,
+    Staging,
+}
+
+#[derive(Args, Clone, Debug)]
+struct EndpointArgs {
+    #[arg(long, default_value = ".rift-spike")]
+    data_dir: PathBuf,
+    #[arg(long, value_enum, default_value_t = RelayModeArg::Default)]
+    relay_mode: RelayModeArg,
+    /// Remove direct UDP transports so the experiment is relay-only.
+    #[arg(long)]
+    relay_only: bool,
+    /// A custom relay URL, intended for the local `rift-relay` experiment.
+    #[arg(long)]
+    relay_url: Option<String>,
+    #[arg(long, default_value = "rift-spike")]
+    device_name: String,
+    #[arg(long)]
+    platform: Option<String>,
+    #[arg(long, default_value_t = 15)]
+    relay_timeout_secs: u64,
+}
+
+impl EndpointArgs {
+    fn platform_name(&self) -> String {
+        self.platform
+            .clone()
+            .unwrap_or_else(|| std::env::consts::OS.to_owned())
+    }
+
+    fn uses_relay(&self) -> bool {
+        self.relay_url.is_some() || self.relay_mode != RelayModeArg::Disabled
+    }
+
+    fn network_config(&self) -> Result<NetworkConfig> {
+        let relay_url = self
+            .relay_url
+            .as_deref()
+            .map(|value| {
+                RelayUrl::from_str(value)
+                    .with_context(|| format!("invalid custom relay URL {value:?}"))
+            })
+            .transpose()?;
+        Ok(NetworkConfig {
+            relay_mode: match self.relay_mode {
+                RelayModeArg::Disabled => RelayModeConfig::Disabled,
+                RelayModeArg::Default => RelayModeConfig::Default,
+                RelayModeArg::Staging => RelayModeConfig::Staging,
+            },
+            relay_only: self.relay_only,
+            relay_url,
+        })
+    }
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+    #[arg(long)]
+    receive_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct SendArgs {
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+    /// A node ID or the JSON printed as `Peer address` by `run`.
+    peer: String,
+    file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct ReconnectArgs {
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+    /// A node ID or the JSON printed as `Peer address` by `run`.
+    peer: String,
+    #[arg(long, default_value_t = 4)]
+    attempts: u32,
+    #[arg(long, default_value_t = 1_000)]
+    drop_after_ms: u64,
+    #[arg(long, default_value_t = 1_000)]
+    retry_delay_ms: u64,
+}
+
+#[derive(Args, Debug)]
+struct BenchArgs {
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    bytes: u64,
+    #[arg(long, default_value_t = 100_000)]
+    protocol_iterations: u64,
+}
+
+struct ServerContext {
+    identity: NodeIdentity,
+    device_name: String,
+    platform: String,
+    receive_dir: PathBuf,
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("error: {error:#}");
+        process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
+    let cli = Cli::parse();
+    init_tracing(&cli.log)?;
+    match cli.command {
+        Command::Run(args) => run_node(args).await,
+        Command::Send(args) => send_file(args).await,
+        Command::Reconnect(args) => reconnect(args).await,
+        Command::Bench(args) => benchmark(args).await,
+    }
+}
+
+fn init_tracing(filter: &str) -> Result<()> {
+    let filter = EnvFilter::try_new(filter).context("invalid tracing filter")?;
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_target(true))
+        .with(filter)
+        .try_init()
+        .context("unable to initialize tracing")
+}
+
+async fn run_node(args: RunArgs) -> Result<()> {
+    let identity = NodeIdentity::load_or_create(&args.endpoint.data_dir)
+        .context("unable to load node identity")?;
+    let endpoint = network::bind_endpoint(&identity, args.endpoint.network_config()?).await?;
+    print_startup(&identity, &endpoint)?;
+
+    if args.endpoint.uses_relay() {
+        network::wait_for_relay(
+            &endpoint,
+            Duration::from_secs(args.endpoint.relay_timeout_secs),
+        )
+        .await;
+        print_updated_peer_address(&endpoint)?;
+    }
+
+    let receive_dir = args
+        .receive_dir
+        .unwrap_or_else(|| args.endpoint.data_dir.join("received"));
+    fs::create_dir_all(&receive_dir).await.with_context(|| {
+        format!(
+            "unable to create receive directory {}",
+            receive_dir.display()
+        )
+    })?;
+    let context = Arc::new(ServerContext {
+        identity,
+        device_name: args.endpoint.device_name.clone(),
+        platform: args.endpoint.platform_name(),
+        receive_dir,
+    });
+
+    info!(local_node_id = %context.identity.node_id(), "node listening for connections");
+    let mut connections = JoinSet::new();
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result.context("unable to listen for Ctrl-C")?;
+                info!(local_node_id = %context.identity.node_id(), "shutdown requested");
+                break;
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let context = Arc::clone(&context);
+                connections.spawn(async move {
+                    if let Err(error) = handle_connection(incoming, context).await {
+                        warn!(error = ?error, "connection handler failed");
+                    }
+                });
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(error = ?error, "connection task failed to join");
+                }
+            }
+        }
+    }
+
+    endpoint.close().await;
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            warn!(error = ?error, "connection task failed during shutdown");
+        }
+    }
+    Ok(())
+}
+
+fn print_startup(identity: &NodeIdentity, endpoint: &Endpoint) -> Result<()> {
+    println!("Node ID: {}", identity.node_id());
+    println!("Fingerprint: {}", identity.fingerprint());
+    println!(
+        "Peer address: {}",
+        network::local_peer_descriptor(endpoint)?
+    );
+    println!("Identity file: {}", identity.storage_path().display());
+    Ok(())
+}
+
+fn print_updated_peer_address(endpoint: &Endpoint) -> Result<()> {
+    println!(
+        "Peer address (after relay discovery): {}",
+        network::local_peer_descriptor(endpoint)?
+    );
+    Ok(())
+}
+
+async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> Result<()> {
+    let connection = time::timeout(CONNECTION_TIMEOUT, async { incoming.await })
+        .await
+        .context("incoming connection handshake timed out")?
+        .context("incoming connection handshake failed")?;
+    let remote_node_id = connection.remote_id();
+    info!(
+        local_node_id = %context.identity.node_id(),
+        remote_node_id = %remote_node_id,
+        "authenticated connection accepted"
+    );
+    network::log_connection_paths(&connection);
+    let path_diagnostics = network::spawn_path_diagnostics(connection.clone());
+
+    let (send, recv) = time::timeout(CONTROL_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out waiting for control stream")?
+        .context("unable to accept control stream")?;
+    info!(
+        local_node_id = %context.identity.node_id(),
+        remote_node_id = %remote_node_id,
+        "control stream created"
+    );
+    let mut control = ControlChannel { send, recv };
+    let peer = protocol::exchange_handshake(
+        &mut control,
+        &local_handshake(&context),
+        *remote_node_id.as_bytes(),
+    )
+    .await
+    .context("control handshake failed")?;
+    info!(
+        local_node_id = %context.identity.node_id(),
+        remote_node_id = %remote_node_id,
+        peer_device_name = %peer.device_name,
+        peer_platform = %peer.platform,
+        peer_capabilities = ?peer.capabilities,
+        "control handshake complete"
+    );
+
+    loop {
+        tokio::select! {
+            close_reason = connection.closed() => {
+                info!(
+                    local_node_id = %context.identity.node_id(),
+                    remote_node_id = %remote_node_id,
+                    reason = ?close_reason,
+                    "connection lost"
+                );
+                break;
+            }
+            result = connection.accept_uni() => {
+                let mut recv = result.context("unable to accept binary stream")?;
+                info!(
+                    local_node_id = %context.identity.node_id(),
+                    remote_node_id = %remote_node_id,
+                    "binary stream created"
+                );
+                match transfer::receive_file(&mut recv, &context.receive_dir).await {
+                    Ok(result) => {
+                        info!(
+                            local_node_id = %context.identity.node_id(),
+                            remote_node_id = %remote_node_id,
+                            bytes = result.byte_len,
+                            blake3 = %hex::encode(result.blake3),
+                            output = %result.output_path.display(),
+                            "binary transfer verified"
+                        );
+                        let ack = ControlMessage::TransferAck {
+                            byte_len: result.byte_len,
+                            blake3: result.blake3,
+                        };
+                        debug!(message = ?ack, "control message sent");
+                        protocol::write_value(&mut control.send, &ack)
+                            .await
+                            .context("unable to send transfer acknowledgement")?;
+                    }
+                    Err(error) => {
+                        warn!(
+                            local_node_id = %context.identity.node_id(),
+                            remote_node_id = %remote_node_id,
+                            error = ?error,
+                            "binary transfer failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Err(error) = control.send.finish() {
+        debug!(error = %error, "control stream was already closed");
+    }
+    path_diagnostics.abort();
+    Ok(())
+}
+
+fn local_handshake(context: &ServerContext) -> LocalHandshake {
+    LocalHandshake {
+        node_id: context.identity.node_id_bytes(),
+        device_name: context.device_name.clone(),
+        platform: context.platform.clone(),
+        capabilities: vec![Capability::BinaryBlobStream],
+    }
+}
+
+async fn send_file(args: SendArgs) -> Result<()> {
+    let identity = NodeIdentity::load_or_create(&args.endpoint.data_dir)
+        .context("unable to load node identity")?;
+    let metadata = transfer::metadata_for_file(&args.file)
+        .await
+        .with_context(|| format!("unable to inspect transfer file {}", args.file.display()))?;
+    let peer = network::parse_peer_descriptor(&args.peer)?;
+    let endpoint = network::bind_endpoint(&identity, args.endpoint.network_config()?).await?;
+    print_startup(&identity, &endpoint)?;
+    if args.endpoint.uses_relay() {
+        network::wait_for_relay(
+            &endpoint,
+            Duration::from_secs(args.endpoint.relay_timeout_secs),
+        )
+        .await;
+        print_updated_peer_address(&endpoint)?;
+    }
+
+    let connection = network::connect(&endpoint, peer.clone(), CONNECTION_TIMEOUT).await?;
+    let path_diagnostics = network::spawn_path_diagnostics(connection.clone());
+    let (send, recv) = time::timeout(CONTROL_TIMEOUT, connection.open_bi())
+        .await
+        .context("timed out opening control stream")?
+        .context("unable to open control stream")?;
+    info!(remote_node_id = %connection.remote_id(), "control stream created");
+    let mut control = ControlChannel { send, recv };
+    let peer_handshake = protocol::exchange_handshake(
+        &mut control,
+        &LocalHandshake {
+            node_id: identity.node_id_bytes(),
+            device_name: args.endpoint.device_name.clone(),
+            platform: args.endpoint.platform_name(),
+            capabilities: vec![Capability::BinaryBlobStream],
+        },
+        *peer.id.as_bytes(),
+    )
+    .await
+    .context("control handshake failed")?;
+    info!(
+        remote_node_id = %connection.remote_id(),
+        peer_device_name = %peer_handshake.device_name,
+        peer_platform = %peer_handshake.platform,
+        peer_capabilities = ?peer_handshake.capabilities,
+        "control handshake complete"
+    );
+    if !peer_handshake
+        .capabilities
+        .contains(&Capability::BinaryBlobStream)
+    {
+        bail!("peer does not advertise the BinaryBlobStream capability");
+    }
+
+    let mut data_stream = time::timeout(CONTROL_TIMEOUT, connection.open_uni())
+        .await
+        .context("timed out opening binary stream")?
+        .context("unable to open binary stream")?;
+    info!(
+        remote_node_id = %connection.remote_id(),
+        file = %args.file.display(),
+        expected_bytes = metadata.byte_len,
+        expected_blake3 = %hex::encode(metadata.blake3),
+        "binary stream created"
+    );
+    let bytes = time::timeout(
+        TRANSFER_TIMEOUT,
+        transfer::send_file(&mut data_stream, &args.file, &metadata),
+    )
+    .await
+    .context("binary transfer timed out")??;
+    info!(remote_node_id = %connection.remote_id(), bytes, "binary bytes transferred");
+
+    let acknowledgement: ControlMessage =
+        time::timeout(CONTROL_TIMEOUT, protocol::read_value(&mut control.recv))
+            .await
+            .context("timed out waiting for transfer acknowledgement")?
+            .context("unable to read transfer acknowledgement")?;
+    let ControlMessage::TransferAck { byte_len, blake3 } = acknowledgement else {
+        bail!("expected TransferAck, received {acknowledgement:?}");
+    };
+    if byte_len != metadata.byte_len || blake3 != metadata.blake3 {
+        bail!("receiver acknowledgement did not verify the expected length/hash");
+    }
+    info!(
+        remote_node_id = %connection.remote_id(),
+        bytes = byte_len,
+        blake3 = %hex::encode(blake3),
+        "receiver confirmed binary transfer"
+    );
+
+    if let Err(error) = control.send.finish() {
+        debug!(error = %error, "control stream was already closed");
+    }
+    connection.close(0_u32.into(), b"transfer complete");
+    endpoint.close().await;
+    path_diagnostics.abort();
+    Ok(())
+}
+
+async fn reconnect(args: ReconnectArgs) -> Result<()> {
+    if args.attempts < 2 {
+        bail!("--attempts must be at least 2 for a reconnect experiment");
+    }
+    let identity = NodeIdentity::load_or_create(&args.endpoint.data_dir)
+        .context("unable to load node identity")?;
+    let peer = network::parse_peer_descriptor(&args.peer)?;
+    let endpoint = network::bind_endpoint(&identity, args.endpoint.network_config()?).await?;
+    print_startup(&identity, &endpoint)?;
+    if args.endpoint.uses_relay() {
+        network::wait_for_relay(
+            &endpoint,
+            Duration::from_secs(args.endpoint.relay_timeout_secs),
+        )
+        .await;
+        print_updated_peer_address(&endpoint)?;
+    }
+
+    let mut successful_connections = 0_u32;
+    for attempt in 1..=args.attempts {
+        info!(attempt, "reconnect attempt");
+        match connect_and_handshake(&endpoint, &identity, &args.endpoint, &peer).await {
+            Ok((connection, mut control, diagnostics)) => {
+                successful_connections += 1;
+                info!(
+                    attempt,
+                    remote_node_id = %connection.remote_id(),
+                    "connection restored and control handshake usable"
+                );
+                if successful_connections == 1 {
+                    info!(
+                        drop_after_ms = args.drop_after_ms,
+                        "simulating connectivity interruption"
+                    );
+                    time::sleep(Duration::from_millis(args.drop_after_ms)).await;
+                    let closed = connection.closed();
+                    connection.close(0_u32.into(), b"reconnect experiment interruption");
+                    let reason = time::timeout(CONNECTION_TIMEOUT, closed)
+                        .await
+                        .context("timed out waiting for deliberate connection loss")?;
+                    info!(remote_node_id = %connection.remote_id(), reason = ?reason, "connection lost");
+                    if attempt < args.attempts {
+                        time::sleep(Duration::from_millis(args.retry_delay_ms)).await;
+                    }
+                } else {
+                    if let Err(error) = control.send.finish() {
+                        debug!(error = %error, "control stream was already closed");
+                    }
+                    connection.close(0_u32.into(), b"reconnect experiment complete");
+                    diagnostics.abort();
+                    break;
+                }
+                if let Err(error) = control.send.finish() {
+                    debug!(error = %error, "control stream was already closed");
+                }
+                diagnostics.abort();
+            }
+            Err(error) => {
+                warn!(attempt, error = ?error, "connection attempt failed");
+                if attempt < args.attempts {
+                    time::sleep(Duration::from_millis(args.retry_delay_ms)).await;
+                }
+            }
+        }
+    }
+    endpoint.close().await;
+    if successful_connections < 2 {
+        bail!("reconnect experiment did not establish two usable connections");
+    }
+    Ok(())
+}
+
+async fn connect_and_handshake(
+    endpoint: &Endpoint,
+    identity: &NodeIdentity,
+    args: &EndpointArgs,
+    peer: &EndpointAddr,
+) -> Result<(
+    iroh::endpoint::Connection,
+    ControlChannel,
+    network::PathDiagnostics,
+)> {
+    let connection = network::connect(endpoint, peer.clone(), CONNECTION_TIMEOUT).await?;
+    let diagnostics = network::spawn_path_diagnostics(connection.clone());
+    let (send, recv) = time::timeout(CONTROL_TIMEOUT, connection.open_bi())
+        .await
+        .context("timed out opening control stream")?
+        .context("unable to open control stream")?;
+    let mut control = ControlChannel { send, recv };
+    protocol::exchange_handshake(
+        &mut control,
+        &LocalHandshake {
+            node_id: identity.node_id_bytes(),
+            device_name: args.device_name.clone(),
+            platform: args.platform_name(),
+            capabilities: vec![Capability::BinaryBlobStream],
+        },
+        *peer.id.as_bytes(),
+    )
+    .await
+    .context("control handshake failed")?;
+    Ok((connection, control, diagnostics))
+}
+
+async fn benchmark(args: BenchArgs) -> Result<()> {
+    if args.bytes == 0 {
+        bail!("--bytes must be greater than zero");
+    }
+    if args.protocol_iterations == 0 {
+        bail!("--protocol-iterations must be greater than zero");
+    }
+    let protocol_result = benchmark_protocol(args.protocol_iterations)?;
+    let transfer_result = benchmark_local_transfer(args.bytes).await?;
+    println!(
+        "protocol.encode_decode.ops_per_second={:.2}",
+        protocol_result
+    );
+    println!(
+        "transfer.localhost.mib_per_second={:.2}",
+        transfer_result.mib_per_second
+    );
+    println!(
+        "transfer.localhost.seconds={:.6}",
+        transfer_result.elapsed.as_secs_f64()
+    );
+    println!("transfer.localhost.bytes={}", transfer_result.bytes);
+    println!(
+        "transfer.streaming_buffer_bytes={}",
+        transfer::STREAM_BUFFER_SIZE
+    );
+    Ok(())
+}
+
+fn benchmark_protocol(iterations: u64) -> Result<f64> {
+    let message = ControlMessage::DeviceMetadata {
+        device_name: "benchmark-node".to_owned(),
+        platform: "benchmark".to_owned(),
+    };
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let encoded = protocol::encode_message(black_box(&message))?;
+        let decoded = protocol::decode_message(black_box(&encoded))?;
+        black_box(decoded);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    Ok(iterations as f64 / seconds.max(f64::MIN_POSITIVE))
+}
+
+struct TransferBenchmarkResult {
+    bytes: u64,
+    elapsed: Duration,
+    mib_per_second: f64,
+}
+
+async fn benchmark_local_transfer(bytes: u64) -> Result<TransferBenchmarkResult> {
+    let root = benchmark_directory();
+    let receive_dir = root.join("received");
+    fs::create_dir_all(&root).await?;
+    let source_path = root.join("benchmark.bin");
+    create_benchmark_file(&source_path, bytes).await?;
+    let metadata = transfer::metadata_for_file(&source_path).await?;
+
+    let sender_identity = NodeIdentity::ephemeral();
+    let receiver_identity = NodeIdentity::ephemeral();
+    let sender = network::bind_endpoint(
+        &sender_identity,
+        NetworkConfig {
+            relay_mode: RelayModeConfig::Disabled,
+            relay_only: false,
+            relay_url: None,
+        },
+    )
+    .await?;
+    let receiver = network::bind_endpoint(
+        &receiver_identity,
+        NetworkConfig {
+            relay_mode: RelayModeConfig::Disabled,
+            relay_only: false,
+            relay_url: None,
+        },
+    )
+    .await?;
+    let receiver_addr = network::local_endpoint_addr(&receiver);
+    let (done_tx, done_rx) = oneshot::channel();
+    let receiver_task = tokio::spawn(async move {
+        let incoming = receiver
+            .accept()
+            .await
+            .context("benchmark receiver did not receive a connection")?;
+        let connection = incoming
+            .await
+            .context("benchmark receiver handshake failed")?;
+        let (send, recv) = connection.accept_bi().await?;
+        let mut control = ControlChannel { send, recv };
+        protocol::exchange_handshake(
+            &mut control,
+            &LocalHandshake {
+                node_id: receiver_identity.node_id_bytes(),
+                device_name: "benchmark-receiver".to_owned(),
+                platform: "benchmark".to_owned(),
+                capabilities: vec![Capability::BinaryBlobStream],
+            },
+            *connection.remote_id().as_bytes(),
+        )
+        .await?;
+        let mut data = connection.accept_uni().await?;
+        let result = transfer::receive_file(&mut data, &receive_dir).await?;
+        let ack = ControlMessage::TransferAck {
+            byte_len: result.byte_len,
+            blake3: result.blake3,
+        };
+        protocol::write_value(&mut control.send, &ack).await?;
+        done_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("benchmark sender dropped completion signal"))?;
+        connection.close(0_u32.into(), b"benchmark complete");
+        receiver.close().await;
+        Ok::<transfer::TransferResult, anyhow::Error>(result)
+    });
+
+    let connection = network::connect(&sender, receiver_addr.clone(), CONNECTION_TIMEOUT).await?;
+    let (send, recv) = connection.open_bi().await?;
+    let mut control = ControlChannel { send, recv };
+    protocol::exchange_handshake(
+        &mut control,
+        &LocalHandshake {
+            node_id: sender_identity.node_id_bytes(),
+            device_name: "benchmark-sender".to_owned(),
+            platform: "benchmark".to_owned(),
+            capabilities: vec![Capability::BinaryBlobStream],
+        },
+        *receiver_addr.id.as_bytes(),
+    )
+    .await?;
+    let mut data = connection.open_uni().await?;
+    let start = Instant::now();
+    transfer::send_file(&mut data, &source_path, &metadata).await?;
+    let ack: ControlMessage = protocol::read_value(&mut control.recv).await?;
+    let elapsed = start.elapsed();
+    let ControlMessage::TransferAck { byte_len, blake3 } = ack else {
+        bail!("benchmark receiver returned an unexpected control message");
+    };
+    if byte_len != metadata.byte_len || blake3 != metadata.blake3 {
+        bail!("benchmark receiver returned an invalid transfer acknowledgement");
+    }
+    done_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("benchmark receiver dropped completion signal"))?;
+    let received = receiver_task.await??;
+    sender.close().await;
+    let mib_per_second =
+        bytes as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE) / (1024.0 * 1024.0);
+    let result = TransferBenchmarkResult {
+        bytes: received.byte_len,
+        elapsed,
+        mib_per_second,
+    };
+    fs::remove_dir_all(&root).await?;
+    Ok(result)
+}
+
+async fn create_benchmark_file(path: &Path, bytes: u64) -> Result<()> {
+    let mut file = fs::File::create(path).await?;
+    let mut buffer = vec![0_u8; transfer::STREAM_BUFFER_SIZE];
+    for (index, byte) in buffer.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.write_all(&buffer[..count]).await?;
+        remaining -= count as u64;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+fn benchmark_directory() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!("rift-spike-benchmark-{}-{nanos}", process::id()))
+}

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/rift-spike"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+futures-util = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+hex = "0.4"
+iroh = "1.0.3"
+# Used only for the local self-signed relay experiment and custom relay TLS configuration.
+iroh-relay = { version = "1.0.3", features = ["server", "test-utils"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.release]
+debug = true
