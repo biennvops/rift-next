@@ -16,7 +16,14 @@ use rift_spike::{
     protocol::{self, Capability, ControlChannel, ControlMessage, LocalHandshake},
     transfer,
 };
-use tokio::{fs, io::AsyncWriteExt, signal, sync::oneshot, task::JoinSet, time};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    signal,
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+    time,
+};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -166,7 +173,6 @@ struct BenchArgs {
 
 struct ServerContext {
     identity: NodeIdentity,
-    endpoint: Endpoint,
     device_name: String,
     platform: String,
     receive_dir: PathBuf,
@@ -227,7 +233,6 @@ async fn run_node(args: RunArgs) -> Result<()> {
     })?;
     let context = Arc::new(ServerContext {
         identity,
-        endpoint: endpoint.clone(),
         device_name: args.endpoint.device_name.clone(),
         platform: args.endpoint.platform_name(),
         receive_dir,
@@ -316,12 +321,16 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
         "control stream created"
     );
     let mut control = ControlChannel { send, recv };
-    let peer = protocol::exchange_handshake(
-        &mut control,
-        &local_handshake(&context),
-        *remote_node_id.as_bytes(),
+    let peer = time::timeout(
+        CONTROL_TIMEOUT,
+        protocol::exchange_handshake(
+            &mut control,
+            &local_handshake(&context),
+            *remote_node_id.as_bytes(),
+        ),
     )
     .await
+    .context("control handshake timed out")?
     .context("control handshake failed")?;
     info!(
         local_node_id = %context.identity.node_id(),
@@ -331,6 +340,11 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
         peer_capabilities = ?peer.capabilities,
         "control handshake complete"
     );
+
+    let ControlChannel { send, recv } = control;
+    let mut control_send = send;
+    let (control_tx, mut control_rx) = mpsc::channel(16);
+    let control_reader = tokio::spawn(protocol::read_control_messages(recv, control_tx));
 
     loop {
         tokio::select! {
@@ -343,24 +357,27 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                 );
                 break;
             }
-            message = protocol::read_value::<_, ControlMessage>(&mut control.recv) => {
+            message = control_rx.recv() => {
                 match message {
-                    Ok(ControlMessage::Ping { nonce }) => {
-                        context.endpoint.network_change().await;
+                    Some(Ok(ControlMessage::Ping { nonce })) => {
                         let pong = ControlMessage::Pong { nonce };
                         debug!(message = ?pong, "control message sent");
-                        protocol::write_value(&mut control.send, &pong)
+                        protocol::write_value(&mut control_send, &pong)
                             .await
                             .context("unable to send ping response")?;
                     }
-                    Ok(ControlMessage::Pong { nonce }) => {
+                    Some(Ok(ControlMessage::Pong { nonce })) => {
                         debug!(nonce, "unexpected pong received on server control stream");
                     }
-                    Ok(message) => {
+                    Some(Ok(message)) => {
                         debug!(message = ?message, "unhandled control message received");
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         debug!(error = ?error, "control stream closed");
+                        break;
+                    }
+                    None => {
+                        debug!("control reader stopped");
                         break;
                     }
                 }
@@ -387,7 +404,7 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                             blake3: result.blake3,
                         };
                         debug!(message = ?ack, "control message sent");
-                        protocol::write_value(&mut control.send, &ack)
+                        protocol::write_value(&mut control_send, &ack)
                             .await
                             .context("unable to send transfer acknowledgement")?;
                     }
@@ -404,7 +421,8 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
         }
     }
 
-    if let Err(error) = control.send.finish() {
+    control_reader.abort();
+    if let Err(error) = control_send.finish() {
         debug!(error = %error, "control stream was already closed");
     }
     path_diagnostics.abort();
@@ -446,17 +464,21 @@ async fn send_file(args: SendArgs) -> Result<()> {
         .context("unable to open control stream")?;
     info!(remote_node_id = %connection.remote_id(), "control stream created");
     let mut control = ControlChannel { send, recv };
-    let peer_handshake = protocol::exchange_handshake(
-        &mut control,
-        &LocalHandshake {
-            node_id: identity.node_id_bytes(),
-            device_name: args.endpoint.device_name.clone(),
-            platform: args.endpoint.platform_name(),
-            capabilities: vec![Capability::BinaryBlobStream],
-        },
-        *peer.id.as_bytes(),
+    let peer_handshake = time::timeout(
+        CONTROL_TIMEOUT,
+        protocol::exchange_handshake(
+            &mut control,
+            &LocalHandshake {
+                node_id: identity.node_id_bytes(),
+                device_name: args.endpoint.device_name.clone(),
+                platform: args.endpoint.platform_name(),
+                capabilities: vec![Capability::BinaryBlobStream],
+            },
+            *peer.id.as_bytes(),
+        ),
     )
     .await
+    .context("control handshake timed out")?
     .context("control handshake failed")?;
     info!(
         remote_node_id = %connection.remote_id(),
@@ -684,17 +706,21 @@ async fn connect_and_handshake(
         .context("timed out opening control stream")?
         .context("unable to open control stream")?;
     let mut control = ControlChannel { send, recv };
-    protocol::exchange_handshake(
-        &mut control,
-        &LocalHandshake {
-            node_id: identity.node_id_bytes(),
-            device_name: args.device_name.clone(),
-            platform: args.platform_name(),
-            capabilities: vec![Capability::BinaryBlobStream],
-        },
-        *peer.id.as_bytes(),
+    time::timeout(
+        CONTROL_TIMEOUT,
+        protocol::exchange_handshake(
+            &mut control,
+            &LocalHandshake {
+                node_id: identity.node_id_bytes(),
+                device_name: args.device_name.clone(),
+                platform: args.platform_name(),
+                capabilities: vec![Capability::BinaryBlobStream],
+            },
+            *peer.id.as_bytes(),
+        ),
     )
     .await
+    .context("control handshake timed out")?
     .context("control handshake failed")?;
     Ok((connection, control, diagnostics))
 }
@@ -791,17 +817,21 @@ async fn benchmark_local_transfer(bytes: u64) -> Result<TransferBenchmarkResult>
             .context("benchmark receiver handshake failed")?;
         let (send, recv) = connection.accept_bi().await?;
         let mut control = ControlChannel { send, recv };
-        protocol::exchange_handshake(
-            &mut control,
-            &LocalHandshake {
-                node_id: receiver_identity.node_id_bytes(),
-                device_name: "benchmark-receiver".to_owned(),
-                platform: "benchmark".to_owned(),
-                capabilities: vec![Capability::BinaryBlobStream],
-            },
-            *connection.remote_id().as_bytes(),
+        time::timeout(
+            CONTROL_TIMEOUT,
+            protocol::exchange_handshake(
+                &mut control,
+                &LocalHandshake {
+                    node_id: receiver_identity.node_id_bytes(),
+                    device_name: "benchmark-receiver".to_owned(),
+                    platform: "benchmark".to_owned(),
+                    capabilities: vec![Capability::BinaryBlobStream],
+                },
+                *connection.remote_id().as_bytes(),
+            ),
         )
-        .await?;
+        .await
+        .context("benchmark receiver control handshake timed out")??;
         let mut data = connection.accept_uni().await?;
         let result = transfer::receive_file(&mut data, &receive_dir).await?;
         let ack = ControlMessage::TransferAck {
@@ -820,17 +850,21 @@ async fn benchmark_local_transfer(bytes: u64) -> Result<TransferBenchmarkResult>
     let connection = network::connect(&sender, receiver_addr.clone(), CONNECTION_TIMEOUT).await?;
     let (send, recv) = connection.open_bi().await?;
     let mut control = ControlChannel { send, recv };
-    protocol::exchange_handshake(
-        &mut control,
-        &LocalHandshake {
-            node_id: sender_identity.node_id_bytes(),
-            device_name: "benchmark-sender".to_owned(),
-            platform: "benchmark".to_owned(),
-            capabilities: vec![Capability::BinaryBlobStream],
-        },
-        *receiver_addr.id.as_bytes(),
+    time::timeout(
+        CONTROL_TIMEOUT,
+        protocol::exchange_handshake(
+            &mut control,
+            &LocalHandshake {
+                node_id: sender_identity.node_id_bytes(),
+                device_name: "benchmark-sender".to_owned(),
+                platform: "benchmark".to_owned(),
+                capabilities: vec![Capability::BinaryBlobStream],
+            },
+            *receiver_addr.id.as_bytes(),
+        ),
     )
-    .await?;
+    .await
+    .context("benchmark sender control handshake timed out")??;
     let mut data = connection.open_uni().await?;
     let start = Instant::now();
     transfer::send_file(&mut data, &source_path, &metadata).await?;
@@ -879,4 +913,131 @@ fn benchmark_directory() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir().join(format!("rift-spike-benchmark-{}-{nanos}", process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{Context, Result};
+    use tokio::time;
+
+    use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    #[tokio::test]
+    async fn control_frame_survives_concurrent_unidirectional_stream() -> Result<()> {
+        time::timeout(TEST_TIMEOUT, async {
+            let sender_identity = NodeIdentity::ephemeral();
+            let receiver_identity = NodeIdentity::ephemeral();
+            let sender = network::bind_endpoint(
+                &sender_identity,
+                NetworkConfig {
+                    relay_mode: RelayModeConfig::Disabled,
+                    relay_only: false,
+                    relay_url: None,
+                    insecure_relay_tls: false,
+                },
+            )
+            .await?;
+            let receiver = network::bind_endpoint(
+                &receiver_identity,
+                NetworkConfig {
+                    relay_mode: RelayModeConfig::Disabled,
+                    relay_only: false,
+                    relay_url: None,
+                    insecure_relay_tls: false,
+                },
+            )
+            .await?;
+            let receive_dir = tempfile::tempdir()?;
+            let source_dir = tempfile::tempdir()?;
+            let source_path = source_dir.path().join("concurrent.bin");
+            let payload = b"concurrent transfer payload".repeat(128);
+            fs::write(&source_path, &payload).await?;
+            let metadata = transfer::metadata_for_file(&source_path).await?;
+            let context = Arc::new(ServerContext {
+                identity: receiver_identity.clone(),
+                device_name: "receiver".to_owned(),
+                platform: "test".to_owned(),
+                receive_dir: receive_dir.path().to_owned(),
+            });
+            let receiver_for_server = receiver.clone();
+            let server_task = tokio::spawn(async move {
+                let incoming = receiver_for_server
+                    .accept()
+                    .await
+                    .context("receiver endpoint closed before accepting")?;
+                handle_connection(incoming, context).await
+            });
+
+            let receiver_address = network::local_endpoint_addr(&receiver);
+            let connection =
+                network::connect(&sender, receiver_address.clone(), TEST_TIMEOUT).await?;
+            let (send, recv) = connection.open_bi().await?;
+            let mut control = ControlChannel { send, recv };
+            protocol::exchange_handshake(
+                &mut control,
+                &LocalHandshake {
+                    node_id: sender_identity.node_id_bytes(),
+                    device_name: "sender".to_owned(),
+                    platform: "test".to_owned(),
+                    capabilities: vec![Capability::BinaryBlobStream],
+                },
+                *receiver_address.id.as_bytes(),
+            )
+            .await?;
+            let ControlChannel {
+                send: mut control_send,
+                recv: mut control_recv,
+            } = control;
+
+            let partial_message = ControlMessage::DeviceMetadata {
+                device_name: "x".repeat(128 * 1024),
+                platform: "test".to_owned(),
+            };
+            let frame = protocol::encode_message(&partial_message)?;
+            let split_at = 4 + 1024;
+            assert!(frame.len() > split_at);
+            control_send.write_all(&frame[..split_at]).await?;
+            time::sleep(Duration::from_millis(100)).await;
+
+            let mut data_stream = connection.open_uni().await?;
+            time::sleep(Duration::from_millis(100)).await;
+            control_send.write_all(&frame[split_at..]).await?;
+            let nonce = 41;
+            protocol::write_value(&mut control_send, &ControlMessage::Ping { nonce }).await?;
+            transfer::send_file(&mut data_stream, &source_path, &metadata).await?;
+
+            let first: ControlMessage =
+                time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
+                    .await
+                    .context("timed out waiting for first control response")??;
+            let second: ControlMessage =
+                time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
+                    .await
+                    .context("timed out waiting for second control response")??;
+            let responses = [first, second];
+            assert!(responses.contains(&ControlMessage::Pong { nonce }));
+            assert!(responses.contains(&ControlMessage::TransferAck {
+                byte_len: metadata.byte_len,
+                blake3: metadata.blake3,
+            }));
+
+            control_send
+                .finish()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let server_result = time::timeout(TEST_TIMEOUT, server_task)
+                .await
+                .context("server task did not finish")?
+                .context("server task failed to join")?;
+            server_result?;
+            connection.close(0_u32.into(), b"test complete");
+            sender.close().await;
+            receiver.close().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("concurrent control/data scenario timed out")??;
+        Ok(())
+    }
 }

@@ -5,7 +5,10 @@ use std::fmt;
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::mpsc,
+};
 use tracing::debug;
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -184,6 +187,21 @@ where
         .await
         .map_err(FrameError::Payload)?;
     postcard::from_bytes(&payload).map_err(FrameError::Decode)
+}
+
+pub async fn read_control_messages<R>(
+    mut reader: R,
+    sender: mpsc::Sender<Result<ControlMessage, FrameError>>,
+) where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let result: Result<ControlMessage, FrameError> = read_value(&mut reader).await;
+        let should_stop = result.is_err();
+        if sender.send(result).await.is_err() || should_stop {
+            break;
+        }
+    }
 }
 
 pub async fn exchange_handshake(
