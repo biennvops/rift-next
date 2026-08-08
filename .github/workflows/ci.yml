@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Quality gates
+  quality-linux:
+    name: Quality firewall (Linux)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -18,9 +18,74 @@ jobs:
         uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy, rustfmt
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run tests
-        run: cargo test --all
+      - name: Install pinned cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Run canonical validation firewall
+        run: cargo xtask verify
+
+  coverage-linux:
+    name: Coverage floor (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: llvm-tools-preview
+      - name: Install pinned cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - name: Generate coverage and enforce floor
+        run: cargo xtask coverage
+      - name: Upload LCOV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-lcov
+          path: target/llvm-cov/lcov.info
+          if-no-files-found: error
+
+  macos-smoke:
+    name: Production crates (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Test production foundation crates
+        run: >-
+          cargo test --all-features
+          -p rift-core
+          -p rift-protocol
+          -p rift-transport-iroh
+
+  windows-smoke:
+    name: Production crates (Windows, advisory)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Test production foundation crates
+        run: >-
+          cargo test --all-features
+          -p rift-core
+          -p rift-protocol
+          -p rift-transport-iroh
+
+  benchmark-smoke:
+    name: Benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Exercise benchmark path
+        run: cargo xtask benchmark-smoke

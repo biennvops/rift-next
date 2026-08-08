@@ -182,10 +182,18 @@ impl StagedFile {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a staged file owns its path until cleanup"
+    )]
     fn path(&self) -> &Path {
         self.path.as_deref().expect("staged file path was removed")
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a staged file is open until receive completion"
+    )]
     fn file_mut(&mut self) -> &mut fs::File {
         self.file.as_mut().expect("staged file was closed")
     }
@@ -310,6 +318,8 @@ fn validate_file_name(file_name: &str) -> Result<(), TransferError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use std::{path::Path, time::Duration};
 
     use super::*;

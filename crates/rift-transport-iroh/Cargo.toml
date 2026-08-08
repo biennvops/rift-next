@@ -1,0 +1,12 @@
+[package]
+name = "rift-transport-iroh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+iroh.workspace = true
+
+[lints]
+workspace = true
