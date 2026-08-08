@@ -139,7 +139,11 @@ pub struct UdpFaultInjector {
 
 impl UdpFaultInjector {
     pub async fn start(target: SocketAddr) -> Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let bind_address = match target {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        };
+        let socket = UdpSocket::bind(bind_address).await?;
         let address = socket.local_addr()?;
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -435,6 +439,34 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_fault_injector_forwards_ipv6_when_loopback_is_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = match UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("skipping IPv6 fault injector test: {error}");
+                return Ok(());
+            }
+        };
+        let target_address = target.local_addr()?;
+        let injector = UdpFaultInjector::start(target_address).await?;
+        assert!(injector.address().is_ipv6());
+        let client = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await?;
+        client.send_to(b"ping", injector.address()).await?;
+
+        let mut buffer = [0_u8; 16];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), target.recv_from(&mut buffer)).await??;
+        assert_eq!(&buffer[..length], b"ping");
+        target.send_to(b"pong", source).await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buffer)).await??;
+        assert_eq!(&buffer[..length], b"pong");
+        injector.cut();
+        Ok(())
     }
 
     #[test]
