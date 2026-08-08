@@ -35,6 +35,7 @@ pub struct NetworkConfig {
     pub relay_mode: RelayModeConfig,
     pub relay_only: bool,
     pub relay_url: Option<RelayUrl>,
+    pub insecure_relay_tls: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -44,6 +45,9 @@ pub struct PeerDescriptor {
 }
 
 pub async fn bind_endpoint(identity: &NodeIdentity, config: NetworkConfig) -> Result<Endpoint> {
+    if config.insecure_relay_tls && config.relay_url.is_none() {
+        bail!("insecure relay TLS requires --relay-url");
+    }
     if config.relay_only
         && config.relay_mode == RelayModeConfig::Disabled
         && config.relay_url.is_none()
@@ -69,7 +73,7 @@ pub async fn bind_endpoint(identity: &NodeIdentity, config: NetworkConfig) -> Re
             .clear_ip_transports()
             .addr_filter(iroh::address_lookup::AddrFilter::relay_only());
     }
-    if config.relay_url.is_some() {
+    if config.insecure_relay_tls {
         builder = builder.ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify());
     }
 

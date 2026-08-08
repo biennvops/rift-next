@@ -24,6 +24,7 @@ async fn relay_only_endpoints_establish_an_authenticated_control_connection() ->
             relay_mode: RelayModeConfig::Disabled,
             relay_only: true,
             relay_url: Some(url),
+            insecure_relay_tls: true,
         };
         let sender = network::bind_endpoint(&sender_identity, config(relay_url.clone())).await?;
         let receiver =

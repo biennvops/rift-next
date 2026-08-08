@@ -36,6 +36,7 @@ async fn two_direct_nodes_handshake_and_stream_a_binary_payload() -> Result<()> 
                 relay_mode: RelayModeConfig::Disabled,
                 relay_only: false,
                 relay_url: None,
+                insecure_relay_tls: false,
             },
         )
         .await?;
@@ -45,6 +46,7 @@ async fn two_direct_nodes_handshake_and_stream_a_binary_payload() -> Result<()> 
                 relay_mode: RelayModeConfig::Disabled,
                 relay_only: false,
                 relay_url: None,
+                insecure_relay_tls: false,
             },
         )
         .await?;

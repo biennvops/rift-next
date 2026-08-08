@@ -67,6 +67,9 @@ struct EndpointArgs {
     /// A custom relay URL, intended for the local `rift-relay` experiment.
     #[arg(long)]
     relay_url: Option<String>,
+    /// Disable certificate verification for a self-signed local relay only.
+    #[arg(long)]
+    insecure_relay_tls: bool,
     #[arg(long, default_value = "rift-spike")]
     device_name: String,
     #[arg(long)]
@@ -103,6 +106,7 @@ impl EndpointArgs {
             },
             relay_only: self.relay_only,
             relay_url,
+            insecure_relay_tls: self.insecure_relay_tls,
         })
     }
 }
@@ -645,6 +649,7 @@ async fn benchmark_local_transfer(bytes: u64) -> Result<TransferBenchmarkResult>
             relay_mode: RelayModeConfig::Disabled,
             relay_only: false,
             relay_url: None,
+            insecure_relay_tls: false,
         },
     )
     .await?;
@@ -654,6 +659,7 @@ async fn benchmark_local_transfer(bytes: u64) -> Result<TransferBenchmarkResult>
             relay_mode: RelayModeConfig::Disabled,
             relay_only: false,
             relay_url: None,
+            insecure_relay_tls: false,
         },
     )
     .await?;

@@ -11,7 +11,9 @@ async fn main() -> Result<()> {
         .https_url()
         .context("local relay did not expose an HTTPS URL")?;
     println!("Relay URL: {relay_url}");
-    println!("Pass --relay-url {relay_url} --relay-only to rift-spike run/send");
+    println!(
+        "Pass --relay-url {relay_url} --insecure-relay-tls --relay-only to rift-spike run/send"
+    );
     signal::ctrl_c()
         .await
         .context("unable to listen for Ctrl-C")?;
