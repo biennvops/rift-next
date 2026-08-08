@@ -30,6 +30,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -345,6 +346,9 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
     let mut control_send = send;
     let (control_tx, mut control_rx) = mpsc::channel(16);
     let control_reader = tokio::spawn(protocol::read_control_messages(recv, control_tx));
+    let (transfer_result_tx, mut transfer_result_rx) =
+        mpsc::channel::<Result<transfer::TransferResult>>(MAX_CONCURRENT_TRANSFERS);
+    let mut transfer_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -382,15 +386,9 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                     }
                 }
             }
-            result = connection.accept_uni() => {
-                let mut recv = result.context("unable to accept binary stream")?;
-                info!(
-                    local_node_id = %context.identity.node_id(),
-                    remote_node_id = %remote_node_id,
-                    "binary stream created"
-                );
-                match transfer::receive_file(&mut recv, &context.receive_dir).await {
-                    Ok(result) => {
+            result = transfer_result_rx.recv() => {
+                match result {
+                    Some(Ok(result)) => {
                         info!(
                             local_node_id = %context.identity.node_id(),
                             remote_node_id = %remote_node_id,
@@ -408,7 +406,7 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                             .await
                             .context("unable to send transfer acknowledgement")?;
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         warn!(
                             local_node_id = %context.identity.node_id(),
                             remote_node_id = %remote_node_id,
@@ -416,11 +414,66 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                             "binary transfer failed"
                         );
                     }
+                    None => {
+                        debug!("transfer result channel closed");
+                        break;
+                    }
                 }
+            }
+            result = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(
+                        local_node_id = %context.identity.node_id(),
+                        remote_node_id = %remote_node_id,
+                        error = ?error,
+                        "binary transfer task failed to join"
+                    );
+                }
+            }
+            result = connection.accept_uni() => {
+                let mut recv = result.context("unable to accept binary stream")?;
+                info!(
+                    local_node_id = %context.identity.node_id(),
+                    remote_node_id = %remote_node_id,
+                    "binary stream created"
+                );
+                if transfer_tasks.len() >= MAX_CONCURRENT_TRANSFERS {
+                    warn!(
+                        local_node_id = %context.identity.node_id(),
+                        remote_node_id = %remote_node_id,
+                        maximum = MAX_CONCURRENT_TRANSFERS,
+                        "too many concurrent binary transfers"
+                    );
+                    if let Err(error) = recv.stop(0_u32.into()) {
+                        debug!(error = ?error, "unable to stop excess binary stream");
+                    }
+                    continue;
+                }
+
+                let receive_dir = context.receive_dir.clone();
+                let transfer_result_tx = transfer_result_tx.clone();
+                transfer_tasks.spawn(async move {
+                    let result = match time::timeout(
+                        TRANSFER_TIMEOUT,
+                        transfer::receive_file(&mut recv, &receive_dir),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => {
+                            let _ = recv.stop(0_u32.into());
+                            Err(anyhow::anyhow!(
+                                "binary transfer timed out after {TRANSFER_TIMEOUT:?}"
+                            ))
+                        }
+                    };
+                    let _ = transfer_result_tx.send(result).await;
+                });
             }
         }
     }
 
+    transfer_tasks.abort_all();
     control_reader.abort();
     if let Err(error) = control_send.finish() {
         debug!(error = %error, "control stream was already closed");
@@ -924,6 +977,26 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+    async fn wait_for_staged_transfer(receive_dir: &Path, file_name: &str) -> Result<()> {
+        let prefix = format!(".{file_name}.");
+        time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let mut entries = fs::read_dir(receive_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(&prefix) && name.ends_with(".part") {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for transfer to stage its output")??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn control_frame_survives_concurrent_unidirectional_stream() -> Result<()> {
         time::timeout(TEST_TIMEOUT, async {
@@ -955,6 +1028,14 @@ mod tests {
             let payload = b"concurrent transfer payload".repeat(128);
             fs::write(&source_path, &payload).await?;
             let metadata = transfer::metadata_for_file(&source_path).await?;
+            let independent_path = source_dir.path().join("independent.bin");
+            let independent_payload = b"independent transfer payload".repeat(64);
+            fs::write(&independent_path, &independent_payload).await?;
+            let independent_metadata = transfer::metadata_for_file(&independent_path).await?;
+            let stalled_path = source_dir.path().join("stalled.bin");
+            let stalled_payload = vec![0x5a; 64 * 1024];
+            fs::write(&stalled_path, &stalled_payload).await?;
+            let stalled_metadata = transfer::metadata_for_file(&stalled_path).await?;
             let context = Arc::new(ServerContext {
                 identity: receiver_identity.clone(),
                 device_name: "receiver".to_owned(),
@@ -1002,26 +1083,72 @@ mod tests {
             time::sleep(Duration::from_millis(100)).await;
 
             let mut data_stream = connection.open_uni().await?;
-            time::sleep(Duration::from_millis(100)).await;
+            transfer::send_file(&mut data_stream, &source_path, &metadata).await?;
+            let acknowledgement: ControlMessage =
+                time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
+                    .await
+                    .context("timed out waiting for transfer acknowledgement")??;
+            assert_eq!(
+                acknowledgement,
+                ControlMessage::TransferAck {
+                    byte_len: metadata.byte_len,
+                    blake3: metadata.blake3,
+                }
+            );
+
             control_send.write_all(&frame[split_at..]).await?;
             let nonce = 41;
             protocol::write_value(&mut control_send, &ControlMessage::Ping { nonce }).await?;
-            transfer::send_file(&mut data_stream, &source_path, &metadata).await?;
+            let response: ControlMessage =
+                time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
+                    .await
+                    .context("timed out waiting for pong")??;
+            assert_eq!(response, ControlMessage::Pong { nonce });
 
-            let first: ControlMessage =
+            let mut stalled_stream = connection.open_uni().await?;
+            protocol::write_value(&mut stalled_stream, &stalled_metadata).await?;
+            stalled_stream.write_all(&stalled_payload[..1024]).await?;
+            wait_for_staged_transfer(receive_dir.path(), "stalled.bin").await?;
+            let stalled_nonce = 42;
+            protocol::write_value(
+                &mut control_send,
+                &ControlMessage::Ping {
+                    nonce: stalled_nonce,
+                },
+            )
+            .await?;
+            let stalled_response: ControlMessage =
                 time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
                     .await
-                    .context("timed out waiting for first control response")??;
-            let second: ControlMessage =
+                    .context("timed out waiting for pong while transfer stalled")??;
+            assert_eq!(
+                stalled_response,
+                ControlMessage::Pong {
+                    nonce: stalled_nonce,
+                }
+            );
+
+            let mut independent_stream = connection.open_uni().await?;
+            transfer::send_file(
+                &mut independent_stream,
+                &independent_path,
+                &independent_metadata,
+            )
+            .await?;
+            let independent_ack: ControlMessage =
                 time::timeout(TEST_TIMEOUT, protocol::read_value(&mut control_recv))
                     .await
-                    .context("timed out waiting for second control response")??;
-            let responses = [first, second];
-            assert!(responses.contains(&ControlMessage::Pong { nonce }));
-            assert!(responses.contains(&ControlMessage::TransferAck {
-                byte_len: metadata.byte_len,
-                blake3: metadata.blake3,
-            }));
+                    .context("timed out waiting for independent transfer acknowledgement")??;
+            assert_eq!(
+                independent_ack,
+                ControlMessage::TransferAck {
+                    byte_len: independent_metadata.byte_len,
+                    blake3: independent_metadata.blake3,
+                }
+            );
+            stalled_stream
+                .finish()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
             control_send
                 .finish()
