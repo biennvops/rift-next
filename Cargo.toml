@@ -21,9 +21,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 hex = "0.4"
-iroh = "1.0.3"
+iroh = "=1.0.3"
 # Used only for the local self-signed relay experiment and custom relay TLS configuration.
-iroh-relay = { version = "1.0.3", features = ["server", "test-utils"] }
+iroh-relay = { version = "=1.0.3", features = ["server", "test-utils"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
