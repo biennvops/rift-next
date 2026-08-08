@@ -422,6 +422,21 @@ mod tests {
     use super::*;
     use iroh::SecretKey;
 
+    #[tokio::test]
+    async fn insecure_relay_tls_requires_a_custom_relay_url() {
+        let result = bind_endpoint(
+            &NodeIdentity::ephemeral(),
+            NetworkConfig {
+                relay_mode: RelayModeConfig::Default,
+                relay_only: false,
+                relay_url: None,
+                insecure_relay_tls: true,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn peer_descriptor_round_trips_direct_and_relay_addresses() -> Result<()> {
         let id = SecretKey::generate().public();
