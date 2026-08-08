@@ -366,9 +366,13 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                     Some(Ok(ControlMessage::Ping { nonce })) => {
                         let pong = ControlMessage::Pong { nonce };
                         debug!(message = ?pong, "control message sent");
-                        protocol::write_value(&mut control_send, &pong)
-                            .await
-                            .context("unable to send ping response")?;
+                        time::timeout(
+                            CONTROL_TIMEOUT,
+                            protocol::write_value(&mut control_send, &pong),
+                        )
+                        .await
+                        .context("timed out sending ping response")?
+                        .context("unable to send ping response")?;
                     }
                     Some(Ok(ControlMessage::Pong { nonce })) => {
                         debug!(nonce, "unexpected pong received on server control stream");
@@ -402,9 +406,13 @@ async fn handle_connection(incoming: Incoming, context: Arc<ServerContext>) -> R
                             blake3: result.blake3,
                         };
                         debug!(message = ?ack, "control message sent");
-                        protocol::write_value(&mut control_send, &ack)
-                            .await
-                            .context("unable to send transfer acknowledgement")?;
+                        time::timeout(
+                            CONTROL_TIMEOUT,
+                            protocol::write_value(&mut control_send, &ack),
+                        )
+                        .await
+                        .context("timed out sending transfer acknowledgement")?
+                        .context("unable to send transfer acknowledgement")?;
                     }
                     Some(Err(error)) => {
                         warn!(

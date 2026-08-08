@@ -131,20 +131,22 @@ where
     fs::create_dir_all(receive_dir).await?;
 
     let output_path = receive_dir.join(&metadata.file_name);
-    let (temporary_path, mut temporary_file) =
+    let (temporary_path, temporary_file) =
         create_temporary_file(receive_dir, &metadata.file_name).await?;
-    let result = receive_to_temporary(recv, &mut temporary_file, &metadata).await;
-    drop(temporary_file);
+    let mut temporary = StagedFile::new(temporary_path, temporary_file);
+    let result = receive_to_temporary(recv, temporary.file_mut(), &metadata).await;
+    temporary.close_file();
     match result {
         Ok((byte_len, blake3)) => {
             if let Err(error) = verify_payload(metadata.byte_len, byte_len, metadata.blake3, blake3)
             {
-                let _ = fs::remove_file(&temporary_path).await;
+                temporary.remove().await;
                 return Err(error);
             }
+            let temporary_path = temporary.path().to_owned();
             match fs::hard_link(&temporary_path, &output_path).await {
                 Ok(()) => {
-                    let _ = fs::remove_file(&temporary_path).await;
+                    temporary.remove().await;
                     Ok(TransferResult {
                         output_path,
                         byte_len,
@@ -152,18 +154,69 @@ where
                     })
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&temporary_path).await;
+                    temporary.remove().await;
                     Err(TransferError::DestinationExists(output_path))
                 }
                 Err(error) => {
-                    let _ = fs::remove_file(&temporary_path).await;
+                    temporary.remove().await;
                     Err(error.into())
                 }
             }
         }
         Err(error) => {
-            let _ = fs::remove_file(&temporary_path).await;
+            temporary.remove().await;
             Err(error)
+        }
+    }
+}
+
+struct StagedFile {
+    path: Option<PathBuf>,
+    file: Option<fs::File>,
+}
+
+impl StagedFile {
+    fn new(path: PathBuf, file: fs::File) -> Self {
+        Self {
+            path: Some(path),
+            file: Some(file),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("staged file path was removed")
+    }
+
+    fn file_mut(&mut self) -> &mut fs::File {
+        self.file.as_mut().expect("staged file was closed")
+    }
+
+    fn close_file(&mut self) {
+        self.file.take();
+    }
+
+    async fn remove(&mut self) {
+        self.close_file();
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        match fs::remove_file(path).await {
+            Ok(()) => {
+                self.path.take();
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.path.take();
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        self.file.take();
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -259,8 +312,120 @@ fn validate_file_name(file_name: &str) -> Result<(), TransferError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, time::Duration};
+
     use super::*;
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::{
+        io::{AsyncWriteExt, duplex},
+        time,
+    };
+
+    async fn staging_file_exists(
+        receive_dir: &Path,
+        file_name: &str,
+    ) -> Result<bool, std::io::Error> {
+        let mut entries = match fs::read_dir(receive_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!(".{file_name}.");
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".part") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn wait_for_staging_file(
+        receive_dir: &Path,
+        file_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if staging_file_exists(receive_dir, file_name).await? {
+                    return Ok::<(), std::io::Error>(());
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn assert_no_staging_file(
+        receive_dir: &Path,
+        file_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!staging_file_exists(receive_dir, file_name).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_receive_removes_partial_staging_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let receive_dir = directory.path().join("received");
+        let payload = vec![0x42; 64 * 1024];
+        let metadata = TransferMetadata {
+            file_name: "cancelled.bin".to_owned(),
+            byte_len: payload.len() as u64,
+            blake3: *blake3::hash(&payload).as_bytes(),
+        };
+        let (mut writer, reader) = duplex(4096);
+        writer
+            .write_all(&protocol::encode_frame(&metadata)?)
+            .await?;
+        writer.write_all(&payload[..1024]).await?;
+        let task_receive_dir = receive_dir.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            receive_file(&mut reader, &task_receive_dir).await
+        });
+
+        wait_for_staging_file(&receive_dir, &metadata.file_name).await?;
+        task.abort();
+        let error = task.await.expect_err("receive task should be cancelled");
+        assert!(error.is_cancelled());
+        assert_no_staging_file(&receive_dir, &metadata.file_name).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_deadline_removes_partial_staging_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let receive_dir = directory.path().join("received");
+        let payload = vec![0x24; 64 * 1024];
+        let metadata = TransferMetadata {
+            file_name: "timed-out.bin".to_owned(),
+            byte_len: payload.len() as u64,
+            blake3: *blake3::hash(&payload).as_bytes(),
+        };
+        let (mut writer, reader) = duplex(4096);
+        writer
+            .write_all(&protocol::encode_frame(&metadata)?)
+            .await?;
+        writer.write_all(&payload[..1024]).await?;
+        let task_receive_dir = receive_dir.clone();
+        let task = tokio::spawn(async move {
+            let mut reader = reader;
+            time::timeout(
+                Duration::from_millis(250),
+                receive_file(&mut reader, &task_receive_dir),
+            )
+            .await
+        });
+
+        wait_for_staging_file(&receive_dir, &metadata.file_name).await?;
+        let result = task.await?;
+        assert!(result.is_err(), "receive deadline should expire");
+        assert_no_staging_file(&receive_dir, &metadata.file_name).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn metadata_hashes_a_file_without_loading_it_as_a_whole_buffer()
