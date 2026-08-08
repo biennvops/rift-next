@@ -4,8 +4,10 @@
 //! corruption-detecting storage format; it does not add another certificate or PKI layer.
 
 use std::{
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use iroh::{EndpointId, SecretKey};
@@ -17,6 +19,7 @@ const FORMAT_VERSION: u8 = 1;
 const SECRET_KEY_LEN: usize = 32;
 const CHECKSUM_LEN: usize = 16;
 const STORAGE_LEN: usize = MAGIC.len() + 1 + SECRET_KEY_LEN + CHECKSUM_LEN;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -44,8 +47,12 @@ impl NodeIdentity {
             Ok(bytes) => decode_storage(&bytes)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let secret_key = SecretKey::generate();
-                write_storage(&storage_path, &secret_key)?;
-                secret_key
+                if create_storage(&storage_path, &secret_key)? {
+                    secret_key
+                } else {
+                    let bytes = fs::read(&storage_path)?;
+                    decode_storage(&bytes)?
+                }
             }
             Err(error) => return Err(error.into()),
         };
@@ -130,13 +137,54 @@ fn decode_storage(bytes: &[u8]) -> Result<SecretKey, IdentityError> {
     Ok(SecretKey::from_bytes(&secret_bytes))
 }
 
-fn write_storage(path: &Path, secret_key: &SecretKey) -> Result<(), IdentityError> {
-    let temporary_path = path.with_extension("key.tmp");
-    fs::write(&temporary_path, encode_storage(secret_key))?;
+fn create_storage(path: &Path, secret_key: &SecretKey) -> Result<bool, IdentityError> {
+    let (mut temporary_file, temporary_path) = create_temporary_file(path)?;
     #[cfg(unix)]
     fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))?;
-    fs::rename(temporary_path, path)?;
-    Ok(())
+    temporary_file.write_all(&encode_storage(secret_key))?;
+    temporary_file.sync_all()?;
+    drop(temporary_file);
+
+    match fs::hard_link(&temporary_path, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary_path);
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temporary_path);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary_path);
+            Err(error.into())
+        }
+    }
+}
+
+fn create_temporary_file(path: &Path) -> Result<(File, PathBuf), IdentityError> {
+    let file_name = path
+        .file_name()
+        .ok_or(IdentityError::MalformedStorage(
+            "identity path has no file name",
+        ))?
+        .to_string_lossy();
+    loop {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = path.with_file_name(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((file, temporary_path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -159,6 +207,39 @@ mod tests {
         assert_eq!(first_fingerprint, second.fingerprint());
         assert_eq!(first_secret, second.secret_key().to_bytes());
         assert_eq!(first.storage_path(), directory.path().join(IDENTITY_FILE));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_loads_share_one_persisted_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().to_owned();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    NodeIdentity::load_or_create(path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let identities = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("identity loader thread panicked"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first_id = identities[0].node_id();
+        let first_secret = identities[0].secret_key().to_bytes();
+        assert!(identities.iter().all(|identity| {
+            identity.node_id() == first_id && identity.secret_key().to_bytes() == first_secret
+        }));
+        assert_eq!(
+            fs::read(directory.path().join(IDENTITY_FILE))?.len(),
+            STORAGE_LEN
+        );
         Ok(())
     }
 
