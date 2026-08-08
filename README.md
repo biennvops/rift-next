@@ -154,7 +154,7 @@ cargo run -p rift-spike -- fault-inject \
   '<direct-plus-relay peer descriptor>'
 ```
 
-`fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay, sends a framed `Ping { nonce }` over the existing control stream, and requires the receiver's matching `Pong { nonce }` before reporting success. This is a deterministic local packet-loss/path-loss experiment; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
+`fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay, sends a framed `Ping { nonce }` over the existing control stream, and requires the receiver's matching `Pong { nonce }` before reporting success. Iroh may advertise additional direct candidates during connection establishment; if one of those uncontrolled paths is selected, the command fails rather than claiming that the proxy caused a complete outage. The integration test uses a constrained local topology for deterministic packet-loss/path-loss evidence; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
 
 ## Architecture implemented
 
