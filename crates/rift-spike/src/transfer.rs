@@ -3,6 +3,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use blake3::Hasher;
@@ -10,13 +11,14 @@ use iroh::endpoint::SendStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    fs,
+    fs::{self, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 
 use crate::protocol::{self, FrameError};
 
 pub const STREAM_BUFFER_SIZE: usize = 64 * 1024;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferMetadata {
@@ -46,6 +48,8 @@ pub enum TransferError {
     LengthMismatch { expected: u64, actual: u64 },
     #[error("transfer hash mismatch: expected {expected}, received {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("transfer destination already exists: {0}")]
+    DestinationExists(PathBuf),
 }
 
 pub async fn metadata_for_file(path: &Path) -> Result<TransferMetadata, TransferError> {
@@ -127,8 +131,10 @@ where
     fs::create_dir_all(receive_dir).await?;
 
     let output_path = receive_dir.join(&metadata.file_name);
-    let temporary_path = receive_dir.join(format!(".{}.part", metadata.file_name));
-    let result = receive_to_temporary(recv, &temporary_path, &metadata).await;
+    let (temporary_path, mut temporary_file) =
+        create_temporary_file(receive_dir, &metadata.file_name).await?;
+    let result = receive_to_temporary(recv, &mut temporary_file, &metadata).await;
+    drop(temporary_file);
     match result {
         Ok((byte_len, blake3)) => {
             if let Err(error) = verify_payload(metadata.byte_len, byte_len, metadata.blake3, blake3)
@@ -136,12 +142,24 @@ where
                 let _ = fs::remove_file(&temporary_path).await;
                 return Err(error);
             }
-            fs::rename(&temporary_path, &output_path).await?;
-            Ok(TransferResult {
-                output_path,
-                byte_len,
-                blake3,
-            })
+            match fs::hard_link(&temporary_path, &output_path).await {
+                Ok(()) => {
+                    let _ = fs::remove_file(&temporary_path).await;
+                    Ok(TransferResult {
+                        output_path,
+                        byte_len,
+                        blake3,
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&temporary_path).await;
+                    Err(TransferError::DestinationExists(output_path))
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary_path).await;
+                    Err(error.into())
+                }
+            }
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary_path).await;
@@ -150,15 +168,38 @@ where
     }
 }
 
+async fn create_temporary_file(
+    receive_dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, fs::File), TransferError> {
+    loop {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary_path = receive_dir.join(format!(
+            ".{file_name}.{}.{}.part",
+            std::process::id(),
+            counter
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await
+        {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 async fn receive_to_temporary<R>(
     recv: &mut R,
-    temporary_path: &Path,
+    file: &mut fs::File,
     metadata: &TransferMetadata,
 ) -> Result<(u64, [u8; 32]), TransferError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut file = fs::File::create(temporary_path).await?;
     let mut hasher = Hasher::new();
     let mut buffer = [0; STREAM_BUFFER_SIZE];
     let mut total = 0_u64;
@@ -269,6 +310,46 @@ mod tests {
             .expect_err("truncated payload must fail");
         assert!(matches!(error, TransferError::LengthMismatch { .. }));
         assert!(!receive_dir.join("payload.bin").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_name_transfers_use_unique_staging_and_reject_collision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let receive_dir = directory.path().join("received");
+        let payload = vec![0x42; 1024];
+        let metadata = TransferMetadata {
+            file_name: "payload.bin".to_owned(),
+            byte_len: payload.len() as u64,
+            blake3: *blake3::hash(&payload).as_bytes(),
+        };
+        let (mut writer_a, mut reader_a) = duplex(4096);
+        let (mut writer_b, mut reader_b) = duplex(4096);
+        let frame = protocol::encode_frame(&metadata)?;
+        for writer in [&mut writer_a, &mut writer_b] {
+            writer.write_all(&frame).await?;
+            writer.write_all(&payload).await?;
+            writer.shutdown().await?;
+        }
+
+        let first = receive_file(&mut reader_a, &receive_dir);
+        let second = receive_file(&mut reader_b, &receive_dir);
+        let (first, second) = tokio::join!(first, second);
+        let results = [first, second];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(TransferError::DestinationExists(_))))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(receive_dir.join("payload.bin")).await?, payload);
+        let mut entries = fs::read_dir(&receive_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            assert_ne!(entry.file_name(), ".payload.bin.part");
+        }
         Ok(())
     }
 
