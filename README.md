@@ -154,7 +154,7 @@ cargo run -p rift-spike -- fault-inject \
   '<direct-plus-relay peer descriptor>'
 ```
 
-`fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay and sends a post-recovery probe stream before reporting success. This is a deterministic local packet-loss/path-loss experiment; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
+`fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay, sends a framed `Ping { nonce }` over the existing control stream, and requires the receiver's matching `Pong { nonce }` before reporting success. This is a deterministic local packet-loss/path-loss experiment; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
 
 ## Architecture implemented
 
@@ -193,7 +193,7 @@ The application compares the `Hello.node_id` to the endpoint ID already authenti
 
 ### Blob/data plane
 
-The sender hashes the file once to create metadata, then streams it in 64 KiB chunks while calculating a second hash. The receiver reads the metadata, writes into a temporary file, hashes while reading, checks the byte count and BLAKE3 digest, then renames the temporary file into the receive directory. A failed or truncated transfer does not become a completed output file.
+The sender hashes the file once to create metadata, then streams it in 64 KiB chunks while calculating a second hash. The receiver reads the metadata, writes into a temporary file, hashes while reading, checks the byte count and BLAKE3 digest, then atomically promotes the temporary file with a hard link and removes the staging path. A failed or truncated transfer does not become a completed output file.
 
 This is deliberately a two-pass sender because the receiver needs the expected content hash before bytes arrive. Each receive uses a uniquely-created staging path, and promotion refuses an already-existing destination instead of overwriting it. The receiver never buffers the complete payload in memory.
 
@@ -201,7 +201,7 @@ This is deliberately a two-pass sender because the receiver needs the expected c
 
 Unit tests cover identity creation/reload/corruption, fingerprint stability, frame round trips and malformed frames, unsupported versions, metadata, unsafe names, hash/length failures, and truncated payloads.
 
-`tests/networking.rs` launches two direct Iroh endpoints and verifies authenticated Hello/metadata/capabilities, a separate binary stream, receiver-side length/hash verification, and the acknowledgement. `tests/relay.rs` starts a local self-signed Iroh relay, verifies a relay-only authenticated control connection, and runs a second direct-plus-relay scenario whose local UDP forwarder is cut under a live connection; the test observes relay selection and a post-outage control message. Both integration scenarios wrap the complete setup, handshake, stream, transfer, channel, and cleanup sequence in an outer deadline, with shorter stage deadlines for diagnostics.
+`tests/networking.rs` launches two direct Iroh endpoints and verifies authenticated Hello/metadata/capabilities, a separate binary stream, receiver-side length/hash verification, and the acknowledgement. `tests/relay.rs` starts a local self-signed Iroh relay, verifies a relay-only authenticated control connection including Ping/Pong framing, and runs a second direct-plus-relay scenario whose local UDP forwarder is cut under a live connection; the test observes relay selection and post-outage control delivery. Both integration scenarios wrap the complete setup, handshake, stream, transfer, channel, and cleanup sequence in an outer deadline, with shorter stage deadlines for diagnostics.
 
 The explicit benchmark command is intentionally environment-dependent and has no pass/fail throughput threshold:
 
