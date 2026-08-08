@@ -43,7 +43,9 @@ enum Command {
     /// Connect, handshake, and stream one file to a running node.
     Send(SendArgs),
     /// Deliberately close and re-establish a control connection.
-    Reconnect(ReconnectArgs),
+    ReconnectAfterClose(ReconnectAfterCloseArgs),
+    /// Cut a live direct UDP path and observe relay recovery.
+    FaultInject(FaultInjectArgs),
     /// Run the explicit protocol and localhost transfer baseline.
     Bench(BenchArgs),
 }
@@ -129,7 +131,7 @@ struct SendArgs {
 }
 
 #[derive(Args, Debug)]
-struct ReconnectArgs {
+struct ReconnectAfterCloseArgs {
     #[command(flatten)]
     endpoint: EndpointArgs,
     /// A node ID or the JSON printed as `Peer address` by `run`.
@@ -140,6 +142,18 @@ struct ReconnectArgs {
     drop_after_ms: u64,
     #[arg(long, default_value_t = 1_000)]
     retry_delay_ms: u64,
+}
+
+#[derive(Args, Debug)]
+struct FaultInjectArgs {
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+    /// A node ID or the JSON printed as `Peer address` by `run`.
+    peer: String,
+    #[arg(long, default_value_t = 1_000)]
+    fault_after_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    recovery_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -171,7 +185,8 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Run(args) => run_node(args).await,
         Command::Send(args) => send_file(args).await,
-        Command::Reconnect(args) => reconnect(args).await,
+        Command::ReconnectAfterClose(args) => reconnect_after_close(args).await,
+        Command::FaultInject(args) => fault_inject(args).await,
         Command::Bench(args) => benchmark(args).await,
     }
 }
@@ -479,7 +494,83 @@ async fn send_file(args: SendArgs) -> Result<()> {
     Ok(())
 }
 
-async fn reconnect(args: ReconnectArgs) -> Result<()> {
+async fn fault_inject(args: FaultInjectArgs) -> Result<()> {
+    if args.recovery_timeout_secs == 0 {
+        bail!("--recovery-timeout-secs must be greater than zero");
+    }
+    let identity = NodeIdentity::load_or_create(&args.endpoint.data_dir)
+        .context("unable to load node identity")?;
+    let peer = network::parse_peer_descriptor(&args.peer)?;
+    if peer.relay_urls().next().is_none() {
+        bail!("fault injection requires a peer descriptor with a relay address");
+    }
+    let direct_address = network::first_ip_address(&peer)?;
+    let proxy = network::UdpFaultInjector::start(direct_address).await?;
+    let fault_peer = network::peer_with_ip_proxy(&peer, proxy.address())?;
+    let endpoint = network::bind_endpoint(&identity, args.endpoint.network_config()?).await?;
+    print_startup(&identity, &endpoint)?;
+    if !args.endpoint.uses_relay()
+        || !network::wait_for_relay(
+            &endpoint,
+            Duration::from_secs(args.endpoint.relay_timeout_secs),
+        )
+        .await
+    {
+        bail!("fault injection requires an endpoint that is online via relay");
+    }
+    print_updated_peer_address(&endpoint)?;
+
+    let (connection, mut control, diagnostics) =
+        connect_and_handshake(&endpoint, &identity, &args.endpoint, &fault_peer).await?;
+    network::wait_for_selected_path(&connection, false, CONNECTION_TIMEOUT)
+        .await
+        .context("fault-injection connection did not select the direct path")?;
+    info!(
+        remote_node_id = %connection.remote_id(),
+        "fault-injection connection established over direct UDP path"
+    );
+    time::sleep(Duration::from_millis(args.fault_after_ms)).await;
+    info!("cutting the direct UDP path while the connection is live");
+    proxy.cut();
+    endpoint.network_change().await;
+    network::wait_for_selected_path(
+        &connection,
+        true,
+        Duration::from_secs(args.recovery_timeout_secs),
+    )
+    .await
+    .context("fault-injection connection did not recover over relay")?;
+    let mut probe = time::timeout(CONTROL_TIMEOUT, connection.open_uni())
+        .await
+        .context("timed out opening post-recovery probe stream")?
+        .context("unable to open post-recovery probe stream")?;
+    time::timeout(CONTROL_TIMEOUT, async {
+        probe
+            .write_all(b"rift fault-injection recovery probe")
+            .await
+            .context("unable to write post-recovery probe")?;
+        probe
+            .finish()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("unable to finish post-recovery probe")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("post-recovery probe timed out")??;
+    info!(
+        remote_node_id = %connection.remote_id(),
+        "fault-injection connection remained usable after direct path loss"
+    );
+    if let Err(error) = control.send.finish() {
+        debug!(error = %error, "control stream was already closed");
+    }
+    connection.close(0_u32.into(), b"fault-injection complete");
+    diagnostics.abort();
+    endpoint.close().await;
+    Ok(())
+}
+
+async fn reconnect_after_close(args: ReconnectAfterCloseArgs) -> Result<()> {
     if args.attempts < 2 {
         bail!("--attempts must be at least 2 for a reconnect experiment");
     }

@@ -1,6 +1,7 @@
 //! Iroh endpoint setup, peer-address exchange, and transport diagnostics.
 
 use std::{
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     time::Duration,
@@ -10,10 +11,12 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr,
-    endpoint::{Connection, PathEvent, presets},
+    endpoint::{Connection, PathEvent, QuicTransportConfig, presets},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
+    net::UdpSocket,
+    sync::oneshot,
     task::JoinHandle,
     time::{self, error::Elapsed},
 };
@@ -45,6 +48,14 @@ pub struct PeerDescriptor {
 }
 
 pub async fn bind_endpoint(identity: &NodeIdentity, config: NetworkConfig) -> Result<Endpoint> {
+    bind_endpoint_with_transport(identity, config, None).await
+}
+
+pub async fn bind_endpoint_with_transport(
+    identity: &NodeIdentity,
+    config: NetworkConfig,
+    transport_config: Option<QuicTransportConfig>,
+) -> Result<Endpoint> {
     if config.insecure_relay_tls && config.relay_url.is_none() {
         bail!("insecure relay TLS requires --relay-url");
     }
@@ -75,6 +86,9 @@ pub async fn bind_endpoint(identity: &NodeIdentity, config: NetworkConfig) -> Re
     }
     if config.insecure_relay_tls {
         builder = builder.ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify());
+    }
+    if let Some(transport_config) = transport_config {
+        builder = builder.transport_config(transport_config);
     }
 
     builder.bind().await.context("unable to bind Iroh endpoint")
@@ -117,6 +131,87 @@ pub async fn connect(
     Ok(connection)
 }
 
+pub struct UdpFaultInjector {
+    address: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl UdpFaultInjector {
+    pub async fn start(target: SocketAddr) -> Result<Self> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = socket.local_addr()?;
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 65_536];
+            let mut client = None;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    result = socket.recv_from(&mut buffer) => {
+                        let (length, source) = result?;
+                        if source == target {
+                            if let Some(client) = client {
+                                socket.send_to(&buffer[..length], client).await?;
+                            }
+                        } else {
+                            client = Some(source);
+                            socket.send_to(&buffer[..length], target).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok(Self {
+            address,
+            stop: Some(stop_tx),
+            task,
+        })
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn cut(mut self) {
+        drop(self.stop.take());
+        self.task.abort();
+    }
+}
+
+impl Drop for UdpFaultInjector {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn wait_for_selected_path(
+    connection: &Connection,
+    relay: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let mut events = connection.path_events();
+    time::timeout(timeout, async {
+        loop {
+            if connection
+                .paths()
+                .iter()
+                .any(|path| path.is_selected() && path.is_relay() == relay)
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            events
+                .next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("connection path events ended"))?;
+        }
+    })
+    .await
+    .context("timed out waiting for selected connection path")??;
+    Ok(())
+}
+
 pub fn local_endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
     let mut address = endpoint.addr();
     for bound_socket in endpoint.bound_sockets() {
@@ -139,6 +234,30 @@ pub fn peer_descriptor(address: &EndpointAddr) -> Result<String> {
         addresses: address.addrs.iter().map(ToString::to_string).collect(),
     };
     serde_json::to_string(&descriptor).context("unable to encode peer descriptor")
+}
+
+pub fn first_ip_address(address: &EndpointAddr) -> Result<SocketAddr> {
+    address
+        .addrs
+        .iter()
+        .find_map(|address| match address {
+            TransportAddr::Ip(address) => Some(*address),
+            _ => None,
+        })
+        .context("peer descriptor does not contain a direct IP address")
+}
+
+pub fn peer_with_ip_proxy(address: &EndpointAddr, proxy: SocketAddr) -> Result<EndpointAddr> {
+    if !address.addrs.iter().any(TransportAddr::is_ip) {
+        bail!("peer descriptor does not contain a direct IP address");
+    }
+    let addresses = address
+        .addrs
+        .iter()
+        .filter(|address| !address.is_ip())
+        .cloned()
+        .chain(std::iter::once(TransportAddr::Ip(proxy)));
+    Ok(EndpointAddr::from_parts(address.id, addresses))
 }
 
 pub fn parse_peer_descriptor(input: &str) -> Result<EndpointAddr> {
