@@ -271,6 +271,9 @@ impl DependencyPolicy {
             self.workspace_package_id(package)?;
         }
 
+        self.require_direct("rift-protocol", "rift-core")?;
+        self.require_direct("rift-transport-iroh", "rift-core")?;
+        self.require_direct("rift-transport-iroh", "rift-protocol")?;
         self.reject_reachable("rift-core", &["iroh", "iroh-relay", "rift-transport-iroh"])?;
         self.reject_reachable(
             "rift-protocol",
@@ -305,6 +308,23 @@ impl DependencyPolicy {
             .get(package_id)
             .map(String::as_str)
             .with_context(|| format!("resolved package {package_id} has no package metadata"))
+    }
+
+    fn require_direct(&self, package: &str, required: &str) -> Result<()> {
+        let package_id = self.workspace_package_id(package)?;
+        let dependencies = self
+            .resolved_dependencies
+            .get(&package_id)
+            .with_context(|| format!("{package} has no resolved dependency node"))?;
+        ensure!(
+            dependencies.iter().any(|dependency| {
+                self.package_names
+                    .get(dependency)
+                    .is_some_and(|name| name == required)
+            }),
+            "architecture violation: {package} must depend directly on {required}"
+        );
+        Ok(())
     }
 
     fn reject_direct(&self, package: &str, forbidden: &str) -> Result<()> {
@@ -418,12 +438,17 @@ mod tests {
         policy
             .resolved_dependencies
             .insert("workspace#rift-core".to_owned(), BTreeSet::new());
-        policy
-            .resolved_dependencies
-            .insert("workspace#rift-protocol".to_owned(), BTreeSet::new());
+        policy.resolved_dependencies.insert(
+            "workspace#rift-protocol".to_owned(),
+            BTreeSet::from(["workspace#rift-core".to_owned()]),
+        );
         policy.resolved_dependencies.insert(
             "workspace#rift-transport-iroh".to_owned(),
-            BTreeSet::from(["registry#iroh@1.0.3".to_owned()]),
+            BTreeSet::from([
+                "registry#iroh@1.0.3".to_owned(),
+                "workspace#rift-core".to_owned(),
+                "workspace#rift-protocol".to_owned(),
+            ]),
         );
         policy.resolved_dependencies.insert(
             "workspace#rift-spike".to_owned(),
@@ -454,6 +479,42 @@ mod tests {
     #[test]
     fn current_dependency_direction_is_allowed() -> Result<()> {
         valid_policy().validate()
+    }
+
+    #[test]
+    fn protocol_must_depend_directly_on_core() {
+        let mut policy = valid_policy();
+        if let Some(dependencies) = policy
+            .resolved_dependencies
+            .get_mut("workspace#rift-protocol")
+        {
+            dependencies.clear();
+        }
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn transport_must_depend_directly_on_protocol() {
+        let mut policy = valid_policy();
+        if let Some(dependencies) = policy
+            .resolved_dependencies
+            .get_mut("workspace#rift-transport-iroh")
+        {
+            dependencies.remove("workspace#rift-protocol");
+        }
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn transport_must_depend_directly_on_core() {
+        let mut policy = valid_policy();
+        if let Some(dependencies) = policy
+            .resolved_dependencies
+            .get_mut("workspace#rift-transport-iroh")
+        {
+            dependencies.remove("workspace#rift-core");
+        }
+        assert!(policy.validate().is_err());
     }
 
     #[test]
@@ -520,7 +581,9 @@ mod tests {
                 {
                     "id": "workspace#rift-protocol",
                     "name": "rift-protocol",
-                    "dependencies": []
+                    "dependencies": [
+                        { "name": "rift-core", "req": "*" }
+                    ]
                 },
                 {
                     "id": "workspace#rift-spike",
@@ -534,7 +597,9 @@ mod tests {
                     "id": "workspace#rift-transport-iroh",
                     "name": "rift-transport-iroh",
                     "dependencies": [
-                        { "name": "iroh", "req": "=1.0.3" }
+                        { "name": "iroh", "req": "=1.0.3" },
+                        { "name": "rift-core", "req": "*" },
+                        { "name": "rift-protocol", "req": "*" }
                     ]
                 },
                 {
@@ -576,7 +641,9 @@ mod tests {
                     },
                     {
                         "id": "workspace#rift-protocol",
-                        "deps": []
+                        "deps": [
+                            { "pkg": "workspace#rift-core" }
+                        ]
                     },
                     {
                         "id": "workspace#rift-spike",
@@ -588,7 +655,9 @@ mod tests {
                     {
                         "id": "workspace#rift-transport-iroh",
                         "deps": [
-                            { "pkg": "registry#iroh@1.0.3" }
+                            { "pkg": "registry#iroh@1.0.3" },
+                            { "pkg": "workspace#rift-core" },
+                            { "pkg": "workspace#rift-protocol" }
                         ]
                     },
                     {
@@ -618,7 +687,9 @@ mod tests {
         let mut metadata = metadata_fixture();
         metadata["packages"][3]["dependencies"] = json!([
             { "name": "iroh", "req": "=1.0.3", "kind": null, "target": "cfg(unix)" },
-            { "name": "iroh", "req": "1.0.3", "kind": "build", "target": "cfg(windows)" }
+            { "name": "iroh", "req": "1.0.3", "kind": "build", "target": "cfg(windows)" },
+            { "name": "rift-core", "req": "*" },
+            { "name": "rift-protocol", "req": "*" }
         ]);
         metadata
     }

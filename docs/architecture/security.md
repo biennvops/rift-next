@@ -12,5 +12,7 @@ These are project-level invariants. Future implementation, tests, and review mus
 8. Cancellation and error paths clean temporary resources and owned work.
 9. Sensitive key material never appears in normal logs.
 10. Protocol failures fail explicitly; implementations do not silently downgrade behavior.
+11. Production `Hello.device_id` must equal the Iroh-authenticated remote endpoint ID.
+12. Production bootstrap establishes authentication only; it does not make a trust or authorization decision.
 
 A change affecting an invariant needs targeted failure-path coverage. Aggregate coverage is not evidence that the invariant holds.

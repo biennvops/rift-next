@@ -7,22 +7,32 @@ Foundation Milestone 1 turns the Prototype 0 evidence into production ownership 
 ```text
 future application/daemon crates
         |
-        +--> rift-core
+        +--> rift-transport-iroh --> rift-protocol --> rift-core
+        |             |
+        |             +-----------------------------> rift-core
         +--> rift-protocol
-        +--> rift-transport-iroh
+        +--> rift-core
 
-rift-core             platform-independent domain logic
-rift-protocol         wire representation and protocol invariants
-rift-transport-iroh   concrete Iroh endpoint integration
+rift-core             platform-independent domain logic and DeviceId
+rift-protocol         production v1 wire representation and invariants
+rift-transport-iroh   concrete authenticated Iroh endpoint integration
 rift-spike            non-production Prototype 0 evidence
-xtask                  repository validation and developer automation
+xtask                 repository validation and developer automation
 ```
 
-`rift-core` must not depend on a transport, Iroh, OS APIs, UI/FFI code, or daemon process management. `rift-protocol` must not depend on Iroh, filesystems, OS behavior, application trust policy, or daemon lifecycle. `rift-transport-iroh` owns Iroh-specific endpoint operations and types, but not pairing, authorization, business logic, relay-server implementation, or insecure TLS modes.
+The production dependency direction is intentionally explicit:
 
-The production crates are intentionally minimal. APIs enter them only with a real caller and tests. Prototype code moves incrementally when a production milestone requires it; Foundation M1 does not mechanically promote the spike into production.
+```text
+rift-protocol       -> rift-core
+rift-transport-iroh -> rift-core
+rift-transport-iroh -> rift-protocol
+```
 
-`cargo xtask architecture` evaluates Cargo's resolved package-ID graph from `cargo metadata.resolve.nodes` and fails when core/protocol can reach Iroh or the Iroh transport crate, when production transport directly acquires `iroh-relay`, or when the validated Iroh dependencies are no longer exactly `1.0.3`. Manifest dependency requirements are kept separately for exact-pin checks; inactive optional dependencies and unrelated duplicate package versions do not become reachable edges.
+`rift-core` must not depend on a transport, Iroh, OS APIs, UI/FFI code, or daemon process management. `rift-protocol` may depend on `rift-core` for transport-independent identity types, but must not depend on Iroh, filesystems, OS behavior, application trust policy, or daemon lifecycle. `rift-transport-iroh` owns Iroh-specific endpoint operations and types and composes the production protocol, but not pairing, authorization, business logic, relay-server implementation, or insecure TLS modes.
+
+The production crates are intentionally minimal. APIs enter them only with a real caller and tests. Foundation M2 promotes the first real vertical slice—`DeviceId`, protocol v1 framing/bootstrap, and the concrete Iroh session wrapper—without mechanically promoting the spike. Prototype code moves incrementally when a production milestone requires it.
+
+`cargo xtask architecture` evaluates Cargo's resolved package-ID graph from `cargo metadata.resolve.nodes`, requires the three direct production edges shown above, and fails when core/protocol can reach Iroh or the Iroh transport crate, when production transport directly acquires `iroh-relay`, or when the validated Iroh dependencies are no longer exactly `1.0.3`. Manifest dependency requirements are kept separately for exact-pin checks; inactive optional dependencies and unrelated duplicate package versions do not become reachable edges.
 
 ## Engineering policy
 
