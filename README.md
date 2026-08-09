@@ -1,4 +1,24 @@
-# Rift vNext — Prototype 0: Iroh/QUIC networking spike
+# Rift vNext
+
+Rift vNext is organized as a production Rust workspace with executable architecture boundaries and one validation firewall. Foundation Milestone 1 adds no user-facing functionality.
+
+```text
+crates/rift-core             platform-independent domain logic
+crates/rift-protocol         wire representations and protocol invariants
+crates/rift-transport-iroh   concrete production Iroh integration
+crates/rift-spike            non-production Prototype 0 evidence
+xtask                        validation and developer automation
+```
+
+Before changing code, read [the repository agent instructions](AGENTS.md), [architecture](docs/architecture/README.md), and applicable [ADRs](docs/adr/). The canonical validation command is:
+
+```bash
+cargo xtask verify
+```
+
+Coverage and benchmark procedures are documented under `docs/testing/` and `docs/performance/`.
+
+## Prototype 0: Iroh/QUIC networking spike
 
 This is a deliberately small architecture-validation prototype. It is not the Rift daemon, does not preserve the existing Rift protocol, and has no UI, mobile, FFI, database, sync semantics, or migration layer.
 

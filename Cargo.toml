@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/rift-spike"]
+members = [
+    "crates/rift-core",
+    "crates/rift-protocol",
+    "crates/rift-spike",
+    "crates/rift-transport-iroh",
+    "xtask",
+]
 
 [workspace.package]
 edition = "2024"
@@ -27,9 +33,16 @@ iroh-relay = { version = "=1.0.3", features = ["server", "test-utils"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unused_must_use = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
 
 [profile.release]
 debug = true

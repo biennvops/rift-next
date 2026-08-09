@@ -36,13 +36,13 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
             insecure_relay_tls: true,
         };
         let transport_config = fault_transport_config();
-        let sender = network::bind_endpoint_with_transport(
+        let sender = network::bind_loopback_endpoint_with_transport(
             &sender_identity,
             config(relay_url.clone()),
             Some(transport_config.clone()),
         )
         .await?;
-        let receiver = network::bind_endpoint_with_transport(
+        let receiver = network::bind_loopback_endpoint_with_transport(
             &receiver_identity,
             config(relay_url.clone()),
             Some(transport_config),
@@ -61,6 +61,7 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
 
         let (ready_tx, ready_rx) = oneshot::channel();
         let (message_tx, message_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
         let receiver_id = receiver_identity.node_id_bytes();
         let receiver_task = tokio::spawn(async move {
             let incoming = receiver
@@ -83,6 +84,9 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
                 *connection.remote_id().as_bytes(),
             )
             .await?;
+            network::wait_for_open_path(&connection, true, STAGE_TIMEOUT)
+                .await
+                .context("relay path was not ready on receiver before direct fault")?;
             ready_tx
                 .send(())
                 .map_err(|_| anyhow::anyhow!("fault-injection sender dropped ready signal"))?;
@@ -94,6 +98,9 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
                 .send(message)
                 .map_err(|_| anyhow::anyhow!("fault-injection sender dropped message result"))?;
             connection.close(0_u32.into(), b"fault-injection complete");
+            done_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("fault-injection sender dropped completion signal"))?;
             Ok::<(), anyhow::Error>(())
         });
 
@@ -127,6 +134,9 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
             .await
             .context("fault-injection receiver ready signal timed out")?
             .map_err(|_| anyhow::anyhow!("fault-injection receiver dropped ready signal"))?;
+        network::wait_for_open_path(&connection, true, STAGE_TIMEOUT)
+            .await
+            .context("relay path was not ready before direct fault")?;
         proxy.cut();
         sender.network_change().await;
         protocol::write_value(
@@ -151,7 +161,12 @@ async fn direct_path_outage_falls_back_to_relay_on_live_connection() -> Result<(
             }
         );
         connection.close(0_u32.into(), b"fault-injection complete");
+        drop(control);
+        drop(connection);
         sender.close().await;
+        done_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("fault-injection receiver dropped completion signal"))?;
         let receiver_result = time::timeout(TEST_TIMEOUT, receiver_task)
             .await
             .context("fault-injection receiver task did not finish")??;
