@@ -7,6 +7,11 @@ publish = false
 
 [dependencies]
 iroh.workspace = true
+rift-core = { path = "../rift-core" }
+rift-protocol = { path = "../rift-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
