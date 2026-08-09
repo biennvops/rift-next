@@ -143,7 +143,13 @@ fn workspace_root() -> PathBuf {
 
 fn check_architecture() -> Result<()> {
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--locked"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--all-features",
+        ])
         .current_dir(workspace_root())
         .output()
         .context("unable to start `cargo metadata`")?;
@@ -637,20 +643,28 @@ mod tests {
         Ok(())
     }
 
+    fn metadata_fixture_with_all_features() -> Value {
+        let mut metadata = metadata_fixture();
+        metadata["resolve"]["nodes"][0]["deps"] = json!([
+            { "pkg": "registry#helper@1.0.0" },
+            { "pkg": "registry#iroh@1.0.3" }
+        ]);
+        metadata
+    }
+
     #[test]
-    fn inactive_optional_dependencies_are_not_treated_as_reachable() -> Result<()> {
-        let policy = DependencyPolicy::from_metadata(&metadata_fixture())?;
-        let core_dependencies = policy
-            .resolved_dependencies
-            .get("workspace#rift-core")
-            .context("fixture is missing the rift-core resolve node")?;
-        assert!(!core_dependencies.iter().any(|dependency| {
-            policy
-                .package_names
-                .get(dependency)
-                .is_some_and(|name| name == "iroh")
-        }));
-        policy.validate()
+    fn optional_iroh_enabled_by_all_features_is_rejected() -> Result<()> {
+        let policy = DependencyPolicy::from_metadata(&metadata_fixture_with_all_features())?;
+        let error = policy
+            .validate()
+            .err()
+            .context("all-feature optional Iroh dependency was accepted")?;
+        assert!(
+            error
+                .to_string()
+                .contains("rift-core reaches forbidden dependency iroh")
+        );
+        Ok(())
     }
 
     #[test]
