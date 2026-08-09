@@ -27,7 +27,7 @@ cargo xtask benchmark-smoke
 Capture a comparable baseline with explicit parameters, for example:
 
 ```bash
-cargo run --release -p rift-spike -- bench \
+cargo run --locked --release -p rift-spike -- bench \
   --bytes 8388608 \
   --protocol-iterations 100000
 ```

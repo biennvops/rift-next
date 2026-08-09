@@ -10,11 +10,11 @@ It fails immediately and runs the same mandatory commands as Linux CI:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 cargo xtask architecture
-cargo deny check
+cargo deny --locked check
 ```
 
 Install the pinned supply-chain tool when needed:

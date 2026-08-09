@@ -1,11 +1,11 @@
 # Foundation Milestone 1 report
 
-Evidence captured 2026-08-08.
+Evidence refreshed 2026-08-09.
 
 ## Revisions and toolchain
 
 - Base commit: `af2e423ead6b5f67e533a2a4033195f0b15b80d8`
-- Final implementation commit: `5585fccfa277f957068e7c2a3788e8496b7b9a7c`
+- Final implementation commit: `c4393cf146b0233299dd2ecb9b30901834188278`
 - Final report commit: the commit containing this file (the branch tip at handoff; a Git commit cannot embed its own SHA)
 - Pinned project/CI Rust: `1.91.0`
 - Local validation Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`, LLVM `22.1.8`, Homebrew installation
@@ -25,7 +25,7 @@ crates/rift-spike            unchanged non-production Prototype 0 behavior/evide
 xtask                        canonical validation and architecture policy
 ```
 
-`cargo xtask architecture` reads `cargo metadata` and enforces forbidden transitive dependencies from core/protocol, forbids a direct production `iroh-relay` dependency, and verifies exact `=1.0.3` Iroh requirements. Its tests prove that forbidden direct/transitive dependencies and loose pins are rejected. No generic transport trait or placeholder domain/protocol API was added.
+`cargo xtask architecture` reads Cargo's resolved `resolve.nodes` package-ID graph and enforces forbidden transitive dependencies from core/protocol, forbids a direct production `iroh-relay` dependency, and verifies exact `=1.0.3` Iroh requirements from manifest declarations. Its tests prove that forbidden direct/transitive dependencies, loose pins, duplicate package names/versions, and inactive optional dependencies are handled correctly. No generic transport trait or placeholder domain/protocol API was added. The `cargo xtask` alias and nested Cargo invocations use `--locked` so validation cannot repair a stale lockfile before the checks run.
 
 ## Validation evidence
 
@@ -49,14 +49,14 @@ This executed, in fail-fast order:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 cargo metadata --format-version 1 --locked  # architecture policy
-cargo deny check
+cargo deny --locked check
 ```
 
-The workspace suite passed 33 tests: the original 27 and six xtask policy/failure-propagation tests. Warning-denied documentation and all supply-chain checks passed. Production crates also passed an independent package-scoped test/doc-test run:
+The workspace suite passed 36 tests: the original 27, the wildcard IPv4 proxy regression test, and eight xtask policy/failure-propagation tests. The live direct-to-relay test also passed in eight consecutive focused local runs after synchronizing both peers on an open relay path before cutting direct UDP. Warning-denied documentation and all supply-chain checks passed. Production crates also passed an independent package-scoped test/doc-test run:
 
 ```bash
 cargo test --all-features \
@@ -104,23 +104,24 @@ LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata \
 cargo xtask coverage
 ```
 
-It ran all 33 tests and generated `target/llvm-cov/lcov.info`.
+It ran all 36 tests and generated `target/llvm-cov/lcov.info`.
 
 | Scope | Line coverage |
 | --- | ---: |
-| Entire meaningful workspace | 61.05% (1,428 / 2,339 lines) |
+| Entire meaningful workspace | 65.01% |
 | Spike identity | 94.09% |
 | Spike protocol | 84.82% |
 | Spike transfer | 93.27% |
-| Spike network | 79.34% |
+| Spike network | 80.27% |
+| xtask | 67.86% |
 
-The enforced non-regression floor is 60.0%. It is derived from the measured 61.05% baseline with modest cross-platform instrumentation tolerance; it is not a quality target and does not replace targeted failure/state-machine tests.
+The enforced non-regression floor remains 60.0%, established from the original measured 61.05% baseline with modest cross-platform instrumentation tolerance. The refreshed result is 65.01%; neither percentage is a quality target or a substitute for targeted failure/state-machine tests.
 
 The first bare `cargo xtask coverage` attempt failed before tests because Homebrew Rust does not provide the rustup-managed `llvm-tools-preview` component. The matching Homebrew LLVM 22 tools succeeded when specified explicitly. CI installs `llvm-tools-preview`, so its canonical command remains bare.
 
 ## Foundation M1 performance baseline
 
-Commit: `5585fccfa277f957068e7c2a3788e8496b7b9a7c`
+Commit: `c4393cf146b0233299dd2ecb9b30901834188278`
 
 Environment:
 
@@ -135,16 +136,16 @@ Environment:
 Command:
 
 ```bash
-cargo run --release -p rift-spike -- bench \
+cargo run --locked --release -p rift-spike -- bench \
   --bytes 8388608 \
   --protocol-iterations 100000
 ```
 
 | Measurement | Result |
 | --- | ---: |
-| Control encode/decode | 5,119,191.68 ops/s |
-| Localhost Iroh transfer | 150.98 MiB/s |
-| Transfer time | 0.052987 s |
+| Control encode/decode | 5,108,121.83 ops/s |
+| Localhost Iroh transfer | 141.57 MiB/s |
+| Transfer time | 0.056510 s |
 | Payload | 8,388,608 bytes |
 | Streaming buffer | 65,536 bytes |
 
