@@ -38,7 +38,7 @@ fn print_help() {
     println!("  cargo xtask verify           Run the canonical validation firewall");
     println!("  cargo xtask architecture     Check crate dependency boundaries");
     println!("  cargo xtask coverage         Generate and enforce line coverage");
-    println!("  cargo xtask benchmark-smoke  Exercise the Prototype 0 benchmark path");
+    println!("  cargo xtask benchmark-smoke  Exercise production and Prototype 0 benchmark paths");
 }
 
 fn verify() -> Result<()> {
@@ -95,6 +95,19 @@ fn coverage() -> Result<()> {
 }
 
 fn benchmark_smoke() -> Result<()> {
+    run_cargo(
+        &[
+            "run",
+            "--locked",
+            "--package",
+            "rift-protocol",
+            "--example",
+            "protocol-benchmark",
+            "--",
+            "100",
+        ],
+        &[],
+    )?;
     run_cargo(
         &[
             "run",

@@ -18,13 +18,19 @@ These tests run in `cargo xtask verify` and may fail a pull request.
 
 ## Measurement benchmarks
 
-Prototype 0's benchmark measures Postcard control encode/decode throughput, localhost Iroh transfer throughput/latency, and reports the application streaming-buffer size. Build and run a small smoke scenario with:
+The production protocol benchmark measures v1 Hello encode/decode throughput, Ping/Pong encode/decode throughput, and encoded Hello frame size. Prototype 0's benchmark separately measures its Postcard control encode/decode throughput, localhost Iroh transfer throughput/latency, and application streaming-buffer size. Build and run both small smoke scenarios with:
 
 ```bash
 cargo xtask benchmark-smoke
 ```
 
-Capture a comparable baseline with explicit parameters, for example:
+Capture a comparable production protocol baseline with explicit parameters, for example:
+
+```bash
+cargo run --locked --release -p rift-protocol --example protocol-benchmark -- 100000
+```
+
+Capture the Prototype 0 baseline with explicit parameters, for example:
 
 ```bash
 cargo run --locked --release -p rift-spike -- bench \
