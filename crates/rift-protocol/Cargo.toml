@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 postcard.workspace = true
-rift-core = { path = "../rift-core" }
+rift-core = { path = "../rift-core", version = "=0.1.0" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

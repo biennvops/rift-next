@@ -595,7 +595,7 @@ mod tests {
                     "id": "workspace#rift-protocol",
                     "name": "rift-protocol",
                     "dependencies": [
-                        { "name": "rift-core", "req": "*" }
+                        { "name": "rift-core", "req": "=0.1.0" }
                     ]
                 },
                 {
@@ -611,8 +611,8 @@ mod tests {
                     "name": "rift-transport-iroh",
                     "dependencies": [
                         { "name": "iroh", "req": "=1.0.3" },
-                        { "name": "rift-core", "req": "*" },
-                        { "name": "rift-protocol", "req": "*" }
+                        { "name": "rift-core", "req": "=0.1.0" },
+                        { "name": "rift-protocol", "req": "=0.1.0" }
                     ]
                 },
                 {
@@ -701,8 +701,8 @@ mod tests {
         metadata["packages"][3]["dependencies"] = json!([
             { "name": "iroh", "req": "=1.0.3", "kind": null, "target": "cfg(unix)" },
             { "name": "iroh", "req": "1.0.3", "kind": "build", "target": "cfg(windows)" },
-            { "name": "rift-core", "req": "*" },
-            { "name": "rift-protocol", "req": "*" }
+            { "name": "rift-core", "req": "=0.1.0" },
+            { "name": "rift-protocol", "req": "=0.1.0" }
         ]);
         metadata
     }
