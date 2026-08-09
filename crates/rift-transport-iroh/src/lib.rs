@@ -560,7 +560,9 @@ mod tests {
         let endpoint = RiftEndpoint::bind(secret_key, EndpointConfig::direct()).await?;
         assert_eq!(endpoint.device_id(), expected);
         assert!(!endpoint.is_closed());
-        assert!(format!("{endpoint:?}").contains(&expected.to_string()));
+        let debug = format!("{endpoint:?}");
+        assert!(debug.contains(&expected.to_string()));
+        assert!(!debug.contains("SecretKey"));
         endpoint.close().await;
         assert!(endpoint.is_closed());
         Ok(())

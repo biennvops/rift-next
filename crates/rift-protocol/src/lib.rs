@@ -870,6 +870,10 @@ mod tests {
             Err(FrameError::Decode(_))
         ));
         assert!(matches!(
+            decode_message(&[0, 0, 0, 0]),
+            Err(FrameError::Decode(_))
+        ));
+        assert!(matches!(
             decode_message(&[0, 0, 0, 2, 0]),
             Err(FrameError::PayloadLengthMismatch {
                 declared: 2,
