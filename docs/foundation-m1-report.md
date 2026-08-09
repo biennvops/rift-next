@@ -5,7 +5,7 @@ Evidence refreshed 2026-08-09.
 ## Revisions and toolchain
 
 - Base commit: `af2e423ead6b5f67e533a2a4033195f0b15b80d8`
-- Final implementation commit: `c4393cf146b0233299dd2ecb9b30901834188278`
+- Final implementation commit: `65d40d48eb7e8916b131b1f49e12c1ead606a7c4`
 - Final report commit: the commit containing this file (the branch tip at handoff; a Git commit cannot embed its own SHA)
 - Pinned project/CI Rust: `1.91.0`
 - Local validation Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`, LLVM `22.1.8`, Homebrew installation
@@ -25,7 +25,7 @@ crates/rift-spike            unchanged non-production Prototype 0 behavior/evide
 xtask                        canonical validation and architecture policy
 ```
 
-`cargo xtask architecture` reads Cargo's resolved `resolve.nodes` package-ID graph and enforces forbidden transitive dependencies from core/protocol, forbids a direct production `iroh-relay` dependency, and verifies exact `=1.0.3` Iroh requirements from manifest declarations. Its tests prove that forbidden direct/transitive dependencies, loose pins, duplicate package names/versions, and inactive optional dependencies are handled correctly. No generic transport trait or placeholder domain/protocol API was added. The `cargo xtask` alias and nested Cargo invocations use `--locked` so validation cannot repair a stale lockfile before the checks run.
+`cargo xtask architecture` reads Cargo's resolved `resolve.nodes` package-ID graph with all workspace features enabled and enforces forbidden transitive dependencies from core/protocol, forbids a direct production `iroh-relay` dependency, and verifies exact `=1.0.3` Iroh requirements from manifest declarations. Its tests prove that forbidden direct/transitive dependencies, loose pins, duplicate package names/versions, and optional Iroh dependencies resolved under all features are rejected. No generic transport trait or placeholder domain/protocol API was added. The `cargo xtask` alias and nested Cargo invocations use `--locked` so validation cannot repair a stale lockfile before the checks run; the architecture metadata query also uses `--all-features` so non-default optional edges are validated.
 
 ## Validation evidence
 
@@ -52,11 +52,11 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
-cargo metadata --format-version 1 --locked  # architecture policy
+cargo metadata --format-version 1 --locked --all-features  # architecture policy
 cargo deny --locked check
 ```
 
-The workspace suite passed 36 tests: the original 27, the wildcard IPv4 proxy regression test, and eight xtask policy/failure-propagation tests. The live direct-to-relay test also passed in eight consecutive focused local runs after synchronizing both peers on an open relay path before cutting direct UDP. Warning-denied documentation and all supply-chain checks passed. Production crates also passed an independent package-scoped test/doc-test run:
+The workspace suite passed 37 tests: the original 27, the wildcard IPv4 proxy regression test, and nine xtask policy/failure-propagation tests. The live direct-to-relay test also passed in eight consecutive focused local runs after synchronizing both peers on an open relay path before cutting direct UDP. Warning-denied documentation and all supply-chain checks passed. Production crates also passed an independent package-scoped test/doc-test run:
 
 ```bash
 cargo test --all-features \
@@ -104,24 +104,24 @@ LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata \
 cargo xtask coverage
 ```
 
-It ran all 36 tests and generated `target/llvm-cov/lcov.info`.
+It ran all 37 tests and generated `target/llvm-cov/lcov.info`.
 
 | Scope | Line coverage |
 | --- | ---: |
-| Entire meaningful workspace | 65.01% |
+| Entire meaningful workspace | 65.34% |
 | Spike identity | 94.09% |
 | Spike protocol | 84.82% |
 | Spike transfer | 93.27% |
 | Spike network | 80.27% |
-| xtask | 67.86% |
+| xtask | 69.37% |
 
-The enforced non-regression floor remains 60.0%, established from the original measured 61.05% baseline with modest cross-platform instrumentation tolerance. The refreshed result is 65.01%; neither percentage is a quality target or a substitute for targeted failure/state-machine tests.
+The enforced non-regression floor remains 60.0%, established from the original measured 61.05% baseline with modest cross-platform instrumentation tolerance. The refreshed result is 65.34%; neither percentage is a quality target or a substitute for targeted failure/state-machine tests.
 
 The first bare `cargo xtask coverage` attempt failed before tests because Homebrew Rust does not provide the rustup-managed `llvm-tools-preview` component. The matching Homebrew LLVM 22 tools succeeded when specified explicitly. CI installs `llvm-tools-preview`, so its canonical command remains bare.
 
 ## Foundation M1 performance baseline
 
-Commit: `c4393cf146b0233299dd2ecb9b30901834188278`
+Benchmark measurement commit: `c4393cf146b0233299dd2ecb9b30901834188278`
 
 Environment:
 
