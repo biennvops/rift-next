@@ -180,6 +180,10 @@ struct CargoPackage {
 struct ManifestDependency {
     name: String,
     req: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,7 +208,7 @@ struct DependencyPolicy {
     package_names: BTreeMap<String, String>,
     workspace_members: BTreeSet<String>,
     resolved_dependencies: BTreeMap<String, BTreeSet<String>>,
-    requirements: BTreeMap<(String, String), String>,
+    requirements: BTreeMap<(String, String), Vec<ManifestDependency>>,
 }
 
 impl DependencyPolicy {
@@ -220,7 +224,10 @@ impl DependencyPolicy {
         let mut requirements = BTreeMap::new();
         for package in metadata.packages {
             for dependency in package.dependencies {
-                requirements.insert((package.id.clone(), dependency.name), dependency.req);
+                requirements
+                    .entry((package.id.clone(), dependency.name.clone()))
+                    .or_insert_with(Vec::new)
+                    .push(dependency);
             }
         }
 
@@ -333,13 +340,21 @@ impl DependencyPolicy {
     fn require_exact(&self, package: &str, dependency: &str, expected: &str) -> Result<()> {
         let package_id = self.workspace_package_id(package)?;
         let key = (package_id.clone(), dependency.to_owned());
-        let actual = self.requirements.get(&key).with_context(|| {
+        let requirements = self.requirements.get(&key).with_context(|| {
             format!("{package} must declare the validated {dependency} dependency")
         })?;
-        ensure!(
-            actual == expected,
-            "{package} must pin {dependency} to {expected}; found {actual}"
-        );
+        for manifest_dependency in requirements {
+            let kind = manifest_dependency.kind.as_deref().unwrap_or("normal");
+            let target = manifest_dependency
+                .target
+                .as_deref()
+                .unwrap_or("all targets");
+            ensure!(
+                manifest_dependency.req == expected,
+                "{package} must pin {dependency} to {expected}; found {} (kind={kind}, target={target})",
+                manifest_dependency.req
+            );
+        }
         let has_resolved_dependency = self
             .resolved_dependencies
             .get(&package_id)
@@ -363,6 +378,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn manifest_dependency(name: &str, req: &str) -> ManifestDependency {
+        ManifestDependency {
+            name: name.to_owned(),
+            req: req.to_owned(),
+            kind: None,
+            target: None,
+        }
+    }
 
     fn valid_policy() -> DependencyPolicy {
         let mut policy = DependencyPolicy::default();
@@ -415,7 +439,7 @@ mod tests {
         ] {
             policy.requirements.insert(
                 (package.to_owned(), dependency.to_owned()),
-                "=1.0.3".to_owned(),
+                vec![manifest_dependency(dependency, "=1.0.3")],
             );
         }
         policy
@@ -471,7 +495,7 @@ mod tests {
                 "workspace#rift-transport-iroh".to_owned(),
                 "iroh".to_owned(),
             ),
-            "1.0.3".to_owned(),
+            vec![manifest_dependency("iroh", "1.0.3")],
         );
         assert!(policy.validate().is_err());
     }
@@ -584,10 +608,33 @@ mod tests {
         })
     }
 
+    fn metadata_fixture_with_mixed_transport_iroh_requirements() -> Value {
+        let mut metadata = metadata_fixture();
+        metadata["packages"][3]["dependencies"] = json!([
+            { "name": "iroh", "req": "=1.0.3", "kind": null, "target": "cfg(unix)" },
+            { "name": "iroh", "req": "1.0.3", "kind": "build", "target": "cfg(windows)" }
+        ]);
+        metadata
+    }
+
     #[test]
     fn resolved_graph_uses_package_ids_for_duplicate_versions() -> Result<()> {
         let policy = DependencyPolicy::from_metadata(&metadata_fixture())?;
         policy.validate()
+    }
+
+    #[test]
+    fn every_manifest_iroh_requirement_must_be_exact() -> Result<()> {
+        let policy = DependencyPolicy::from_metadata(
+            &metadata_fixture_with_mixed_transport_iroh_requirements(),
+        )?;
+        let error = policy
+            .validate()
+            .err()
+            .context("mixed Iroh manifest requirements were accepted")?;
+        assert!(error.to_string().contains("kind=build"));
+        assert!(error.to_string().contains("cfg(windows)"));
+        Ok(())
     }
 
     #[test]
