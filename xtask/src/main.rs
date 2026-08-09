@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::Value;
 
 const COVERAGE_LINE_FLOOR: f64 = 60.0;
@@ -45,6 +46,7 @@ fn verify() -> Result<()> {
     run_cargo(
         &[
             "clippy",
+            "--locked",
             "--workspace",
             "--all-targets",
             "--all-features",
@@ -54,13 +56,19 @@ fn verify() -> Result<()> {
         ],
         &[],
     )?;
-    run_cargo(&["test", "--workspace", "--all-features"], &[])?;
+    run_cargo(&["test", "--locked", "--workspace", "--all-features"], &[])?;
     run_cargo(
-        &["doc", "--workspace", "--all-features", "--no-deps"],
+        &[
+            "doc",
+            "--locked",
+            "--workspace",
+            "--all-features",
+            "--no-deps",
+        ],
         &[("RUSTDOCFLAGS", "-D warnings")],
     )?;
     check_architecture()?;
-    run_cargo(&["deny", "check"], &[])?;
+    run_cargo(&["deny", "--locked", "check"], &[])?;
     println!("validation firewall passed");
     Ok(())
 }
@@ -72,6 +80,7 @@ fn coverage() -> Result<()> {
     run_cargo(
         &[
             "llvm-cov",
+            "--locked",
             "--workspace",
             "--all-features",
             "--lcov",
@@ -89,6 +98,7 @@ fn benchmark_smoke() -> Result<()> {
     run_cargo(
         &[
             "run",
+            "--locked",
             "--package",
             "rift-spike",
             "--",
@@ -151,57 +161,101 @@ fn check_architecture() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+    workspace_members: Vec<String>,
+    resolve: CargoResolve,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    id: String,
+    name: String,
+    #[serde(default)]
+    dependencies: Vec<ManifestDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestDependency {
+    name: String,
+    req: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolve {
+    nodes: Vec<CargoResolveNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolveNode {
+    id: String,
+    #[serde(default)]
+    deps: Vec<CargoResolvedDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolvedDependency {
+    pkg: String,
+}
+
 #[derive(Debug, Default)]
 struct DependencyPolicy {
-    direct_dependencies: BTreeMap<String, BTreeSet<String>>,
+    package_names: BTreeMap<String, String>,
+    workspace_members: BTreeSet<String>,
+    resolved_dependencies: BTreeMap<String, BTreeSet<String>>,
     requirements: BTreeMap<(String, String), String>,
 }
 
 impl DependencyPolicy {
     fn from_metadata(metadata: &Value) -> Result<Self> {
-        let packages = metadata
-            .get("packages")
-            .and_then(Value::as_array)
-            .context("cargo metadata has no packages array")?;
-        let mut policy = Self::default();
-        for package in packages {
-            let name = package
-                .get("name")
-                .and_then(Value::as_str)
-                .context("cargo metadata package has no name")?;
-            let dependencies = package
-                .get("dependencies")
-                .and_then(Value::as_array)
-                .context("cargo metadata package has no dependencies array")?;
-            let direct = policy
-                .direct_dependencies
-                .entry(name.to_owned())
-                .or_default();
-            for dependency in dependencies {
-                let dependency_name = dependency
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("cargo metadata dependency has no name")?;
-                let requirement = dependency
-                    .get("req")
-                    .and_then(Value::as_str)
-                    .context("cargo metadata dependency has no version requirement")?;
-                direct.insert(dependency_name.to_owned());
-                policy.requirements.insert(
-                    (name.to_owned(), dependency_name.to_owned()),
-                    requirement.to_owned(),
-                );
+        let metadata: CargoMetadata = serde_json::from_value(metadata.clone())
+            .context("cargo metadata has an unexpected schema")?;
+        let package_names = metadata
+            .packages
+            .iter()
+            .map(|package| (package.id.clone(), package.name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let workspace_members = metadata.workspace_members.into_iter().collect();
+        let mut requirements = BTreeMap::new();
+        for package in metadata.packages {
+            for dependency in package.dependencies {
+                requirements.insert((package.id.clone(), dependency.name), dependency.req);
             }
         }
-        Ok(policy)
+
+        let mut resolved_dependencies = BTreeMap::new();
+        for node in metadata.resolve.nodes {
+            ensure!(
+                package_names.contains_key(&node.id),
+                "cargo resolve node {0} has no matching package",
+                node.id
+            );
+            let dependencies = node
+                .deps
+                .into_iter()
+                .map(|dependency| dependency.pkg)
+                .collect::<BTreeSet<_>>();
+            for dependency in &dependencies {
+                ensure!(
+                    package_names.contains_key(dependency),
+                    "cargo resolved dependency {dependency} has no matching package"
+                );
+            }
+            resolved_dependencies.insert(node.id, dependencies);
+        }
+
+        Ok(Self {
+            package_names,
+            workspace_members,
+            resolved_dependencies,
+            requirements,
+        })
     }
 
     fn validate(&self) -> Result<()> {
         for package in ["rift-core", "rift-protocol", "rift-transport-iroh"] {
-            ensure!(
-                self.direct_dependencies.contains_key(package),
-                "required production package {package} is missing from the workspace"
-            );
+            self.workspace_package_id(package)?;
         }
 
         self.reject_reachable("rift-core", &["iroh", "iroh-relay", "rift-transport-iroh"])?;
@@ -216,31 +270,58 @@ impl DependencyPolicy {
         Ok(())
     }
 
+    fn workspace_package_id(&self, package: &str) -> Result<String> {
+        let mut matching = self.workspace_members.iter().filter(|package_id| {
+            self.package_names
+                .get(*package_id)
+                .is_some_and(|name| name == package)
+        });
+        let package_id = matching
+            .next()
+            .cloned()
+            .with_context(|| format!("required workspace package {package} is missing"))?;
+        ensure!(
+            matching.next().is_none(),
+            "workspace contains multiple packages named {package}"
+        );
+        Ok(package_id)
+    }
+
+    fn package_name<'a>(&'a self, package_id: &str) -> Result<&'a str> {
+        self.package_names
+            .get(package_id)
+            .map(String::as_str)
+            .with_context(|| format!("resolved package {package_id} has no package metadata"))
+    }
+
     fn reject_direct(&self, package: &str, forbidden: &str) -> Result<()> {
-        if self
-            .direct_dependencies
-            .get(package)
-            .is_some_and(|dependencies| dependencies.contains(forbidden))
-        {
-            bail!("architecture violation: {package} must not depend directly on {forbidden}");
+        let package_id = self.workspace_package_id(package)?;
+        let Some(dependencies) = self.resolved_dependencies.get(&package_id) else {
+            return Ok(());
+        };
+        for dependency in dependencies {
+            if self.package_name(dependency)? == forbidden {
+                bail!("architecture violation: {package} must not depend directly on {forbidden}");
+            }
         }
         Ok(())
     }
 
     fn reject_reachable(&self, package: &str, forbidden: &[&str]) -> Result<()> {
-        let mut pending = vec![package.to_owned()];
+        let mut pending = vec![self.workspace_package_id(package)?];
         let mut visited = BTreeSet::new();
         while let Some(current) = pending.pop() {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            let Some(dependencies) = self.direct_dependencies.get(&current) else {
+            let Some(dependencies) = self.resolved_dependencies.get(&current) else {
                 continue;
             };
             for dependency in dependencies {
-                if forbidden.contains(&dependency.as_str()) {
+                let dependency_name = self.package_name(dependency)?;
+                if forbidden.contains(&dependency_name) {
                     bail!(
-                        "architecture violation: {package} reaches forbidden dependency {dependency}"
+                        "architecture violation: {package} reaches forbidden dependency {dependency_name}"
                     );
                 }
                 pending.push(dependency.clone());
@@ -250,7 +331,8 @@ impl DependencyPolicy {
     }
 
     fn require_exact(&self, package: &str, dependency: &str, expected: &str) -> Result<()> {
-        let key = (package.to_owned(), dependency.to_owned());
+        let package_id = self.workspace_package_id(package)?;
+        let key = (package_id.clone(), dependency.to_owned());
         let actual = self.requirements.get(&key).with_context(|| {
             format!("{package} must declare the validated {dependency} dependency")
         })?;
@@ -258,41 +340,78 @@ impl DependencyPolicy {
             actual == expected,
             "{package} must pin {dependency} to {expected}; found {actual}"
         );
+        let has_resolved_dependency = self
+            .resolved_dependencies
+            .get(&package_id)
+            .into_iter()
+            .flatten()
+            .any(|resolved_id| {
+                self.package_names
+                    .get(resolved_id)
+                    .is_some_and(|name| name == dependency)
+            });
+        ensure!(
+            has_resolved_dependency,
+            "{package} must resolve its direct {dependency} dependency"
+        );
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn valid_policy() -> DependencyPolicy {
         let mut policy = DependencyPolicy::default();
-        for package in [
-            "rift-core",
-            "rift-protocol",
-            "rift-spike",
-            "rift-transport-iroh",
-        ] {
+        let workspace_packages = [
+            ("workspace#rift-core", "rift-core"),
+            ("workspace#rift-protocol", "rift-protocol"),
+            ("workspace#rift-spike", "rift-spike"),
+            ("workspace#rift-transport-iroh", "rift-transport-iroh"),
+        ];
+        for (package_id, package_name) in workspace_packages {
             policy
-                .direct_dependencies
-                .entry(package.to_owned())
-                .or_default();
+                .package_names
+                .insert(package_id.to_owned(), package_name.to_owned());
+            policy.workspace_members.insert(package_id.to_owned());
         }
+        policy.package_names.extend([
+            ("registry#iroh@1.0.3".to_owned(), "iroh".to_owned()),
+            (
+                "registry#iroh-relay@1.0.3".to_owned(),
+                "iroh-relay".to_owned(),
+            ),
+        ]);
         policy
-            .direct_dependencies
-            .entry("rift-transport-iroh".to_owned())
-            .or_default()
-            .insert("iroh".to_owned());
+            .resolved_dependencies
+            .insert("workspace#rift-core".to_owned(), BTreeSet::new());
         policy
-            .direct_dependencies
-            .entry("rift-spike".to_owned())
-            .or_default()
-            .extend(["iroh".to_owned(), "iroh-relay".to_owned()]);
+            .resolved_dependencies
+            .insert("workspace#rift-protocol".to_owned(), BTreeSet::new());
+        policy.resolved_dependencies.insert(
+            "workspace#rift-transport-iroh".to_owned(),
+            BTreeSet::from(["registry#iroh@1.0.3".to_owned()]),
+        );
+        policy.resolved_dependencies.insert(
+            "workspace#rift-spike".to_owned(),
+            BTreeSet::from([
+                "registry#iroh@1.0.3".to_owned(),
+                "registry#iroh-relay@1.0.3".to_owned(),
+            ]),
+        );
+        policy
+            .resolved_dependencies
+            .insert("registry#iroh@1.0.3".to_owned(), BTreeSet::new());
+        policy
+            .resolved_dependencies
+            .insert("registry#iroh-relay@1.0.3".to_owned(), BTreeSet::new());
         for (package, dependency) in [
-            ("rift-transport-iroh", "iroh"),
-            ("rift-spike", "iroh"),
-            ("rift-spike", "iroh-relay"),
+            ("workspace#rift-transport-iroh", "iroh"),
+            ("workspace#rift-spike", "iroh"),
+            ("workspace#rift-spike", "iroh-relay"),
         ] {
             policy.requirements.insert(
                 (package.to_owned(), dependency.to_owned()),
@@ -311,35 +430,36 @@ mod tests {
     fn transitive_transport_dependency_is_rejected() {
         let mut policy = valid_policy();
         policy
-            .direct_dependencies
-            .entry("rift-core".to_owned())
-            .or_default()
-            .insert("helper".to_owned());
-        policy
-            .direct_dependencies
-            .insert("helper".to_owned(), BTreeSet::from(["iroh".to_owned()]));
+            .package_names
+            .insert("registry#helper@1.0.0".to_owned(), "helper".to_owned());
+        policy.resolved_dependencies.insert(
+            "workspace#rift-core".to_owned(),
+            BTreeSet::from(["registry#helper@1.0.0".to_owned()]),
+        );
+        policy.resolved_dependencies.insert(
+            "registry#helper@1.0.0".to_owned(),
+            BTreeSet::from(["registry#iroh@1.0.3".to_owned()]),
+        );
         assert!(policy.validate().is_err());
     }
 
     #[test]
     fn protocol_iroh_dependency_is_rejected() {
         let mut policy = valid_policy();
-        policy
-            .direct_dependencies
-            .entry("rift-protocol".to_owned())
-            .or_default()
-            .insert("iroh".to_owned());
+        policy.resolved_dependencies.insert(
+            "workspace#rift-protocol".to_owned(),
+            BTreeSet::from(["registry#iroh@1.0.3".to_owned()]),
+        );
         assert!(policy.validate().is_err());
     }
 
     #[test]
     fn production_relay_server_dependency_is_rejected() {
         let mut policy = valid_policy();
-        policy
-            .direct_dependencies
-            .entry("rift-transport-iroh".to_owned())
-            .or_default()
-            .insert("iroh-relay".to_owned());
+        policy.resolved_dependencies.insert(
+            "workspace#rift-transport-iroh".to_owned(),
+            BTreeSet::from(["registry#iroh-relay@1.0.3".to_owned()]),
+        );
         assert!(policy.validate().is_err());
     }
 
@@ -347,10 +467,143 @@ mod tests {
     fn unpinned_iroh_dependency_is_rejected() {
         let mut policy = valid_policy();
         policy.requirements.insert(
-            ("rift-transport-iroh".to_owned(), "iroh".to_owned()),
+            (
+                "workspace#rift-transport-iroh".to_owned(),
+                "iroh".to_owned(),
+            ),
             "1.0.3".to_owned(),
         );
         assert!(policy.validate().is_err());
+    }
+
+    fn metadata_fixture() -> Value {
+        json!({
+            "packages": [
+                {
+                    "id": "workspace#rift-core",
+                    "name": "rift-core",
+                    "dependencies": [
+                        { "name": "iroh", "req": "=1.0.3", "optional": true },
+                        { "name": "helper", "req": "=1.0.0" }
+                    ]
+                },
+                {
+                    "id": "workspace#rift-protocol",
+                    "name": "rift-protocol",
+                    "dependencies": []
+                },
+                {
+                    "id": "workspace#rift-spike",
+                    "name": "rift-spike",
+                    "dependencies": [
+                        { "name": "iroh", "req": "=1.0.3" },
+                        { "name": "iroh-relay", "req": "=1.0.3" }
+                    ]
+                },
+                {
+                    "id": "workspace#rift-transport-iroh",
+                    "name": "rift-transport-iroh",
+                    "dependencies": [
+                        { "name": "iroh", "req": "=1.0.3" }
+                    ]
+                },
+                {
+                    "id": "registry#iroh@1.0.3",
+                    "name": "iroh",
+                    "dependencies": []
+                },
+                {
+                    "id": "registry#iroh-relay@1.0.3",
+                    "name": "iroh-relay",
+                    "dependencies": []
+                },
+                {
+                    "id": "registry#helper@1.0.0",
+                    "name": "helper",
+                    "dependencies": []
+                },
+                {
+                    "id": "registry#helper@2.0.0",
+                    "name": "helper",
+                    "dependencies": [
+                        { "name": "iroh", "req": "=1.0.3" }
+                    ]
+                }
+            ],
+            "workspace_members": [
+                "workspace#rift-core",
+                "workspace#rift-protocol",
+                "workspace#rift-spike",
+                "workspace#rift-transport-iroh"
+            ],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": "workspace#rift-core",
+                        "deps": [
+                            { "pkg": "registry#helper@1.0.0" }
+                        ]
+                    },
+                    {
+                        "id": "workspace#rift-protocol",
+                        "deps": []
+                    },
+                    {
+                        "id": "workspace#rift-spike",
+                        "deps": [
+                            { "pkg": "registry#iroh@1.0.3" },
+                            { "pkg": "registry#iroh-relay@1.0.3" }
+                        ]
+                    },
+                    {
+                        "id": "workspace#rift-transport-iroh",
+                        "deps": [
+                            { "pkg": "registry#iroh@1.0.3" }
+                        ]
+                    },
+                    {
+                        "id": "registry#iroh@1.0.3",
+                        "deps": []
+                    },
+                    {
+                        "id": "registry#iroh-relay@1.0.3",
+                        "deps": []
+                    },
+                    {
+                        "id": "registry#helper@1.0.0",
+                        "deps": []
+                    },
+                    {
+                        "id": "registry#helper@2.0.0",
+                        "deps": [
+                            { "pkg": "registry#iroh@1.0.3" }
+                        ]
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn resolved_graph_uses_package_ids_for_duplicate_versions() -> Result<()> {
+        let policy = DependencyPolicy::from_metadata(&metadata_fixture())?;
+        policy.validate()
+    }
+
+    #[test]
+    fn inactive_optional_dependencies_are_not_treated_as_reachable() -> Result<()> {
+        let policy = DependencyPolicy::from_metadata(&metadata_fixture())?;
+        let core_dependencies = policy
+            .resolved_dependencies
+            .get("workspace#rift-core")
+            .context("fixture is missing the rift-core resolve node")?;
+        assert!(!core_dependencies.iter().any(|dependency| {
+            policy
+                .package_names
+                .get(dependency)
+                .is_some_and(|name| name == "iroh")
+        }));
+        policy.validate()
     }
 
     #[test]

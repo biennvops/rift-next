@@ -22,7 +22,7 @@ xtask                  repository validation and developer automation
 
 The production crates are intentionally minimal. APIs enter them only with a real caller and tests. Prototype code moves incrementally when a production milestone requires it; Foundation M1 does not mechanically promote the spike into production.
 
-`cargo xtask architecture` evaluates `cargo metadata` and fails when core/protocol can reach Iroh or the Iroh transport crate, when production transport directly acquires `iroh-relay`, or when the validated Iroh dependencies are no longer exactly `1.0.3`.
+`cargo xtask architecture` evaluates Cargo's resolved package-ID graph from `cargo metadata.resolve.nodes` and fails when core/protocol can reach Iroh or the Iroh transport crate, when production transport directly acquires `iroh-relay`, or when the validated Iroh dependencies are no longer exactly `1.0.3`. Manifest dependency requirements are kept separately for exact-pin checks; inactive optional dependencies and unrelated duplicate package versions do not become reachable edges.
 
 ## Engineering policy
 

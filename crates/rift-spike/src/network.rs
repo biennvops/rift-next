@@ -48,13 +48,37 @@ pub struct PeerDescriptor {
 }
 
 pub async fn bind_endpoint(identity: &NodeIdentity, config: NetworkConfig) -> Result<Endpoint> {
-    bind_endpoint_with_transport(identity, config, None).await
+    bind_endpoint_with_transport_and_bind_addr(identity, config, None, None).await
 }
 
 pub async fn bind_endpoint_with_transport(
     identity: &NodeIdentity,
     config: NetworkConfig,
     transport_config: Option<QuicTransportConfig>,
+) -> Result<Endpoint> {
+    bind_endpoint_with_transport_and_bind_addr(identity, config, transport_config, None).await
+}
+
+/// Binds a non-relay-only endpoint to IPv4 loopback for deterministic local topology tests.
+pub async fn bind_loopback_endpoint_with_transport(
+    identity: &NodeIdentity,
+    config: NetworkConfig,
+    transport_config: Option<QuicTransportConfig>,
+) -> Result<Endpoint> {
+    bind_endpoint_with_transport_and_bind_addr(
+        identity,
+        config,
+        transport_config,
+        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+    )
+    .await
+}
+
+async fn bind_endpoint_with_transport_and_bind_addr(
+    identity: &NodeIdentity,
+    config: NetworkConfig,
+    transport_config: Option<QuicTransportConfig>,
+    bind_addr: Option<SocketAddr>,
 ) -> Result<Endpoint> {
     if config.insecure_relay_tls && config.relay_url.is_none() {
         bail!("insecure relay TLS requires --relay-url");
@@ -79,6 +103,11 @@ pub async fn bind_endpoint_with_transport(
         .secret_key(identity.secret_key().clone())
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(relay_mode);
+    if let Some(bind_addr) = bind_addr {
+        builder = builder
+            .bind_addr(bind_addr)
+            .context("unable to configure Iroh loopback bind address")?;
+    }
     if config.relay_only {
         builder = builder
             .clear_ip_transports()
@@ -95,10 +124,24 @@ pub async fn bind_endpoint_with_transport(
 }
 
 pub async fn wait_for_relay(endpoint: &Endpoint, timeout: Duration) -> bool {
-    match time::timeout(timeout, endpoint.online()).await {
-        Ok(()) => {
+    let online = time::timeout(timeout, async {
+        endpoint.online().await;
+        loop {
+            if endpoint.addr().relay_urls().next().is_some() {
+                return true;
+            }
+            time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    match online {
+        Ok(true) => {
             info!(endpoint_addr = ?endpoint.addr(), "Iroh endpoint is online via relay");
             true
+        }
+        Ok(false) => {
+            warn!(endpoint_addr = ?endpoint.addr(), "relay address was not published");
+            false
         }
         Err(Elapsed { .. }) => {
             warn!(?timeout, endpoint_addr = ?endpoint.addr(), "relay did not become online before timeout");
@@ -139,6 +182,7 @@ pub struct UdpFaultInjector {
 
 impl UdpFaultInjector {
     pub async fn start(target: SocketAddr) -> Result<Self> {
+        let target = loopback_target(target);
         let bind_address = match target {
             SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
@@ -146,7 +190,11 @@ impl UdpFaultInjector {
         let socket = UdpSocket::bind(bind_address).await?;
         let address = socket.local_addr()?;
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            ready_tx
+                .send(())
+                .map_err(|_| io::Error::other("UDP fault injector readiness receiver dropped"))?;
             let mut buffer = [0_u8; 65_536];
             let mut client = None;
             loop {
@@ -167,6 +215,9 @@ impl UdpFaultInjector {
             }
             Ok(())
         });
+        ready_rx.await.map_err(|_| {
+            io::Error::other("UDP fault injector task stopped before becoming ready")
+        })?;
         Ok(Self {
             address,
             stop: Some(stop_tx),
@@ -188,6 +239,32 @@ impl Drop for UdpFaultInjector {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+pub async fn wait_for_open_path(
+    connection: &Connection,
+    relay: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let mut events = connection.path_events();
+    time::timeout(timeout, async {
+        loop {
+            if connection
+                .paths()
+                .iter()
+                .any(|path| path.is_relay() == relay)
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            events
+                .next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("connection path events ended"))?;
+        }
+    })
+    .await
+    .context("timed out waiting for connection path to open")??;
+    Ok(())
 }
 
 pub async fn wait_for_selected_path(
@@ -411,6 +488,20 @@ pub fn spawn_path_diagnostics(connection: Connection) -> PathDiagnostics {
     }
 }
 
+// Iroh's default IPv4 socket binds to 0.0.0.0. A local proxy must forward to a
+// concrete loopback address; Linux does not reliably route datagrams sent to 0.0.0.0.
+fn loopback_target(target: SocketAddr) -> SocketAddr {
+    match target {
+        SocketAddr::V4(address) if address.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
+        }
+        SocketAddr::V6(address) if address.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
+        }
+        target => target,
+    }
+}
+
 fn transport_kind(address: &TransportAddr) -> &'static str {
     if address.is_relay() {
         "relay"
@@ -439,6 +530,30 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_fault_injector_normalizes_unspecified_ipv4_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let target_address = target.local_addr()?;
+        let wildcard_target =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), target_address.port());
+        let injector = UdpFaultInjector::start(wildcard_target).await?;
+        assert!(injector.address().is_ipv4());
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        client.send_to(b"ping", injector.address()).await?;
+
+        let mut buffer = [0_u8; 16];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), target.recv_from(&mut buffer)).await??;
+        assert_eq!(&buffer[..length], b"ping");
+        target.send_to(b"pong", source).await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buffer)).await??;
+        assert_eq!(&buffer[..length], b"pong");
+        injector.cut();
+        Ok(())
     }
 
     #[tokio::test]
