@@ -1,0 +1,50 @@
+{
+  "protocol_version": 1,
+  "alpn_hex": "726966742f31",
+  "vectors": [
+    {
+      "name": "hello-unicode-empty-capabilities",
+      "message": {
+        "type": "hello",
+        "protocol_version": 1,
+        "device_id_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "device_name": "Mötley 🦀",
+        "platform": "macOS-arm64",
+        "capabilities": []
+      },
+      "postcard_payload_hex": "0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0c4dc3b6746c657920f09fa6800b6d61634f532d61726d363400",
+      "frame_hex": "0000003c0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0c4dc3b6746c657920f09fa6800b6d61634f532d61726d363400"
+    },
+    {
+      "name": "hello-known-capability",
+      "message": {
+        "type": "hello",
+        "protocol_version": 1,
+        "device_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "device_name": "transfer-source",
+        "platform": "linux-x86_64",
+        "capabilities": [1]
+      },
+      "postcard_payload_hex": "0001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0f7472616e736665722d736f757263650c6c696e75782d7838365f36340101",
+      "frame_hex": "000000410001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0f7472616e736665722d736f757263650c6c696e75782d7838365f36340101"
+    },
+    {
+      "name": "ping",
+      "message": {
+        "type": "ping",
+        "nonce": 42
+      },
+      "postcard_payload_hex": "012a",
+      "frame_hex": "00000002012a"
+    },
+    {
+      "name": "pong",
+      "message": {
+        "type": "pong",
+        "nonce": 42
+      },
+      "postcard_payload_hex": "022a",
+      "frame_hex": "00000002022a"
+    }
+  ]
+}
