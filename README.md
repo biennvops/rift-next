@@ -1,6 +1,6 @@
 # Rift vNext
 
-Rift vNext is organized as a production Rust workspace with executable architecture boundaries and one validation firewall. Foundation Milestone 1 adds no user-facing functionality.
+Rift vNext is organized as a production Rust workspace with executable architecture boundaries and one validation firewall. Foundation Milestone 2 adds the first production authenticated protocol bootstrap without pairing or authorization.
 
 ```text
 crates/rift-core             platform-independent domain logic
@@ -17,6 +17,27 @@ cargo xtask verify
 ```
 
 Coverage and benchmark procedures are documented under `docs/testing/` and `docs/performance/`.
+
+## Production Foundation M2 path
+
+```text
+caller-owned Iroh SecretKey
+        ↓
+rift-transport-iroh (authenticated QUIC, ALPN rift/1)
+        ↓
+rift-protocol bounded control stream
+        ↓
+identity-bound Hello
+        ↓
+BootstrappedConnection with peer metadata/capabilities
+        ↓
+one-shot Ping/Pong control primitive
+```
+
+The production contract is documented in [protocol v1](docs/protocol/v1.md), with
+machine-readable [conformance vectors](docs/protocol/v1-vectors.json). A successful
+bootstrap proves that the Iroh-authenticated endpoint identity matches the Rift Hello
+identity. It does not pair, authorize, persist trust, discover peers, or reconnect.
 
 ## Prototype 0: Iroh/QUIC networking spike
 
@@ -176,7 +197,10 @@ cargo run -p rift-spike -- fault-inject \
 
 `fault-inject` puts a local UDP forwarder in front of the peer's direct address, establishes the live connection through that direct path, then stops forwarding packets underneath the connection and notifies Iroh of a network change. It requires the selected path to move to the relay, sends a framed `Ping { nonce }` over the existing control stream, and requires the receiver's matching `Pong { nonce }` before reporting success. Iroh may advertise additional direct candidates during connection establishment; if one of those uncontrolled paths is selected, the command fails rather than claiming that the proxy caused a complete outage. The integration test uses a constrained local topology for deterministic packet-loss/path-loss evidence; interface changes, arbitrary NAT changes, and public-relay outages remain separate topology cases.
 
-## Architecture implemented
+## Prototype 0 architecture implemented
+
+The following diagram describes the frozen Prototype 0 only; it is not the production
+v1 contract.
 
 ```text
 persistent Iroh SecretKey
