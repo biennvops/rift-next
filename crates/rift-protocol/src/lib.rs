@@ -7,7 +7,10 @@
 use std::{fmt, io, time::Duration};
 
 use rift_core::DeviceId;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeOwned, SeqAccess, Visitor},
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
@@ -104,10 +107,13 @@ pub struct Hello {
     /// The public cryptographic identity claimed by this peer.
     pub device_id: DeviceId,
     /// The peer's human-readable device name.
+    #[serde(deserialize_with = "deserialize_device_name")]
     pub device_name: String,
     /// The peer's platform identifier.
+    #[serde(deserialize_with = "deserialize_platform")]
     pub platform: String,
     /// The peer's capability identifiers.
+    #[serde(deserialize_with = "deserialize_capabilities")]
     pub capabilities: Vec<Capability>,
 }
 
@@ -133,6 +139,82 @@ impl Hello {
             platform: self.platform.clone(),
             capabilities: self.capabilities.clone(),
         }
+    }
+}
+
+fn deserialize_device_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_str(BoundedStringVisitor::<MAX_DEVICE_NAME_LEN>)
+}
+
+fn deserialize_platform<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_str(BoundedStringVisitor::<MAX_PLATFORM_LEN>)
+}
+
+struct BoundedStringVisitor<const MAXIMUM: usize>;
+
+impl<'de, const MAXIMUM: usize> Visitor<'de> for BoundedStringVisitor<MAXIMUM> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a UTF-8 string of at most {MAXIMUM} bytes")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > MAXIMUM {
+            return Err(E::invalid_length(value.len(), &self));
+        }
+        Ok(value.to_owned())
+    }
+}
+
+fn deserialize_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedCapabilitiesVisitor)
+}
+
+struct BoundedCapabilitiesVisitor;
+
+impl<'de> Visitor<'de> for BoundedCapabilitiesVisitor {
+    type Value = Vec<Capability>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a sequence of at most {MAX_CAPABILITIES} capabilities"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let capacity = match sequence.size_hint() {
+            Some(length) if length > MAX_CAPABILITIES => {
+                return Err(de::Error::invalid_length(length, &self));
+            }
+            Some(length) => length,
+            None => 0,
+        };
+
+        let mut capabilities = Vec::with_capacity(capacity);
+        while let Some(capability) = sequence.next_element()? {
+            if capabilities.len() == MAX_CAPABILITIES {
+                return Err(de::Error::invalid_length(MAX_CAPABILITIES + 1, &self));
+            }
+            capabilities.push(capability);
+        }
+        Ok(capabilities)
     }
 }
 
@@ -636,6 +718,34 @@ mod tests {
         }
     }
 
+    #[derive(Serialize)]
+    enum WireControlMessage<'a> {
+        Hello(WireHello<'a>),
+    }
+
+    #[derive(Serialize)]
+    struct WireHello<'a> {
+        protocol_version: u16,
+        device_id: DeviceId,
+        device_name: &'a str,
+        platform: &'a str,
+        capabilities: &'a [Capability],
+    }
+
+    fn wire_hello_frame(
+        device_name: &str,
+        platform: &str,
+        capabilities: &[Capability],
+    ) -> Result<Vec<u8>, FrameError> {
+        encode_frame(&WireControlMessage::Hello(WireHello {
+            protocol_version: PROTOCOL_VERSION,
+            device_id: device_id(7),
+            device_name,
+            platform,
+            capabilities,
+        }))
+    }
+
     #[derive(Deserialize)]
     struct ConformanceFile {
         protocol_version: u16,
@@ -918,6 +1028,22 @@ mod tests {
             read_message(&mut frame).await,
             Err(FrameError::TrailingPayload { remaining: 1 })
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_hello_metadata_is_rejected_from_wire_bytes() -> Result<(), FrameError> {
+        for frame in [
+            wire_hello_frame(&"x".repeat(MAX_DEVICE_NAME_LEN + 1), "", &[]),
+            wire_hello_frame("", &"x".repeat(MAX_PLATFORM_LEN + 1), &[]),
+            wire_hello_frame("", "", &[Capability::new(1); MAX_CAPABILITIES + 1]),
+        ] {
+            let mut frame = Cursor::new(frame?);
+            assert!(matches!(
+                read_message(&mut frame).await,
+                Err(FrameError::Decode(_))
+            ));
+        }
+        Ok(())
     }
 
     #[test]
