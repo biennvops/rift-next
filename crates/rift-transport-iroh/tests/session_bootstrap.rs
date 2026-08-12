@@ -3,10 +3,11 @@ use std::{error::Error, time::Duration};
 use rift_core::{DEVICE_ID_LEN, DeviceId};
 use rift_protocol::{
     ControlMessage, HandshakeError, Hello, HelloMetadata, MAX_CONTROL_FRAME_LEN, MessageKind,
-    PROTOCOL_VERSION, read_message, write_message,
+    PROTOCOL_VERSION, encode_message, exchange_hello_with_timeout, read_message, write_message,
 };
 use rift_transport_iroh::{
-    BootstrappedConnection, EndpointConfig, RiftEndpoint, SecretKey, TransportError,
+    AuthenticatedConnection, BootstrappedConnection, ControlStream, EndpointConfig, RiftEndpoint,
+    SecretKey, TransportError,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -290,6 +291,102 @@ async fn failed_bootstrap_does_not_poison_endpoint_identity_or_future_connection
     client_connection.ping(12).await?;
     let (server_connection, nonce) = responder.await??;
     assert_eq!(nonce, 12);
+
+    client_connection.close();
+    server_connection.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+async fn bootstrap_client_with_manual_server() -> TestResult<(
+    RiftEndpoint,
+    RiftEndpoint,
+    BootstrappedConnection,
+    AuthenticatedConnection,
+    ControlStream,
+)> {
+    let (client, server) = bind_pair().await?;
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let connection = server.accept().await?;
+            let remote_device_id = connection.remote_device_id();
+            let mut control = connection.accept_control().await?;
+            exchange_hello_with_timeout(
+                &mut control,
+                server.device_id(),
+                &metadata("server", "test"),
+                remote_device_id,
+                TEST_HANDSHAKE_TIMEOUT,
+            )
+            .await?;
+            Ok::<_, TransportError>((connection, control))
+        }
+    });
+    let client_connection = client
+        .connect_and_bootstrap(server.local_addr(), metadata("client", "test"))
+        .await?;
+    let (server_connection, control) = server_task.await??;
+    Ok((
+        client,
+        server,
+        client_connection,
+        server_connection,
+        control,
+    ))
+}
+
+#[tokio::test]
+async fn partial_pong_timeout_poisoned_connection_cannot_be_reused() -> TestResult {
+    let (client, server, mut client_connection, server_connection, mut server_control) =
+        bootstrap_client_with_manual_server().await?;
+    let pong = encode_message(&ControlMessage::Pong { nonce: 1 })?;
+    let ping_task = tokio::spawn(async move {
+        let ping = read_message(&mut server_control.recv).await?;
+        assert_eq!(ping, ControlMessage::Ping { nonce: 1 });
+        server_control
+            .send
+            .write_all(&pong[..pong.len() - 1])
+            .await?;
+        tokio::time::sleep(TEST_HANDSHAKE_TIMEOUT + Duration::from_millis(25)).await;
+        Ok::<_, Box<dyn Error + Send + Sync>>(server_control)
+    });
+
+    assert!(matches!(
+        client_connection.ping(1).await,
+        Err(TransportError::ControlTimeout)
+    ));
+    assert!(matches!(
+        client_connection.ping(2).await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
+
+    client_connection.close();
+    drop(ping_task.await??);
+    server_connection.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sequencing_error_poisoned_connection_cannot_be_reused() -> TestResult {
+    let (client, server, mut client_connection, server_connection, mut server_control) =
+        bootstrap_client_with_manual_server().await?;
+    write_message(&mut server_control.send, &ControlMessage::Pong { nonce: 9 }).await?;
+
+    assert!(matches!(
+        client_connection.respond_to_ping().await,
+        Err(TransportError::Control(
+            rift_protocol::ControlError::UnexpectedMessage {
+                expected: MessageKind::Ping,
+                received: MessageKind::Pong
+            }
+        ))
+    ));
+    assert!(matches!(
+        client_connection.respond_to_ping().await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
 
     client_connection.close();
     server_connection.close();

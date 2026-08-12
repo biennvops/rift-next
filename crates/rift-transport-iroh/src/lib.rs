@@ -157,6 +157,9 @@ pub enum TransportError {
     /// A post-bootstrap control message failed.
     #[error("Rift control message failed: {0}")]
     Control(#[from] ControlError),
+    /// A prior control failure invalidated and closed this disposable connection.
+    #[error("Rift control connection is poisoned by a prior failure")]
+    ControlConnectionPoisoned,
     /// A post-bootstrap control operation exceeded its deadline.
     #[error("Rift control operation timed out")]
     ControlTimeout,
@@ -377,7 +380,7 @@ impl RiftEndpoint {
         );
         Ok(BootstrappedConnection {
             connection: connection.connection,
-            control,
+            control: Some(control),
             peer_hello,
             control_timeout: self.config.handshake_timeout,
         })
@@ -447,7 +450,7 @@ impl AuthenticatedConnection {
 /// A successfully Hello-bootstrapped, still-disposable Rift connection.
 pub struct BootstrappedConnection {
     connection: Connection,
-    control: ControlStream,
+    control: Option<ControlStream>,
     peer_hello: Hello,
     control_timeout: Duration,
 }
@@ -473,31 +476,63 @@ impl BootstrappedConnection {
     }
 
     /// Sends a Ping and waits for the matching Pong before the control deadline.
+    /// Any failure closes and permanently invalidates this disposable connection.
     pub async fn ping(&mut self, nonce: u64) -> Result<(), TransportError> {
-        time::timeout(
-            self.control_timeout,
-            rift_protocol::ping(&mut self.control, nonce),
-        )
-        .await
-        .map_err(|_| TransportError::ControlTimeout)?
-        .map_err(TransportError::Control)
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        let result = time::timeout(self.control_timeout, rift_protocol::ping(control, nonce)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::Control(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
     }
 
     /// Waits for one Ping and sends its matching Pong before the control deadline.
+    /// Any failure closes and permanently invalidates this disposable connection.
     pub async fn respond_to_ping(&mut self) -> Result<u64, TransportError> {
-        time::timeout(
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        let result = time::timeout(
             self.control_timeout,
-            rift_protocol::respond_to_ping(&mut self.control),
+            rift_protocol::respond_to_ping(control),
         )
-        .await
-        .map_err(|_| TransportError::ControlTimeout)?
-        .map_err(TransportError::Control)
+        .await;
+        match result {
+            Ok(Ok(nonce)) => Ok(nonce),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::Control(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
     }
 
     /// Closes this disposable QUIC connection immediately.
     pub fn close(&self) {
-        self.connection
-            .close(0_u32.into(), b"Rift connection closed");
+        self.close_with_reason(b"Rift connection closed");
+    }
+
+    fn poison(&mut self) {
+        self.control = None;
+        self.close_with_reason(b"Rift control connection poisoned");
+    }
+
+    fn close_with_reason(&self, reason: &[u8]) {
+        self.connection.close(0_u32.into(), reason);
     }
 }
 
