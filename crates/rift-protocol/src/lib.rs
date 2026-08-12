@@ -201,6 +201,9 @@ pub enum FrameError {
     /// The complete in-memory frame does not contain exactly the declared payload.
     #[error("control frame length {declared} does not match payload length {actual}")]
     PayloadLengthMismatch { declared: usize, actual: usize },
+    /// The complete payload contained bytes after the decoded Postcard value.
+    #[error("control frame contains {remaining} trailing payload bytes")]
+    TrailingPayload { remaining: usize },
     /// The stream rejected a frame write.
     #[error("unable to write control frame: {0}")]
     Write(#[source] io::Error),
@@ -337,7 +340,7 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> 
             actual: payload.len(),
         });
     }
-    postcard::from_bytes(payload).map_err(FrameError::Decode)
+    decode_payload(payload)
 }
 
 /// Encodes a production control message as a complete frame.
@@ -386,7 +389,7 @@ where
         .read_exact(&mut payload)
         .await
         .map_err(FrameError::TruncatedPayload)?;
-    postcard::from_bytes(&payload).map_err(FrameError::Decode)
+    decode_payload(&payload)
 }
 
 /// Writes one production control message.
@@ -560,6 +563,17 @@ fn validate_metadata(
         });
     }
     Ok(())
+}
+
+fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, FrameError> {
+    let (value, remaining) = postcard::take_from_bytes(payload).map_err(FrameError::Decode)?;
+    if remaining.is_empty() {
+        Ok(value)
+    } else {
+        Err(FrameError::TrailingPayload {
+            remaining: remaining.len(),
+        })
+    }
 }
 
 fn ensure_frame_size(length: usize) -> Result<(), FrameError> {
@@ -883,6 +897,26 @@ mod tests {
         assert!(matches!(
             decode_message(&[]),
             Err(FrameError::TruncatedLengthPrefix(_))
+        ));
+    }
+
+    #[test]
+    fn in_memory_frame_with_trailing_postcard_bytes_is_rejected() {
+        let frame = [0, 0, 0, 3, 1, 42, 0xff];
+
+        assert!(matches!(
+            decode_message(&frame),
+            Err(FrameError::TrailingPayload { remaining: 1 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn streamed_frame_with_trailing_postcard_bytes_is_rejected() {
+        let mut frame = Cursor::new([0, 0, 0, 3, 1, 42, 0xff]);
+
+        assert!(matches!(
+            read_message(&mut frame).await,
+            Err(FrameError::TrailingPayload { remaining: 1 })
         ));
     }
 
