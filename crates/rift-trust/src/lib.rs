@@ -727,6 +727,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_store_is_rejected_before_read_allocation() -> TestResult {
+        let directory = TempDir::new()?;
+        let path = store_path(&directory);
+        let file = File::create(&path).await?;
+        file.set_len(u64::try_from(MAX_STORE_SIZE + 1)?).await?;
+        drop(file);
+
+        assert!(matches!(
+            TrustStore::open(path).await,
+            Err(TrustStoreError::StoreTooLarge { actual, maximum })
+                if actual == MAX_STORE_SIZE + 1 && maximum == MAX_STORE_SIZE
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checksummed_invalid_mutation_fails_closed() -> TestResult {
+        let directory = TempDir::new()?;
+        let path = store_path(&directory);
+        drop(TrustStore::open(&path).await?);
+        let record = encode_record(&[0xff])?;
+        append_bytes(&path, &record).await?;
+
+        assert!(matches!(
+            TrustStore::open(path).await,
+            Err(TrustStoreError::CorruptRecord {
+                reason: "invalid mutation encoding",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checksum_mismatch_and_middle_corruption_fail_closed() -> TestResult {
         let directory = TempDir::new()?;
         let checksum_path = directory.path().join("checksum");
