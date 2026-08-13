@@ -5,6 +5,7 @@ members = [
     "crates/rift-protocol",
     "crates/rift-spike",
     "crates/rift-transport-iroh",
+    "crates/rift-trust",
     "xtask",
 ]
 

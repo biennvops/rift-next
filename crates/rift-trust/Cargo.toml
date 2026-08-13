@@ -1,0 +1,21 @@
+[package]
+name = "rift-trust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+postcard.workspace = true
+rift-core = { path = "../rift-core", version = "=0.1.0" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
