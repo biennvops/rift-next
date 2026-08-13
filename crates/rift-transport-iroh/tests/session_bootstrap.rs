@@ -89,6 +89,8 @@ async fn production_endpoints_bootstrap_authenticate_and_use_ping_pong() -> Test
         .await?;
     let mut connection_b = accept_task.await??;
 
+    assert_eq!(connection_a.local_device_id(), endpoint_a.device_id());
+    assert_eq!(connection_b.local_device_id(), endpoint_b.device_id());
     assert_eq!(connection_a.remote_device_id(), endpoint_b.device_id());
     assert_eq!(connection_b.remote_device_id(), endpoint_a.device_id());
     assert_eq!(connection_a.peer_hello().device_name, "laptop");

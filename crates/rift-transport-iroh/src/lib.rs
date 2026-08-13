@@ -387,6 +387,7 @@ impl RiftEndpoint {
         Ok(BootstrappedConnection {
             connection: connection.connection,
             control: Some(control),
+            local_device_id: self.device_id,
             peer_hello,
             control_timeout: self.config.handshake_timeout,
         })
@@ -457,6 +458,7 @@ impl AuthenticatedConnection {
 pub struct BootstrappedConnection {
     connection: Connection,
     control: Option<ControlStream>,
+    local_device_id: DeviceId,
     peer_hello: Hello,
     control_timeout: Duration,
 }
@@ -471,6 +473,11 @@ impl fmt::Debug for BootstrappedConnection {
 }
 
 impl BootstrappedConnection {
+    /// Returns the endpoint-owned local public identity used in Hello.
+    pub const fn local_device_id(&self) -> DeviceId {
+        self.local_device_id
+    }
+
     /// Returns the validated peer Hello metadata and identity.
     pub const fn peer_hello(&self) -> &Hello {
         &self.peer_hello
