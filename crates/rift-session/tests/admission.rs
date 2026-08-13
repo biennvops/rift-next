@@ -194,6 +194,55 @@ async fn successful_pairing_requires_local_confirmation_and_authorizes_both() ->
 }
 
 #[tokio::test]
+async fn dropping_pending_pairing_cannot_create_trust_from_remote_messages() -> TestResult {
+    let directory = TempDir::new()?;
+    let store_a = store(&directory, "a.trust").await?;
+    let store_b = store(&directory, "b.trust").await?;
+    let manager_a = manager(store_a.clone())?;
+    let manager_b = manager(store_b.clone())?;
+    let (endpoint_a, endpoint_b) = bind_pair().await?;
+    let (pairable_a, pairable_b) =
+        pairable_pair(&manager_a, &manager_b, &endpoint_a, &endpoint_b).await?;
+    let (pending_a, pending_b) = pending_pair(pairable_a, pairable_b).await?;
+
+    let remote_confirmation = tokio::spawn(async move { pending_b.confirm(true).await });
+    drop(pending_a);
+    assert!(remote_confirmation.await?.is_err());
+    assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
+    assert_eq!(store_b.state(endpoint_a.device_id()).await, None);
+    close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn revocation_during_confirmation_blocks_pairing_commit() -> TestResult {
+    let directory = TempDir::new()?;
+    let store_a = store(&directory, "a.trust").await?;
+    let store_b = store(&directory, "b.trust").await?;
+    let manager_a = manager(store_a.clone())?;
+    let manager_b = manager(store_b.clone())?;
+    let (endpoint_a, endpoint_b) = bind_pair().await?;
+    let (pairable_a, pairable_b) =
+        pairable_pair(&manager_a, &manager_b, &endpoint_a, &endpoint_b).await?;
+    let (pending_a, pending_b) = pending_pair(pairable_a, pairable_b).await?;
+    store_a.revoke(endpoint_b.device_id()).await?;
+
+    let (result_a, result_b) = tokio::join!(pending_a.confirm(true), pending_b.confirm(true));
+    assert!(matches!(result_a, Err(PairingError::Trust(_))));
+    assert!(result_b.is_err());
+    assert_eq!(
+        store_a.state(endpoint_b.device_id()).await,
+        Some(TrustState::Revoked)
+    );
+    assert_eq!(
+        store_b.state(endpoint_a.device_id()).await,
+        Some(TrustState::Trusted)
+    );
+    close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn one_sided_local_rejection_creates_no_trust() -> TestResult {
     let directory = TempDir::new()?;
     let store_a = store(&directory, "a.trust").await?;
