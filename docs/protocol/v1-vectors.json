@@ -77,6 +77,16 @@
       "frame_hex": "0000001205000102030405060708090a0b0c0d0e0f01"
     },
     {
+      "name": "pairing-decision-rejected",
+      "message": {
+        "type": "pairing_decision",
+        "pairing_id_hex": "000102030405060708090a0b0c0d0e0f",
+        "accepted": false
+      },
+      "postcard_payload_hex": "05000102030405060708090a0b0c0d0e0f00",
+      "frame_hex": "0000001205000102030405060708090a0b0c0d0e0f00"
+    },
+    {
       "name": "pairing-complete",
       "message": {
         "type": "pairing_complete",
