@@ -1,11 +1,16 @@
 # Rift vNext
 
-Rift vNext is organized as a production Rust workspace with executable architecture boundaries and one validation firewall. Foundation Milestone 2 adds the first production authenticated protocol bootstrap without pairing or authorization.
+Rift vNext is organized as a production Rust workspace with executable architecture
+boundaries and one validation firewall. Foundation Milestone 3 adds human-confirmed
+pairing, durable identity-keyed trust/revocation, and the first application authorization
+gate above authenticated transport.
 
 ```text
-crates/rift-core             platform-independent domain logic
-crates/rift-protocol         wire representations and protocol invariants
+crates/rift-core             platform-independent identity and trust types
+crates/rift-protocol         bounded v1 wire and pairing transcript invariants
 crates/rift-transport-iroh   concrete production Iroh integration
+crates/rift-trust            durable trust/revocation journal
+crates/rift-session          pairing state machine and authorization admission
 crates/rift-spike            non-production Prototype 0 evidence
 xtask                        validation and developer automation
 ```
@@ -18,26 +23,37 @@ cargo xtask verify
 
 Coverage and benchmark procedures are documented under `docs/testing/` and `docs/performance/`.
 
-## Production Foundation M2 path
+## Production Foundation M3 path
 
 ```text
 caller-owned Iroh SecretKey
         ↓
 rift-transport-iroh (authenticated QUIC, ALPN rift/1)
         ↓
-rift-protocol bounded control stream
+rift-protocol bounded control stream and identity-bound Hello
         ↓
-identity-bound Hello
+BootstrappedConnection (authenticated, not authorized)
         ↓
-BootstrappedConnection with peer metadata/capabilities
-        ↓
-one-shot Ping/Pong control primitive
+rift-session consults rift-trust
+   ┌────────────┼────────────┐
+trusted       unknown      revoked
+   ↓             ↓            ↓
+Authorized   pairing-only    reject
+Connection   SAS + local
+             confirmation
+                 ↓
+          durable trust commit
+                 ↓
+        AuthorizedConnection
 ```
 
 The production contract is documented in [protocol v1](docs/protocol/v1.md), with
 machine-readable [conformance vectors](docs/protocol/v1-vectors.json). A successful
 bootstrap proves that the Iroh-authenticated endpoint identity matches the Rift Hello
-identity. It does not pair, authorize, persist trust, discover peers, or reconnect.
+identity but grants no application access by itself. Only local durable trust keyed by
+`DeviceId` can produce `AuthorizedConnection`; unknown peers are isolated to pairing and
+revoked peers are rejected. Discovery, daemon lifecycle, durable peer addresses,
+persistent secret-key storage, transfers, and UI remain deferred.
 
 ## Prototype 0: Iroh/QUIC networking spike
 
