@@ -368,11 +368,6 @@ impl TrustStore {
 
         if let Err(error) = persist_record(&mut inner.file, &record).await {
             inner.poisoned = true;
-            let previous_len = inner.file_len;
-            let _rollback_result = inner
-                .file
-                .set_len(u64::try_from(previous_len).unwrap_or(u64::MAX))
-                .await;
             return Err(error);
         }
 
