@@ -11,11 +11,11 @@ rift-protocol = { path = "../rift-protocol", version = "=0.1.0" }
 rift-transport-iroh = { path = "../rift-transport-iroh", version = "=0.1.0" }
 rift-trust = { path = "../rift-trust", version = "=0.1.0" }
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true
