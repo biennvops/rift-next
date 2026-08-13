@@ -31,12 +31,22 @@ pub const FRAME_LENGTH_PREFIX_LEN: usize = 4;
 /// The maximum number of capabilities in [`Hello`].
 pub const MAX_CAPABILITIES: usize = 64;
 
+/// The fixed byte length of a pairing attempt identifier.
+pub const PAIRING_ID_LEN: usize = 16;
+
+/// The fixed byte length of each pairing nonce.
+pub const PAIRING_NONCE_LEN: usize = 32;
+
+/// The domain separator at the start of every canonical pairing transcript.
+pub const PAIRING_DOMAIN: &[u8] = b"rift-pairing-v1";
+
+const PAIRING_CODE_MODULUS: u32 = 1_000_000;
+
 /// A forward-compatible capability identifier.
 ///
 /// Unknown values are valid wire values and are preserved in a decoded `Hello`.
-/// Rift v1 does not act on unknown capabilities. The known blob-transfer slot is
-/// intentionally not advertised by the production bootstrap default because the
-/// production blob-transfer plane does not exist yet.
+/// Rift v1 does not act on unknown capabilities. Blob transfer remains reserved and
+/// unadvertised; pairing is advertised only by session implementations that enable it.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Capability(u16);
@@ -44,6 +54,9 @@ pub struct Capability(u16);
 impl Capability {
     /// The reserved capability identifier for future production blob transfer.
     pub const BLOB_TRANSFER_V1: Self = Self(1);
+
+    /// Pairing protocol v1 support.
+    pub const PAIRING_V1: Self = Self(2);
 
     /// Constructs a capability identifier, retaining unknown values for forward
     /// compatibility.
@@ -58,7 +71,7 @@ impl Capability {
 
     /// Returns whether this is a capability known by Rift v1.
     pub const fn is_known(self) -> bool {
-        self.0 == Self::BLOB_TRANSFER_V1.0
+        self.0 == Self::BLOB_TRANSFER_V1.0 || self.0 == Self::PAIRING_V1.0
     }
 }
 
@@ -213,7 +226,79 @@ impl<'de> Visitor<'de> for BoundedCapabilitiesVisitor {
     }
 }
 
-/// The minimal production control message set for v1.
+/// The complete, role-ordered input to one pairing verification code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairingTranscript {
+    initiator_device_id: DeviceId,
+    responder_device_id: DeviceId,
+    pairing_id: [u8; PAIRING_ID_LEN],
+    initiator_nonce: [u8; PAIRING_NONCE_LEN],
+    responder_nonce: [u8; PAIRING_NONCE_LEN],
+}
+
+impl PairingTranscript {
+    /// Constructs a transcript with explicit initiator and responder roles.
+    pub const fn new(
+        initiator_device_id: DeviceId,
+        responder_device_id: DeviceId,
+        pairing_id: [u8; PAIRING_ID_LEN],
+        initiator_nonce: [u8; PAIRING_NONCE_LEN],
+        responder_nonce: [u8; PAIRING_NONCE_LEN],
+    ) -> Self {
+        Self {
+            initiator_device_id,
+            responder_device_id,
+            pairing_id,
+            initiator_nonce,
+            responder_nonce,
+        }
+    }
+
+    /// Derives the six-digit human comparison value for this transcript.
+    pub fn code(&self) -> PairingCode {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(PAIRING_DOMAIN);
+        hasher.update(&PROTOCOL_VERSION.to_be_bytes());
+        hasher.update(self.initiator_device_id.as_bytes());
+        hasher.update(self.responder_device_id.as_bytes());
+        hasher.update(&self.pairing_id);
+        hasher.update(&self.initiator_nonce);
+        hasher.update(&self.responder_nonce);
+        let digest = hasher.finalize();
+        let prefix = u32::from_be_bytes([
+            digest.as_bytes()[0],
+            digest.as_bytes()[1],
+            digest.as_bytes()[2],
+            digest.as_bytes()[3],
+        ]);
+        PairingCode(prefix % PAIRING_CODE_MODULUS)
+    }
+}
+
+/// A fixed six-digit human comparison value derived from a pairing transcript.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PairingCode(u32);
+
+impl PairingCode {
+    /// Returns the numeric value, which is always less than one million.
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingCode(..)")
+    }
+}
+
+impl fmt::Display for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:06}", self.0)
+    }
+}
+
+/// The production control message set for v1.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ControlMessage {
     /// The symmetric session bootstrap message.
@@ -222,6 +307,32 @@ pub enum ControlMessage {
     Ping { nonce: u64 },
     /// The response to a one-shot control-channel ping.
     Pong { nonce: u64 },
+    /// Starts one pairing attempt as its initiator.
+    PairingRequest {
+        /// The initiator-selected attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Fresh initiator nonce material.
+        nonce: [u8; PAIRING_NONCE_LEN],
+    },
+    /// Supplies the responder nonce for one pairing attempt.
+    PairingResponse {
+        /// The attempt identifier copied from the request.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Fresh responder nonce material.
+        nonce: [u8; PAIRING_NONCE_LEN],
+    },
+    /// Communicates one peer's explicit local human decision.
+    PairingDecision {
+        /// The active attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Whether the local human confirmed the verification code.
+        accepted: bool,
+    },
+    /// Signals that local trust was durably committed.
+    PairingComplete {
+        /// The completed attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+    },
 }
 
 impl ControlMessage {
@@ -231,6 +342,10 @@ impl ControlMessage {
             Self::Hello(_) => MessageKind::Hello,
             Self::Ping { .. } => MessageKind::Ping,
             Self::Pong { .. } => MessageKind::Pong,
+            Self::PairingRequest { .. } => MessageKind::PairingRequest,
+            Self::PairingResponse { .. } => MessageKind::PairingResponse,
+            Self::PairingDecision { .. } => MessageKind::PairingDecision,
+            Self::PairingComplete { .. } => MessageKind::PairingComplete,
         }
     }
 }
@@ -244,6 +359,14 @@ pub enum MessageKind {
     Ping,
     /// A Pong message.
     Pong,
+    /// A pairing request.
+    PairingRequest,
+    /// A pairing response.
+    PairingResponse,
+    /// A pairing decision.
+    PairingDecision,
+    /// A pairing completion signal.
+    PairingComplete,
 }
 
 impl fmt::Display for MessageKind {
@@ -252,6 +375,10 @@ impl fmt::Display for MessageKind {
             Self::Hello => "Hello",
             Self::Ping => "Ping",
             Self::Pong => "Pong",
+            Self::PairingRequest => "PairingRequest",
+            Self::PairingResponse => "PairingResponse",
+            Self::PairingDecision => "PairingDecision",
+            Self::PairingComplete => "PairingComplete",
         };
         formatter.write_str(name)
     }
@@ -746,6 +873,18 @@ mod tests {
         protocol_version: u16,
         alpn_hex: String,
         vectors: Vec<ConformanceVector>,
+        pairing_code_vectors: Vec<PairingCodeVector>,
+    }
+
+    #[derive(Deserialize)]
+    struct PairingCodeVector {
+        name: String,
+        initiator_device_id_hex: String,
+        responder_device_id_hex: String,
+        pairing_id_hex: String,
+        initiator_nonce_hex: String,
+        responder_nonce_hex: String,
+        code: String,
     }
 
     #[derive(Deserialize)]
@@ -772,6 +911,28 @@ mod tests {
         Pong {
             nonce: u64,
         },
+        PairingRequest {
+            pairing_id_hex: String,
+            nonce_hex: String,
+        },
+        PairingResponse {
+            pairing_id_hex: String,
+            nonce_hex: String,
+        },
+        PairingDecision {
+            pairing_id_hex: String,
+            accepted: bool,
+        },
+        PairingComplete {
+            pairing_id_hex: String,
+        },
+    }
+
+    fn vector_bytes<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], String> {
+        let bytes = hex::decode(value).map_err(|error| error.to_string())?;
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            format!("expected {LENGTH} vector bytes, received {}", bytes.len())
+        })
     }
 
     fn vector_message(
@@ -801,6 +962,30 @@ mod tests {
             }
             VectorMessage::Ping { nonce } => ControlMessage::Ping { nonce },
             VectorMessage::Pong { nonce } => ControlMessage::Pong { nonce },
+            VectorMessage::PairingRequest {
+                pairing_id_hex,
+                nonce_hex,
+            } => ControlMessage::PairingRequest {
+                pairing_id: vector_bytes(&pairing_id_hex)?,
+                nonce: vector_bytes(&nonce_hex)?,
+            },
+            VectorMessage::PairingResponse {
+                pairing_id_hex,
+                nonce_hex,
+            } => ControlMessage::PairingResponse {
+                pairing_id: vector_bytes(&pairing_id_hex)?,
+                nonce: vector_bytes(&nonce_hex)?,
+            },
+            VectorMessage::PairingDecision {
+                pairing_id_hex,
+                accepted,
+            } => ControlMessage::PairingDecision {
+                pairing_id: vector_bytes(&pairing_id_hex)?,
+                accepted,
+            },
+            VectorMessage::PairingComplete { pairing_id_hex } => ControlMessage::PairingComplete {
+                pairing_id: vector_bytes(&pairing_id_hex)?,
+            },
         };
         Ok(message)
     }
@@ -831,16 +1016,56 @@ mod tests {
             );
             assert_eq!(decode_message(&frame)?, message, "{} decode", vector.name);
         }
+        for vector in vectors.pairing_code_vectors {
+            let transcript = PairingTranscript::new(
+                DeviceId::from_bytes(vector_bytes(&vector.initiator_device_id_hex)?),
+                DeviceId::from_bytes(vector_bytes(&vector.responder_device_id_hex)?),
+                vector_bytes(&vector.pairing_id_hex)?,
+                vector_bytes(&vector.initiator_nonce_hex)?,
+                vector_bytes(&vector.responder_nonce_hex)?,
+            );
+            assert_eq!(
+                transcript.code().to_string(),
+                vector.code,
+                "{}",
+                vector.name
+            );
+        }
         Ok(())
+    }
+
+    fn pairing_messages() -> [ControlMessage; 5] {
+        let pairing_id = [0x10; PAIRING_ID_LEN];
+        [
+            ControlMessage::PairingRequest {
+                pairing_id,
+                nonce: [0x20; PAIRING_NONCE_LEN],
+            },
+            ControlMessage::PairingResponse {
+                pairing_id,
+                nonce: [0x30; PAIRING_NONCE_LEN],
+            },
+            ControlMessage::PairingDecision {
+                pairing_id,
+                accepted: true,
+            },
+            ControlMessage::PairingDecision {
+                pairing_id,
+                accepted: false,
+            },
+            ControlMessage::PairingComplete { pairing_id },
+        ]
     }
 
     #[test]
     fn all_v1_messages_round_trip_through_framing() -> Result<(), FrameError> {
-        for message in [
+        let mut messages = vec![
             ControlMessage::Hello(hello()),
             ControlMessage::Ping { nonce: 7 },
             ControlMessage::Pong { nonce: 7 },
-        ] {
+        ];
+        messages.extend(pairing_messages());
+        for message in messages {
             let encoded = encode_message(&message)?;
             assert_eq!(decode_message(&encoded)?, message);
         }
@@ -1087,6 +1312,117 @@ mod tests {
     }
 
     #[test]
+    fn pairing_transcript_is_role_ordered_and_code_is_six_digits() {
+        let transcript = PairingTranscript::new(
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [4; PAIRING_NONCE_LEN],
+            [5; PAIRING_NONCE_LEN],
+        );
+        let same = PairingTranscript::new(
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [4; PAIRING_NONCE_LEN],
+            [5; PAIRING_NONCE_LEN],
+        );
+
+        assert_eq!(transcript.code(), same.code());
+        assert_eq!(transcript.code().to_string().len(), 6);
+        assert!(
+            transcript
+                .code()
+                .to_string()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        );
+        assert!(transcript.code().value() < PAIRING_CODE_MODULUS);
+        assert_eq!(format!("{:?}", transcript.code()), "PairingCode(..)");
+    }
+
+    #[test]
+    fn every_pairing_transcript_component_affects_the_code() {
+        let baseline = PairingTranscript::new(
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [4; PAIRING_NONCE_LEN],
+            [5; PAIRING_NONCE_LEN],
+        )
+        .code();
+        let changed = [
+            PairingTranscript::new(
+                device_id(9),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+                [5; PAIRING_NONCE_LEN],
+            ),
+            PairingTranscript::new(
+                device_id(1),
+                device_id(9),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+                [5; PAIRING_NONCE_LEN],
+            ),
+            PairingTranscript::new(
+                device_id(1),
+                device_id(2),
+                [9; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+                [5; PAIRING_NONCE_LEN],
+            ),
+            PairingTranscript::new(
+                device_id(1),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [9; PAIRING_NONCE_LEN],
+                [5; PAIRING_NONCE_LEN],
+            ),
+            PairingTranscript::new(
+                device_id(1),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+                [9; PAIRING_NONCE_LEN],
+            ),
+        ];
+
+        for transcript in changed {
+            assert_ne!(transcript.code(), baseline);
+        }
+        assert_eq!(PAIRING_DOMAIN, b"rift-pairing-v1");
+        assert_eq!(PAIRING_ID_LEN, 16);
+        assert_eq!(PAIRING_NONCE_LEN, 32);
+    }
+
+    #[test]
+    fn initiator_and_responder_inputs_produce_the_same_code() {
+        let initiator = device_id(1);
+        let responder = device_id(2);
+        let pairing_id = [3; PAIRING_ID_LEN];
+        let initiator_nonce = [4; PAIRING_NONCE_LEN];
+        let responder_nonce = [5; PAIRING_NONCE_LEN];
+
+        let initiator_view = PairingTranscript::new(
+            initiator,
+            responder,
+            pairing_id,
+            initiator_nonce,
+            responder_nonce,
+        );
+        let responder_view = PairingTranscript::new(
+            initiator,
+            responder,
+            pairing_id,
+            initiator_nonce,
+            responder_nonce,
+        );
+        assert_eq!(initiator_view.code(), responder_view.code());
+    }
+
+    #[test]
     fn unknown_capabilities_are_preserved_without_being_advertised_by_default() {
         let unknown = Capability::new(u16::MAX);
         assert!(!unknown.is_known());
@@ -1095,6 +1431,9 @@ mod tests {
         assert!(
             HelloMetadata::new("device", "platform", vec![Capability::BLOB_TRANSFER_V1]).is_ok()
         );
+        assert!(HelloMetadata::new("device", "platform", vec![Capability::PAIRING_V1]).is_ok());
+        assert!(Capability::BLOB_TRANSFER_V1.is_known());
+        assert!(Capability::PAIRING_V1.is_known());
         assert!(HelloMetadata::new("device", "platform", Vec::new()).is_ok());
     }
 

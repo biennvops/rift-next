@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+blake3.workspace = true
 postcard.workspace = true
 rift-core = { path = "../rift-core", version = "=0.1.0" }
 serde.workspace = true

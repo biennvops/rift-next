@@ -45,6 +45,56 @@
       },
       "postcard_payload_hex": "022a",
       "frame_hex": "00000002022a"
+    },
+    {
+      "name": "pairing-request",
+      "message": {
+        "type": "pairing_request",
+        "pairing_id_hex": "000102030405060708090a0b0c0d0e0f",
+        "nonce_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+      },
+      "postcard_payload_hex": "03000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+      "frame_hex": "0000003103000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+    },
+    {
+      "name": "pairing-response",
+      "message": {
+        "type": "pairing_response",
+        "pairing_id_hex": "000102030405060708090a0b0c0d0e0f",
+        "nonce_hex": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"
+      },
+      "postcard_payload_hex": "04000102030405060708090a0b0c0d0e0f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+      "frame_hex": "0000003104000102030405060708090a0b0c0d0e0f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"
+    },
+    {
+      "name": "pairing-decision-accepted",
+      "message": {
+        "type": "pairing_decision",
+        "pairing_id_hex": "000102030405060708090a0b0c0d0e0f",
+        "accepted": true
+      },
+      "postcard_payload_hex": "05000102030405060708090a0b0c0d0e0f01",
+      "frame_hex": "0000001205000102030405060708090a0b0c0d0e0f01"
+    },
+    {
+      "name": "pairing-complete",
+      "message": {
+        "type": "pairing_complete",
+        "pairing_id_hex": "000102030405060708090a0b0c0d0e0f"
+      },
+      "postcard_payload_hex": "06000102030405060708090a0b0c0d0e0f",
+      "frame_hex": "0000001106000102030405060708090a0b0c0d0e0f"
+    }
+  ],
+  "pairing_code_vectors": [
+    {
+      "name": "role-ordered-transcript",
+      "initiator_device_id_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "responder_device_id_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "pairing_id_hex": "03030303030303030303030303030303",
+      "initiator_nonce_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+      "responder_nonce_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+      "code": "587870"
     }
   ]
 }
