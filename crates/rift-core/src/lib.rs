@@ -1,8 +1,8 @@
 //! Platform-independent Rift domain logic.
 //!
-//! Cryptographic device identity is represented by [`DeviceId`]. It contains only
-//! public identity bytes and has no dependency on a transport, operating system, or
-//! secret-key storage mechanism.
+//! Cryptographic device identity is represented by [`DeviceId`]. Durable trust
+//! decisions use that identity as their only key. These types contain no transport,
+//! operating-system, or secret-key storage details.
 
 use std::fmt;
 
@@ -11,6 +11,12 @@ use thiserror::Error;
 
 /// The byte length of a Rift device identity.
 pub const DEVICE_ID_LEN: usize = 32;
+
+/// The maximum UTF-8 byte length of peer display names.
+pub const MAX_DEVICE_NAME_LEN: usize = 128;
+
+/// The maximum UTF-8 byte length of peer platform identifiers.
+pub const MAX_PLATFORM_LEN: usize = 64;
 
 /// The public cryptographic identity of a Rift device.
 ///
@@ -72,6 +78,32 @@ impl fmt::Display for DeviceId {
 #[error("device ID must contain exactly {expected} bytes, received {actual}", expected = DEVICE_ID_LEN)]
 pub struct DeviceIdError {
     actual: usize,
+}
+
+/// A durable local trust decision for a cryptographic device identity.
+///
+/// No stored value represents an unknown peer. Absence from a trust store means
+/// unknown.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TrustState {
+    /// The peer may be admitted to application functionality.
+    Trusted,
+    /// The peer is blocked until explicitly forgotten.
+    Revoked,
+}
+
+/// A trusted peer and the display metadata captured when pairing succeeded.
+///
+/// Only [`device_id`](Self::device_id) identifies the peer. The name and platform
+/// are bounded, peer-controlled presentation data and must never be used as keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TrustedPeer {
+    /// The peer's public cryptographic identity and trust-store key.
+    pub device_id: DeviceId,
+    /// Human-readable display metadata captured from the authenticated Hello.
+    pub device_name: String,
+    /// Platform display metadata captured from the authenticated Hello.
+    pub platform: String,
 }
 
 #[cfg(test)]
@@ -142,5 +174,31 @@ mod tests {
                 actual: DEVICE_ID_LEN + 1,
             })
         );
+    }
+
+    #[test]
+    fn trust_records_are_keyed_by_device_id_not_display_metadata() {
+        let device_id = DeviceId::from_bytes([9; DEVICE_ID_LEN]);
+        let first = TrustedPeer {
+            device_id,
+            device_name: "first name".to_owned(),
+            platform: "first platform".to_owned(),
+        };
+        let second = TrustedPeer {
+            device_id,
+            device_name: "renamed".to_owned(),
+            platform: "changed platform".to_owned(),
+        };
+
+        assert_eq!(first.device_id, second.device_id);
+        assert_ne!(first, second);
+        assert_eq!(TrustState::Trusted, TrustState::Trusted);
+        assert_ne!(TrustState::Trusted, TrustState::Revoked);
+    }
+
+    #[test]
+    fn peer_metadata_bounds_match_the_authenticated_hello_contract() {
+        assert_eq!(MAX_DEVICE_NAME_LEN, 128);
+        assert_eq!(MAX_PLATFORM_LEN, 64);
     }
 }

@@ -7,6 +7,7 @@
 use std::{fmt, io, time::Duration};
 
 use rift_core::DeviceId;
+pub use rift_core::{MAX_DEVICE_NAME_LEN, MAX_PLATFORM_LEN};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, DeserializeOwned, SeqAccess, Visitor},
@@ -26,12 +27,6 @@ pub const MAX_CONTROL_FRAME_LEN: usize = 1024 * 1024;
 
 /// The size of the big-endian frame length prefix.
 pub const FRAME_LENGTH_PREFIX_LEN: usize = 4;
-
-/// The maximum UTF-8 byte length of a device name in [`Hello`].
-pub const MAX_DEVICE_NAME_LEN: usize = 128;
-
-/// The maximum UTF-8 byte length of a platform identifier in [`Hello`].
-pub const MAX_PLATFORM_LEN: usize = 64;
 
 /// The maximum number of capabilities in [`Hello`].
 pub const MAX_CAPABILITIES: usize = 64;
