@@ -123,6 +123,9 @@ pub enum TrustStoreError {
     /// Postcard could not encode a mutation.
     #[error("unable to encode trust mutation: {0}")]
     Encode(#[source] postcard::Error),
+    /// A revoked identity cannot be trusted until it is explicitly forgotten.
+    #[error("revoked peer {0} must be forgotten before it can be trusted again")]
+    RevokedIdentity(DeviceId),
     /// A prior persistence failure poisoned this store instance.
     #[error("trust store is poisoned by a prior persistence failure")]
     StorePoisoned,
@@ -328,6 +331,14 @@ impl TrustStore {
         let mut inner = self.inner.lock().await;
         if inner.poisoned {
             return Err(TrustStoreError::StorePoisoned);
+        }
+        if let TrustMutation::Trust { peer } = &mutation
+            && matches!(
+                inner.decisions.get(&peer.device_id),
+                Some(StoredDecision::Revoked)
+            )
+        {
+            return Err(TrustStoreError::RevokedIdentity(peer.device_id));
         }
         if inner.record_count >= MAX_RECORDS {
             return Err(TrustStoreError::TooManyRecords {
@@ -781,6 +792,23 @@ mod tests {
         let reopened = TrustStore::open(&path).await?;
         assert!(reopened.list().await.is_empty());
         assert_eq!(fs::metadata(path).await?.len(), HEADER_LEN as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revocation_is_sticky_until_explicit_forget() -> TestResult {
+        let directory = TempDir::new()?;
+        let store = TrustStore::open(store_path(&directory)).await?;
+        store.revoke(device_id(1)).await?;
+        assert!(matches!(
+            store.trust(peer(1, "blocked")).await,
+            Err(TrustStoreError::RevokedIdentity(revoked)) if revoked == device_id(1)
+        ));
+        assert_eq!(store.state(device_id(1)).await, Some(TrustState::Revoked));
+
+        store.forget(device_id(1)).await?;
+        store.trust(peer(1, "allowed after forget")).await?;
+        assert_eq!(store.state(device_id(1)).await, Some(TrustState::Trusted));
         Ok(())
     }
 
