@@ -348,6 +348,91 @@ impl ControlMessage {
             Self::PairingComplete { .. } => MessageKind::PairingComplete,
         }
     }
+
+    /// Converts a control message into the pairing-only representation.
+    pub fn into_pairing(self) -> Result<PairingMessage, MessageKind> {
+        match self {
+            Self::PairingRequest { pairing_id, nonce } => {
+                Ok(PairingMessage::Request { pairing_id, nonce })
+            }
+            Self::PairingResponse { pairing_id, nonce } => {
+                Ok(PairingMessage::Response { pairing_id, nonce })
+            }
+            Self::PairingDecision {
+                pairing_id,
+                accepted,
+            } => Ok(PairingMessage::Decision {
+                pairing_id,
+                accepted,
+            }),
+            Self::PairingComplete { pairing_id } => Ok(PairingMessage::Complete { pairing_id }),
+            message => Err(message.kind()),
+        }
+    }
+}
+
+/// A pairing-only view of the v1 control messages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PairingMessage {
+    /// Starts a pairing attempt.
+    Request {
+        /// The initiator-selected attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Fresh initiator nonce material.
+        nonce: [u8; PAIRING_NONCE_LEN],
+    },
+    /// Supplies the responder's nonce.
+    Response {
+        /// The active attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Fresh responder nonce material.
+        nonce: [u8; PAIRING_NONCE_LEN],
+    },
+    /// Communicates one explicit local decision.
+    Decision {
+        /// The active attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// Whether the local human confirmed the code.
+        accepted: bool,
+    },
+    /// Signals a durable local trust commit.
+    Complete {
+        /// The completed attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+    },
+}
+
+impl PairingMessage {
+    /// Returns the corresponding v1 control message kind.
+    pub const fn kind(&self) -> MessageKind {
+        match self {
+            Self::Request { .. } => MessageKind::PairingRequest,
+            Self::Response { .. } => MessageKind::PairingResponse,
+            Self::Decision { .. } => MessageKind::PairingDecision,
+            Self::Complete { .. } => MessageKind::PairingComplete,
+        }
+    }
+}
+
+impl From<PairingMessage> for ControlMessage {
+    fn from(message: PairingMessage) -> Self {
+        match message {
+            PairingMessage::Request { pairing_id, nonce } => {
+                Self::PairingRequest { pairing_id, nonce }
+            }
+            PairingMessage::Response { pairing_id, nonce } => {
+                Self::PairingResponse { pairing_id, nonce }
+            }
+            PairingMessage::Decision {
+                pairing_id,
+                accepted,
+            } => Self::PairingDecision {
+                pairing_id,
+                accepted,
+            },
+            PairingMessage::Complete { pairing_id } => Self::PairingComplete { pairing_id },
+        }
+    }
 }
 
 /// A payload-free control message kind used in typed sequencing errors.
@@ -1037,24 +1122,45 @@ mod tests {
     fn pairing_messages() -> [ControlMessage; 5] {
         let pairing_id = [0x10; PAIRING_ID_LEN];
         [
-            ControlMessage::PairingRequest {
+            PairingMessage::Request {
                 pairing_id,
                 nonce: [0x20; PAIRING_NONCE_LEN],
-            },
-            ControlMessage::PairingResponse {
+            }
+            .into(),
+            PairingMessage::Response {
                 pairing_id,
                 nonce: [0x30; PAIRING_NONCE_LEN],
-            },
-            ControlMessage::PairingDecision {
+            }
+            .into(),
+            PairingMessage::Decision {
                 pairing_id,
                 accepted: true,
-            },
-            ControlMessage::PairingDecision {
+            }
+            .into(),
+            PairingMessage::Decision {
                 pairing_id,
                 accepted: false,
-            },
-            ControlMessage::PairingComplete { pairing_id },
+            }
+            .into(),
+            PairingMessage::Complete { pairing_id }.into(),
         ]
+    }
+
+    #[test]
+    fn pairing_only_messages_reject_general_control_variants() {
+        for message in pairing_messages() {
+            let kind = message.kind();
+            let pairing = message.into_pairing();
+            assert!(matches!(pairing, Ok(ref pairing) if pairing.kind() == kind));
+        }
+        for message in [
+            ControlMessage::Hello(hello()),
+            ControlMessage::Ping { nonce: 1 },
+            ControlMessage::Pong { nonce: 1 },
+        ] {
+            let kind = message.kind();
+            assert_eq!(message.into_pairing(), Err(kind));
+        }
     }
 
     #[test]
