@@ -1,0 +1,21 @@
+[package]
+name = "rift-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rift-core = { path = "../rift-core", version = "=0.1.0" }
+rift-protocol = { path = "../rift-protocol", version = "=0.1.0" }
+rift-transport-iroh = { path = "../rift-transport-iroh", version = "=0.1.0" }
+rift-trust = { path = "../rift-trust", version = "=0.1.0" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -2798,6 +2798,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-session"
+version = "0.1.0"
+dependencies = [
+ "rift-core",
+ "rift-protocol",
+ "rift-transport-iroh",
+ "rift-trust",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rift-spike"
 version = "0.1.0"
 dependencies = [

@@ -184,24 +184,28 @@ impl TrustStore {
         &self.path
     }
 
-    /// Returns the local decision, or `None` when the identity is unknown.
-    pub async fn state(&self, device_id: DeviceId) -> Option<TrustState> {
+    /// Returns one current decision for an identity.
+    pub async fn entry(&self, device_id: DeviceId) -> Option<TrustEntry> {
         let inner = self.inner.lock().await;
         inner
             .decisions
             .get(&device_id)
             .map(|decision| match decision {
-                StoredDecision::Trusted(_) => TrustState::Trusted,
-                StoredDecision::Revoked => TrustState::Revoked,
+                StoredDecision::Trusted(peer) => TrustEntry::Trusted(peer.clone()),
+                StoredDecision::Revoked => TrustEntry::Revoked(device_id),
             })
+    }
+
+    /// Returns the local decision, or `None` when the identity is unknown.
+    pub async fn state(&self, device_id: DeviceId) -> Option<TrustState> {
+        self.entry(device_id).await.map(|entry| entry.state())
     }
 
     /// Returns trusted metadata only when the current state is trusted.
     pub async fn peer(&self, device_id: DeviceId) -> Option<TrustedPeer> {
-        let inner = self.inner.lock().await;
-        match inner.decisions.get(&device_id) {
-            Some(StoredDecision::Trusted(peer)) => Some(peer.clone()),
-            Some(StoredDecision::Revoked) | None => None,
+        match self.entry(device_id).await {
+            Some(TrustEntry::Trusted(peer)) => Some(peer),
+            Some(TrustEntry::Revoked(_)) | None => None,
         }
     }
 
