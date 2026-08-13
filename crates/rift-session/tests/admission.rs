@@ -426,6 +426,64 @@ async fn durable_reconnect_authorizes_without_repairing() -> TestResult {
 }
 
 #[tokio::test]
+async fn paired_peer_revocation_and_forget_apply_to_fresh_admission() -> TestResult {
+    let directory = TempDir::new()?;
+    let store_a = store(&directory, "a.trust").await?;
+    let store_b = store(&directory, "b.trust").await?;
+    let manager_a = manager(store_a.clone())?;
+    let manager_b = manager(store_b.clone())?;
+    let (endpoint_a, endpoint_b) = bind_pair().await?;
+    let (pairable_a, pairable_b) =
+        pairable_pair(&manager_a, &manager_b, &endpoint_a, &endpoint_b).await?;
+    let (pending_a, pending_b) = pending_pair(pairable_a, pairable_b).await?;
+    let (authorized_a, authorized_b) =
+        tokio::try_join!(pending_a.confirm(true), pending_b.confirm(true))?;
+    authorized_a.close();
+    authorized_b.close();
+
+    store_a.revoke(endpoint_b.device_id()).await?;
+    let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
+    assert!(matches!(
+        manager_a.admit(connection_a).await,
+        Err(SessionError::PeerRevoked(device_id)) if device_id == endpoint_b.device_id()
+    ));
+    let SessionAdmission::Authorized(authorized_b) = manager_b.admit(connection_b).await? else {
+        return Err("B's independent trust decision unexpectedly changed".into());
+    };
+    authorized_b.close();
+
+    store_a.forget(endpoint_b.device_id()).await?;
+    let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
+    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+        return Err("forgotten peer was not pairing-only".into());
+    };
+    let SessionAdmission::Authorized(authorized_b) = manager_b.admit(connection_b).await? else {
+        return Err("B's independent trust decision unexpectedly changed".into());
+    };
+    assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
+    pairable_a.close();
+    authorized_b.close();
+    close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_pairing_timeout_configuration_is_rejected() -> TestResult {
+    let directory = TempDir::new()?;
+    let store = store(&directory, "trust").await?;
+    assert!(matches!(
+        SessionManager::with_config(
+            store,
+            SessionConfig {
+                pairing_timeout: Duration::ZERO
+            }
+        ),
+        Err(SessionError::InvalidPairingTimeout)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn trusted_peer_is_authorized_from_device_id_record() -> TestResult {
     let directory = TempDir::new()?;
     let store_a = store(&directory, "a.trust").await?;
