@@ -411,6 +411,11 @@ impl PendingPairing {
         self.code
     }
 
+    /// Returns the deadline by which local confirmation must begin.
+    pub const fn confirmation_deadline(&self) -> Instant {
+        self.local_confirmation_deadline
+    }
+
     /// Returns the current explicit state-machine phase.
     pub const fn phase(&self) -> PairingPhase {
         self.machine.phase()

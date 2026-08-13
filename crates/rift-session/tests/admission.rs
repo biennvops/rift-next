@@ -7,8 +7,9 @@ use rift_session::{
     SessionAdmission, SessionConfig, SessionError, SessionManager, pairing_metadata,
 };
 use rift_transport_iroh::{BootstrappedConnection, EndpointConfig, RiftEndpoint, SecretKey};
-use rift_trust::TrustStore;
+use rift_trust::{TrustStore, TrustStoreError};
 use tempfile::TempDir;
+use tokio::fs;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -422,6 +423,60 @@ async fn durable_reconnect_authorizes_without_repairing() -> TestResult {
     authorized_a.close();
     authorized_b.close();
     close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_confirmation_deadline_expires_without_trust() -> TestResult {
+    let directory = TempDir::new()?;
+    let store_a = store(&directory, "a.trust").await?;
+    let store_b = store(&directory, "b.trust").await?;
+    let short_config = SessionConfig {
+        pairing_timeout: Duration::from_millis(20),
+    };
+    let manager_a = SessionManager::with_config(store_a.clone(), short_config)?;
+    let manager_b = SessionManager::with_config(store_b.clone(), short_config)?;
+    let (endpoint_a, endpoint_b) = bind_pair().await?;
+    let (pairable_a, pairable_b) =
+        pairable_pair(&manager_a, &manager_b, &endpoint_a, &endpoint_b).await?;
+    let (pending_a, pending_b) = pending_pair(pairable_a, pairable_b).await?;
+
+    tokio::time::sleep_until(pending_a.confirmation_deadline()).await;
+    assert!(matches!(
+        pending_a.confirm(true).await,
+        Err(PairingError::Timeout {
+            phase: PairingPhase::AwaitingLocalDecision
+        })
+    ));
+    assert!(pending_b.confirm(true).await.is_err());
+    assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
+    assert_eq!(store_b.state(endpoint_a.device_id()).await, None);
+    close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_trust_store_cannot_supply_authorization_state() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("corrupt.trust");
+    let store = TrustStore::open(&path).await?;
+    store
+        .trust(TrustedPeer {
+            device_id: rift_core::DeviceId::from_bytes([7; 32]),
+            device_name: "formerly trusted".to_owned(),
+            platform: "test".to_owned(),
+        })
+        .await?;
+    drop(store);
+    let mut bytes = fs::read(&path).await?;
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fs::write(&path, bytes).await?;
+
+    assert!(matches!(
+        TrustStore::open(path).await,
+        Err(TrustStoreError::CorruptRecord { .. })
+    ));
     Ok(())
 }
 
