@@ -17,5 +17,9 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[example]]
+name = "trust-benchmark"
+required-features = []
+
 [lints]
 workspace = true

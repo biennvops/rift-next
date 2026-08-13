@@ -113,6 +113,20 @@ fn benchmark_smoke() -> Result<()> {
             "run",
             "--locked",
             "--package",
+            "rift-trust",
+            "--example",
+            "trust-benchmark",
+            "--",
+            "10",
+            "100",
+        ],
+        &[],
+    )?;
+    run_cargo(
+        &[
+            "run",
+            "--locked",
+            "--package",
             "rift-spike",
             "--",
             "bench",
