@@ -91,6 +91,9 @@ impl fmt::Display for PairingPhase {
 /// poisoned and never returns an authorized wrapper.
 #[derive(Debug, Error)]
 pub enum PairingError {
+    /// The operating system could not provide secure pairing randomness.
+    #[error("unable to obtain OS pairing randomness: {0}")]
+    Randomness(#[source] getrandom::Error),
     /// The peer did not advertise pairing protocol v1 in its authenticated Hello.
     #[error("peer {0} did not advertise PAIRING_V1")]
     PairingUnsupported(DeviceId),
@@ -136,11 +139,7 @@ pub enum PairingError {
     Trust(#[source] TrustStoreError),
 }
 
-/// Deterministic initiator inputs used by tests and protocol vectors.
-///
-/// Production callers use the secure generation API added alongside the session
-/// pairing entry point. This constructor is deliberately named to prevent fixed test
-/// material from looking like production randomness.
+/// Initiator pairing inputs containing a fresh attempt ID and nonce.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct InitiatorPairingMaterial {
     pairing_id: [u8; PAIRING_ID_LEN],
@@ -148,6 +147,16 @@ pub struct InitiatorPairingMaterial {
 }
 
 impl InitiatorPairingMaterial {
+    /// Generates a fresh pairing ID and nonce directly from the operating-system
+    /// cryptographically secure random source.
+    pub fn generate() -> Result<Self, PairingError> {
+        let mut pairing_id = [0_u8; PAIRING_ID_LEN];
+        let mut nonce = [0_u8; PAIRING_NONCE_LEN];
+        getrandom::fill(&mut pairing_id).map_err(PairingError::Randomness)?;
+        getrandom::fill(&mut nonce).map_err(PairingError::Randomness)?;
+        Ok(Self { pairing_id, nonce })
+    }
+
     /// Constructs deterministic initiator material for tests.
     pub const fn from_bytes_for_test(
         pairing_id: [u8; PAIRING_ID_LEN],
@@ -163,13 +172,21 @@ impl fmt::Debug for InitiatorPairingMaterial {
     }
 }
 
-/// Deterministic responder nonce material used by tests and protocol vectors.
+/// Responder pairing inputs containing a fresh nonce.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ResponderPairingMaterial {
     nonce: [u8; PAIRING_NONCE_LEN],
 }
 
 impl ResponderPairingMaterial {
+    /// Generates a fresh responder nonce directly from the operating-system
+    /// cryptographically secure random source.
+    pub fn generate() -> Result<Self, PairingError> {
+        let mut nonce = [0_u8; PAIRING_NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(PairingError::Randomness)?;
+        Ok(Self { nonce })
+    }
+
     /// Constructs deterministic responder material for tests.
     pub const fn from_bytes_for_test(nonce: [u8; PAIRING_NONCE_LEN]) -> Self {
         Self { nonce }
@@ -244,6 +261,12 @@ impl PairableConnection {
             .contains(&Capability::PAIRING_V1)
     }
 
+    /// Starts the initiator role with fresh OS-CSPRNG pairing material.
+    pub async fn initiate_pairing(self) -> Result<PendingPairing, PairingError> {
+        let material = InitiatorPairingMaterial::generate()?;
+        self.initiate_pairing_with_material_for_test(material).await
+    }
+
     /// Starts the initiator role with deterministic test material.
     pub async fn initiate_pairing_with_material_for_test(
         mut self,
@@ -292,6 +315,13 @@ impl PairableConnection {
             machine,
             self.pairing_timeout,
         ))
+    }
+
+    /// Runs the responder role with a fresh OS-CSPRNG nonce.
+    pub async fn respond_to_pairing(self) -> Result<PendingPairing, PairingError> {
+        let material = ResponderPairingMaterial::generate()?;
+        self.respond_to_pairing_with_material_for_test(material)
+            .await
     }
 
     /// Runs the responder role with deterministic test material.

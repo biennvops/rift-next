@@ -2801,6 +2801,7 @@ dependencies = [
 name = "rift-session"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "rift-core",
  "rift-protocol",
  "rift-transport-iroh",

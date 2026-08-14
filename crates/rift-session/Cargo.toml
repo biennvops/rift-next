@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+getrandom.workspace = true
 rift-core = { path = "../rift-core", version = "=0.1.0" }
 rift-protocol = { path = "../rift-protocol", version = "=0.1.0" }
 rift-transport-iroh = { path = "../rift-transport-iroh", version = "=0.1.0" }

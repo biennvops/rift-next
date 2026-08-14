@@ -105,6 +105,16 @@ async fn pairable_pair(
     Ok((pairable_a, pairable_b))
 }
 
+async fn pending_pair_production(
+    pairable_a: rift_session::PairableConnection,
+    pairable_b: rift_session::PairableConnection,
+) -> TestResult<(rift_session::PendingPairing, rift_session::PendingPairing)> {
+    let responder = tokio::spawn(async move { pairable_b.respond_to_pairing().await });
+    let pending_a = pairable_a.initiate_pairing().await?;
+    let pending_b = responder.await??;
+    Ok((pending_a, pending_b))
+}
+
 async fn pending_pair(
     pairable_a: rift_session::PairableConnection,
     pairable_b: rift_session::PairableConnection,
@@ -165,7 +175,7 @@ async fn successful_pairing_requires_local_confirmation_and_authorizes_both() ->
     let (endpoint_a, endpoint_b) = bind_pair().await?;
     let (pairable_a, pairable_b) =
         pairable_pair(&manager_a, &manager_b, &endpoint_a, &endpoint_b).await?;
-    let (pending_a, pending_b) = pending_pair(pairable_a, pairable_b).await?;
+    let (pending_a, pending_b) = pending_pair_production(pairable_a, pairable_b).await?;
 
     assert_eq!(pending_a.verification_code(), pending_b.verification_code());
     assert_eq!(pending_a.verification_code().to_string().len(), 6);
