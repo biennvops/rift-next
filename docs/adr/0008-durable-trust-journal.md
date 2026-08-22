@@ -22,8 +22,10 @@ Postcard TrustMutation payload
 ```
 
 The mutation set is `Trust { TrustedPeer }`, `Revoke { DeviceId }`, and
-`Forget { DeviceId }`. Replay applies mutations in order and the last valid mutation for
-each `DeviceId` wins. Unknown is represented by absence, never a stored enum value.
+`Forget { DeviceId }`. Replay validates and applies mutations in order. Revocation remains
+sticky during replay: a `Trust` for a revoked identity without an intervening `Forget` is
+semantic corruption and fails the entire open. Unknown is represented by absence, never a
+stored enum value.
 
 Record payloads are bounded to 1,024 bytes, the complete journal to 16 MiB, replay to
 100,000 records, and display metadata to the protocol Hello bounds. Declared lengths are
@@ -32,8 +34,12 @@ bounded read.
 
 A mutation is serialized, appended as a complete checksummed record, flushed, and synced
 to durable storage before the in-memory map changes or the call returns success. Mutations
-are serialized under one store-instance lock. A persistence failure leaves the mutation
-invisible and poisons that instance against further writes.
+are serialized under one store-instance lock. The store records the pre-append length. Any
+append, flush, or sync failure poisons the instance and durably truncates and syncs the
+journal back to that length before returning the commit failure, so the mutation remains
+invisible after reopen. If that rollback itself fails, the store reports both failures and
+remains poisoned; the store path must be treated as quarantined rather than reopened for
+authorization.
 
 A physically incomplete final record envelope is treated as an interrupted append: replay
 stops at the last completely validated record, truncates the tail, and syncs recovery.

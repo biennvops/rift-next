@@ -129,12 +129,28 @@ pub enum TrustStoreError {
     /// A prior persistence failure poisoned this store instance.
     #[error("trust store is poisoned by a prior persistence failure")]
     StorePoisoned,
+    /// A failed commit could not be durably removed from the journal.
+    #[error("trust-store commit failed ({commit}) and durable rollback failed ({rollback})")]
+    RollbackFailed {
+        /// The original append, flush, or sync failure.
+        commit: Box<TrustStoreError>,
+        /// The failure while truncating or syncing the rollback.
+        rollback: Box<TrustStoreError>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StoredDecision {
     Trusted(TrustedPeer),
     Revoked,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PersistFailure {
+    Write,
+    Flush,
+    Sync,
 }
 
 struct StoreInner {
@@ -144,7 +160,7 @@ struct StoreInner {
     record_count: usize,
     poisoned: bool,
     #[cfg(test)]
-    fail_next_append: bool,
+    fail_next_persist: Option<PersistFailure>,
 }
 
 /// A single-process owner of one durable trust-journal path.
@@ -315,7 +331,7 @@ impl TrustStore {
                 record_count,
                 poisoned: false,
                 #[cfg(test)]
-                fail_next_append: false,
+                fail_next_persist: None,
             }),
         }
     }
@@ -336,20 +352,14 @@ impl TrustStore {
         if inner.poisoned {
             return Err(TrustStoreError::StorePoisoned);
         }
-        if let TrustMutation::Trust { peer } = &mutation
-            && matches!(
-                inner.decisions.get(&peer.device_id),
-                Some(StoredDecision::Revoked)
-            )
-        {
-            return Err(TrustStoreError::RevokedIdentity(peer.device_id));
-        }
+        validate_transition(&inner.decisions, &mutation)?;
         if inner.record_count >= MAX_RECORDS {
             return Err(TrustStoreError::TooManyRecords {
                 maximum: MAX_RECORDS,
             });
         }
-        let next_len = inner.file_len.saturating_add(record.len());
+        let previous_len = inner.file_len;
+        let next_len = previous_len.saturating_add(record.len());
         if next_len > MAX_STORE_SIZE {
             return Err(TrustStoreError::StoreTooLarge {
                 actual: next_len,
@@ -358,17 +368,21 @@ impl TrustStore {
         }
 
         #[cfg(test)]
-        if inner.fail_next_append {
-            inner.fail_next_append = false;
-            return Err(io_error(
-                "append",
-                io::Error::other("injected append failure"),
-            ));
-        }
+        let failure = inner.fail_next_persist.take();
+        #[cfg(test)]
+        let persist_result = persist_record(&mut inner.file, &record, failure).await;
+        #[cfg(not(test))]
+        let persist_result = persist_record(&mut inner.file, &record).await;
 
-        if let Err(error) = persist_record(&mut inner.file, &record).await {
+        if let Err(commit) = persist_result {
             inner.poisoned = true;
-            return Err(error);
+            if let Err(rollback) = rollback_record(&mut inner.file, previous_len).await {
+                return Err(TrustStoreError::RollbackFailed {
+                    commit: Box::new(commit),
+                    rollback: Box::new(rollback),
+                });
+            }
+            return Err(commit);
         }
 
         apply_mutation(&mut inner.decisions, &mutation);
@@ -378,8 +392,8 @@ impl TrustStore {
     }
 
     #[cfg(test)]
-    async fn inject_append_failure(&self) {
-        self.inner.lock().await.fail_next_append = true;
+    async fn inject_persist_failure(&self, failure: PersistFailure) {
+        self.inner.lock().await.fail_next_persist = Some(failure);
     }
 }
 
@@ -457,6 +471,11 @@ fn replay(bytes: &[u8]) -> Result<ReplayResult, TrustStoreError> {
             offset: record_offset,
             reason: "invalid trusted-peer metadata",
         })?;
+        validate_transition(&decisions, &mutation).map_err(|_| TrustStoreError::CorruptRecord {
+            record: record_count,
+            offset: record_offset,
+            reason: "revoked identity trusted without intervening forget",
+        })?;
         apply_mutation(&mut decisions, &mutation);
         record_count += 1;
         offset = checksum_end;
@@ -489,6 +508,21 @@ fn validate_header(bytes: &[u8]) -> Result<(), TrustStoreError> {
 fn validate_mutation(mutation: &TrustMutation) -> Result<(), TrustStoreError> {
     if let TrustMutation::Trust { peer } = mutation {
         validate_peer(peer)?;
+    }
+    Ok(())
+}
+
+fn validate_transition(
+    decisions: &BTreeMap<DeviceId, StoredDecision>,
+    mutation: &TrustMutation,
+) -> Result<(), TrustStoreError> {
+    if let TrustMutation::Trust { peer } = mutation
+        && matches!(
+            decisions.get(&peer.device_id),
+            Some(StoredDecision::Revoked)
+        )
+    {
+        return Err(TrustStoreError::RevokedIdentity(peer.device_id));
     }
     Ok(())
 }
@@ -551,6 +585,7 @@ async fn write_header(file: &mut File) -> Result<(), TrustStoreError> {
         .map_err(|source| io_error("sync header", source))
 }
 
+#[cfg(not(test))]
 async fn persist_record(file: &mut File, record: &[u8]) -> Result<(), TrustStoreError> {
     file.write_all(record)
         .await
@@ -561,6 +596,53 @@ async fn persist_record(file: &mut File, record: &[u8]) -> Result<(), TrustStore
     file.sync_data()
         .await
         .map_err(|source| io_error("sync", source))
+}
+
+#[cfg(test)]
+async fn persist_record(
+    file: &mut File,
+    record: &[u8],
+    failure: Option<PersistFailure>,
+) -> Result<(), TrustStoreError> {
+    file.write_all(record)
+        .await
+        .map_err(|source| io_error("append", source))?;
+    if matches!(failure, Some(PersistFailure::Write)) {
+        return Err(io_error(
+            "append",
+            io::Error::other("injected failure after write"),
+        ));
+    }
+
+    file.flush()
+        .await
+        .map_err(|source| io_error("flush", source))?;
+    if matches!(failure, Some(PersistFailure::Flush)) {
+        return Err(io_error(
+            "flush",
+            io::Error::other("injected failure after flush"),
+        ));
+    }
+
+    file.sync_data()
+        .await
+        .map_err(|source| io_error("sync", source))?;
+    if matches!(failure, Some(PersistFailure::Sync)) {
+        return Err(io_error(
+            "sync",
+            io::Error::other("injected failure after sync"),
+        ));
+    }
+    Ok(())
+}
+
+async fn rollback_record(file: &mut File, previous_len: usize) -> Result<(), TrustStoreError> {
+    file.set_len(u64::try_from(previous_len).unwrap_or(u64::MAX))
+        .await
+        .map_err(|source| io_error("truncate failed commit", source))?;
+    file.sync_data()
+        .await
+        .map_err(|source| io_error("sync failed-commit rollback", source))
 }
 
 fn io_error(operation: &'static str, source: io::Error) -> TrustStoreError {
@@ -846,19 +928,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_append_does_not_change_visible_state() -> TestResult {
+    async fn replay_rejects_trust_after_revocation_without_forget() -> TestResult {
         let directory = TempDir::new()?;
-        let store = TrustStore::open(store_path(&directory)).await?;
-        store.inject_append_failure().await;
+        let path = store_path(&directory);
+        drop(TrustStore::open(&path).await?);
+
+        for mutation in [
+            TrustMutation::Revoke {
+                device_id: device_id(1),
+            },
+            TrustMutation::Trust {
+                peer: peer(1, "must remain revoked"),
+            },
+        ] {
+            let payload = postcard::to_stdvec(&mutation)?;
+            append_bytes(&path, &encode_record(&payload)?).await?;
+        }
+
         assert!(matches!(
-            store.trust(peer(1, "not committed")).await,
-            Err(TrustStoreError::Io {
-                operation: "append",
+            TrustStore::open(path).await,
+            Err(TrustStoreError::CorruptRecord {
+                record: 1,
+                reason: "revoked identity trusted without intervening forget",
                 ..
             })
         ));
-        assert_eq!(store.state(device_id(1)).await, None);
-        assert!(store.list().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_commit_is_durably_rolled_back_at_every_persistence_boundary() -> TestResult {
+        let directory = TempDir::new()?;
+
+        for (failure, operation) in [
+            (PersistFailure::Write, "append"),
+            (PersistFailure::Flush, "flush"),
+            (PersistFailure::Sync, "sync"),
+        ] {
+            let path = directory.path().join(operation);
+            let store = TrustStore::open(&path).await?;
+            store.trust(peer(1, "already committed")).await?;
+            let committed_len = fs::metadata(&path).await?.len();
+            store.inject_persist_failure(failure).await;
+
+            assert!(matches!(
+                store.trust(peer(2, "must stay unknown")).await,
+                Err(TrustStoreError::Io {
+                    operation: actual,
+                    ..
+                }) if actual == operation
+            ));
+            assert_eq!(store.state(device_id(1)).await, Some(TrustState::Trusted));
+            assert_eq!(store.state(device_id(2)).await, None);
+            assert!(matches!(
+                store.revoke(device_id(3)).await,
+                Err(TrustStoreError::StorePoisoned)
+            ));
+            drop(store);
+
+            assert_eq!(fs::metadata(&path).await?.len(), committed_len);
+            let reopened = TrustStore::open(&path).await?;
+            assert_eq!(
+                reopened.state(device_id(1)).await,
+                Some(TrustState::Trusted)
+            );
+            assert_eq!(reopened.state(device_id(2)).await, None);
+            assert_eq!(reopened.state(device_id(3)).await, None);
+        }
         Ok(())
     }
 

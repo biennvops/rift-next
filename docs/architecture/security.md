@@ -27,7 +27,8 @@ them.
 16. Pairing uses fresh OS-CSPRNG session material, role-ordered authenticated identities,
     explicit deadlines, and a canonical transcript.
 17. Trust persistence completes before authorization becomes visible. A persistence
-    failure never returns `AuthorizedConnection`.
+    failure never returns `AuthorizedConnection`, and a failed mutation cannot become visible
+    after journal reopen.
 18. Trust-journal corruption fails closed; only an incomplete final record envelope is
     recoverable, through the last fully validated record.
 19. Trust storage contains no secret identity key, endpoint address, relay URL, or
