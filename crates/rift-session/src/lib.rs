@@ -10,7 +10,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use rift_core::{DeviceId, TrustedPeer};
 use rift_protocol::{
     Capability, Hello, HelloMetadata, MessageKind, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingCode,
-    PairingMessage, PairingTranscript,
+    PairingCommitment, PairingCommitmentRole, PairingMessage, PairingTranscript,
 };
 use rift_transport_iroh::{BootstrappedConnection, TransportError};
 use rift_trust::{TrustEntry, TrustStore, TrustStoreError};
@@ -52,8 +52,10 @@ pub enum SessionError {
 pub enum PairingPhase {
     /// The responder is waiting for the initiator's request.
     AwaitingRequest,
-    /// The initiator is waiting for the responder's nonce.
+    /// The initiator is waiting for the responder's nonce commitment.
     AwaitingResponse,
+    /// Both commitments are fixed and a peer nonce reveal is required.
+    AwaitingReveal,
     /// The SAS is ready and the implementation is waiting for local confirmation.
     AwaitingLocalDecision,
     /// The local decision was sent and the remote decision is required.
@@ -75,6 +77,7 @@ impl fmt::Display for PairingPhase {
         let name = match self {
             Self::AwaitingRequest => "awaiting request",
             Self::AwaitingResponse => "awaiting response",
+            Self::AwaitingReveal => "awaiting reveal",
             Self::AwaitingLocalDecision => "awaiting local decision",
             Self::AwaitingRemoteDecision => "awaiting remote decision",
             Self::CommittingTrust => "committing trust",
@@ -117,6 +120,9 @@ pub enum PairingError {
     /// A message named a different pairing attempt.
     #[error("pairing message used a different pairing ID during {phase}")]
     PairingIdMismatch { phase: PairingPhase },
+    /// A revealed nonce did not open the peer's role-bound commitment.
+    #[error("peer pairing nonce did not match its commitment during {phase}")]
+    CommitmentMismatch { phase: PairingPhase },
     /// A peer sent a second decision after its first decision was consumed.
     #[error("duplicate pairing decision received during {phase}")]
     DuplicateDecision { phase: PairingPhase },
@@ -278,11 +284,18 @@ impl PairableConnection {
         let mut machine = PairingStateMachine::initiator(material.pairing_id);
         info!(remote_device_id = %peer.device_id, "pairing_started");
 
+        let initiator_commitment = PairingCommitment::derive(
+            PairingCommitmentRole::Initiator,
+            local_device_id,
+            peer.device_id,
+            material.pairing_id,
+            material.nonce,
+        );
         send_or_close(
             &mut self.connection,
             PairingMessage::Request {
                 pairing_id: material.pairing_id,
-                nonce: material.nonce,
+                commitment: initiator_commitment,
             },
             self.pairing_timeout,
             machine.phase(),
@@ -290,8 +303,44 @@ impl PairableConnection {
         .await?;
         let response =
             receive_or_close(&mut self.connection, self.pairing_timeout, machine.phase()).await?;
-        let responder_nonce = match machine.receive_response(response) {
-            Ok(nonce) => nonce,
+        let responder_commitment = match machine.receive_response(response) {
+            Ok(commitment) => commitment,
+            Err(error) => {
+                self.connection.close();
+                return Err(error);
+            }
+        };
+        send_or_close(
+            &mut self.connection,
+            PairingMessage::Reveal {
+                pairing_id: material.pairing_id,
+                nonce: material.nonce,
+            },
+            self.pairing_timeout,
+            machine.phase(),
+        )
+        .await?;
+        let reveal =
+            receive_or_close(&mut self.connection, self.pairing_timeout, machine.phase()).await?;
+        let responder_nonce = match machine.receive_reveal(reveal) {
+            Ok(nonce)
+                if responder_commitment.verifies(
+                    PairingCommitmentRole::Responder,
+                    local_device_id,
+                    peer.device_id,
+                    material.pairing_id,
+                    nonce,
+                ) =>
+            {
+                nonce
+            }
+            Ok(_) => {
+                machine.fail();
+                self.connection.close();
+                return Err(PairingError::CommitmentMismatch {
+                    phase: PairingPhase::AwaitingReveal,
+                });
+            }
             Err(error) => {
                 self.connection.close();
                 return Err(error);
@@ -337,16 +386,33 @@ impl PairableConnection {
 
         let request =
             receive_or_close(&mut self.connection, self.pairing_timeout, machine.phase()).await?;
-        let (pairing_id, initiator_nonce) = match machine.receive_request(request) {
+        let (pairing_id, initiator_commitment) = match machine.receive_request(request) {
             Ok(request) => request,
             Err(error) => {
                 self.connection.close();
                 return Err(error);
             }
         };
+        let responder_commitment = PairingCommitment::derive(
+            PairingCommitmentRole::Responder,
+            peer.device_id,
+            local_device_id,
+            pairing_id,
+            material.nonce,
+        );
         send_or_close(
             &mut self.connection,
             PairingMessage::Response {
+                pairing_id,
+                commitment: responder_commitment,
+            },
+            self.pairing_timeout,
+            machine.phase(),
+        )
+        .await?;
+        send_or_close(
+            &mut self.connection,
+            PairingMessage::Reveal {
                 pairing_id,
                 nonce: material.nonce,
             },
@@ -354,6 +420,32 @@ impl PairableConnection {
             machine.phase(),
         )
         .await?;
+        let reveal =
+            receive_or_close(&mut self.connection, self.pairing_timeout, machine.phase()).await?;
+        let initiator_nonce = match machine.receive_reveal(reveal) {
+            Ok(nonce)
+                if initiator_commitment.verifies(
+                    PairingCommitmentRole::Initiator,
+                    peer.device_id,
+                    local_device_id,
+                    pairing_id,
+                    nonce,
+                ) =>
+            {
+                nonce
+            }
+            Ok(_) => {
+                machine.fail();
+                self.connection.close();
+                return Err(PairingError::CommitmentMismatch {
+                    phase: PairingPhase::AwaitingReveal,
+                });
+            }
+            Err(error) => {
+                self.connection.close();
+                return Err(error);
+            }
+        };
         let code = PairingTranscript::new(
             peer.device_id,
             local_device_id,
@@ -660,13 +752,16 @@ impl PairingStateMachine {
     fn receive_request(
         &mut self,
         message: PairingMessage,
-    ) -> Result<([u8; PAIRING_ID_LEN], [u8; PAIRING_NONCE_LEN]), PairingError> {
+    ) -> Result<([u8; PAIRING_ID_LEN], PairingCommitment), PairingError> {
         self.require_active(PairingPhase::AwaitingRequest)?;
         match message {
-            PairingMessage::Request { pairing_id, nonce } => {
+            PairingMessage::Request {
+                pairing_id,
+                commitment,
+            } => {
                 self.pairing_id = Some(pairing_id);
-                self.phase = PairingPhase::AwaitingLocalDecision;
-                Ok((pairing_id, nonce))
+                self.phase = PairingPhase::AwaitingReveal;
+                Ok((pairing_id, commitment))
             }
             message => Err(self.unexpected(MessageKind::PairingRequest, message.kind())),
         }
@@ -675,15 +770,33 @@ impl PairingStateMachine {
     fn receive_response(
         &mut self,
         message: PairingMessage,
-    ) -> Result<[u8; PAIRING_NONCE_LEN], PairingError> {
+    ) -> Result<PairingCommitment, PairingError> {
         self.require_active(PairingPhase::AwaitingResponse)?;
         match message {
-            PairingMessage::Response { pairing_id, nonce } => {
+            PairingMessage::Response {
+                pairing_id,
+                commitment,
+            } => {
+                self.require_pairing_id(pairing_id)?;
+                self.phase = PairingPhase::AwaitingReveal;
+                Ok(commitment)
+            }
+            message => Err(self.unexpected(MessageKind::PairingResponse, message.kind())),
+        }
+    }
+
+    fn receive_reveal(
+        &mut self,
+        message: PairingMessage,
+    ) -> Result<[u8; PAIRING_NONCE_LEN], PairingError> {
+        self.require_active(PairingPhase::AwaitingReveal)?;
+        match message {
+            PairingMessage::Reveal { pairing_id, nonce } => {
                 self.require_pairing_id(pairing_id)?;
                 self.phase = PairingPhase::AwaitingLocalDecision;
                 Ok(nonce)
             }
-            message => Err(self.unexpected(MessageKind::PairingResponse, message.kind())),
+            message => Err(self.unexpected(MessageKind::PairingReveal, message.kind())),
         }
     }
 
@@ -787,6 +900,7 @@ fn expected_kind(phase: PairingPhase, role: PairingRole) -> MessageKind {
     match phase {
         PairingPhase::AwaitingRequest => MessageKind::PairingRequest,
         PairingPhase::AwaitingResponse => MessageKind::PairingResponse,
+        PairingPhase::AwaitingReveal => MessageKind::PairingReveal,
         PairingPhase::AwaitingLocalDecision | PairingPhase::AwaitingRemoteDecision => {
             MessageKind::PairingDecision
         }
@@ -851,17 +965,28 @@ mod tests {
 
     use super::*;
 
+    fn commitment(byte: u8) -> PairingCommitment {
+        PairingCommitment::from_bytes([byte; rift_protocol::PAIRING_COMMITMENT_LEN])
+    }
+
     fn request(pairing_id: [u8; PAIRING_ID_LEN]) -> PairingMessage {
         PairingMessage::Request {
             pairing_id,
-            nonce: [2; PAIRING_NONCE_LEN],
+            commitment: commitment(2),
         }
     }
 
     fn response(pairing_id: [u8; PAIRING_ID_LEN]) -> PairingMessage {
         PairingMessage::Response {
             pairing_id,
-            nonce: [3; PAIRING_NONCE_LEN],
+            commitment: commitment(3),
+        }
+    }
+
+    fn reveal(pairing_id: [u8; PAIRING_ID_LEN]) -> PairingMessage {
+        PairingMessage::Reveal {
+            pairing_id,
+            nonce: [4; PAIRING_NONCE_LEN],
         }
     }
 
@@ -909,6 +1034,29 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            initiator.receive_response(reveal(pairing_id)),
+            Err(PairingError::UnexpectedMessage {
+                expected: MessageKind::PairingResponse,
+                received: MessageKind::PairingReveal,
+                ..
+            })
+        ));
+        assert!(initiator.receive_response(response(pairing_id)).is_ok());
+        assert!(matches!(
+            initiator.receive_reveal(reveal([9; PAIRING_ID_LEN])),
+            Err(PairingError::PairingIdMismatch {
+                phase: PairingPhase::AwaitingReveal
+            })
+        ));
+        assert!(matches!(
+            initiator.receive_reveal(decision(pairing_id, true)),
+            Err(PairingError::UnexpectedMessage {
+                expected: MessageKind::PairingReveal,
+                received: MessageKind::PairingDecision,
+                ..
+            })
+        ));
 
         let mut responder = PairingStateMachine::responder();
         assert!(matches!(
@@ -919,6 +1067,14 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            responder.receive_request(reveal(pairing_id)),
+            Err(PairingError::UnexpectedMessage {
+                expected: MessageKind::PairingRequest,
+                received: MessageKind::PairingReveal,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -926,6 +1082,7 @@ mod tests {
         let pairing_id = [1; PAIRING_ID_LEN];
         let mut machine = PairingStateMachine::initiator(pairing_id);
         machine.receive_response(response(pairing_id))?;
+        machine.receive_reveal(reveal(pairing_id))?;
         machine.local_decision(true)?;
         assert!(matches!(
             machine.local_decision(true),
@@ -953,6 +1110,7 @@ mod tests {
         let pairing_id = [1; PAIRING_ID_LEN];
         let mut machine = PairingStateMachine::responder();
         machine.receive_request(request(pairing_id))?;
+        machine.receive_reveal(reveal(pairing_id))?;
         machine.local_decision(false)?;
         assert!(machine.remote_decision(decision(pairing_id, true))?);
         assert_eq!(machine.phase(), PairingPhase::Rejected);

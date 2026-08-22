@@ -1,7 +1,10 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use rift_core::{TrustState, TrustedPeer};
-use rift_protocol::{HelloMetadata, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingMessage};
+use rift_protocol::{
+    HelloMetadata, PAIRING_COMMITMENT_LEN, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingCommitment,
+    PairingCommitmentRole, PairingMessage,
+};
 use rift_session::{
     InitiatorPairingMaterial, PairingError, PairingPhase, ResponderPairingMaterial,
     SessionAdmission, SessionConfig, SessionError, SessionManager, pairing_metadata,
@@ -324,7 +327,7 @@ async fn wrong_pairing_id_is_rejected_without_trust() -> TestResult {
             .send_pairing(
                 PairingMessage::Response {
                     pairing_id: wrong_id,
-                    nonce: [3; PAIRING_NONCE_LEN],
+                    commitment: PairingCommitment::from_bytes([3; PAIRING_COMMITMENT_LEN]),
                 },
                 PAIRING_TIMEOUT,
             )
@@ -342,6 +345,73 @@ async fn wrong_pairing_id_is_rejected_without_trust() -> TestResult {
         result,
         Err(PairingError::PairingIdMismatch {
             phase: PairingPhase::AwaitingResponse
+        })
+    ));
+    assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
+    let connection_b = malicious.await??;
+    connection_b.close();
+    close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn responder_cannot_change_its_nonce_after_learning_initiator_nonce() -> TestResult {
+    let directory = TempDir::new()?;
+    let store_a = store(&directory, "a.trust").await?;
+    let manager_a = manager(store_a.clone())?;
+    let (endpoint_a, endpoint_b) = bind_pair().await?;
+    let (connection_a, mut connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
+    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+        return Err("unknown peer bypassed authorization".into());
+    };
+
+    let malicious = tokio::spawn(async move {
+        let request = connection_b.receive_pairing(PAIRING_TIMEOUT).await?;
+        let PairingMessage::Request { pairing_id, .. } = request else {
+            return Err("initiator disclosed a nonce before responder commitment".into());
+        };
+        let committed_nonce = [3; PAIRING_NONCE_LEN];
+        let commitment = PairingCommitment::derive(
+            PairingCommitmentRole::Responder,
+            connection_b.remote_device_id(),
+            connection_b.local_device_id(),
+            pairing_id,
+            committed_nonce,
+        );
+        connection_b
+            .send_pairing(
+                PairingMessage::Response {
+                    pairing_id,
+                    commitment,
+                },
+                PAIRING_TIMEOUT,
+            )
+            .await?;
+        assert!(matches!(
+            connection_b.receive_pairing(PAIRING_TIMEOUT).await?,
+            PairingMessage::Reveal { nonce, .. } if nonce == [2; PAIRING_NONCE_LEN]
+        ));
+        connection_b
+            .send_pairing(
+                PairingMessage::Reveal {
+                    pairing_id,
+                    nonce: [4; PAIRING_NONCE_LEN],
+                },
+                PAIRING_TIMEOUT,
+            )
+            .await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(connection_b)
+    });
+
+    assert!(matches!(
+        pairable_a
+            .initiate_pairing_with_material_for_test(InitiatorPairingMaterial::from_bytes_for_test(
+                [1; PAIRING_ID_LEN],
+                [2; PAIRING_NONCE_LEN],
+            ),)
+            .await,
+        Err(PairingError::CommitmentMismatch {
+            phase: PairingPhase::AwaitingReveal
         })
     ));
     assert_eq!(store_a.state(endpoint_b.device_id()).await, None);

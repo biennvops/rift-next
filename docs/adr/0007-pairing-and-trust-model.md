@@ -26,10 +26,17 @@ revocation decision and makes the identity unknown again. Forgetting does not tr
 peer.
 
 Pairing protocol v1 uses explicit initiator and responder roles, a fresh 16-byte
-initiator pairing ID, fresh 32-byte nonces from both peers, and an ephemeral canonical
-transcript containing the role-ordered identities and all three random values. BLAKE3
-over the transcript produces a six-digit, zero-padded decimal short authentication string
-(SAS) for human comparison. Pairing attempts and nonce material are not persisted.
+initiator pairing ID, fresh 32-byte nonces from both peers, and role-bound BLAKE3
+commitments to those nonces. Each implementation generates its nonce before receiving any
+peer nonce. The peers exchange commitments before either reveals its nonce, verify each
+reveal against the prior commitment, and only then derive the SAS from an ephemeral
+canonical transcript containing the role-ordered identities and all three random values.
+A commitment binds the protocol version, role, identities, pairing ID, and nonce under a
+distinct domain. This prevents either peer—especially a responder that acts after
+receiving the request—from adaptively searching nonce candidates after learning the other
+nonce. BLAKE3 over the SAS transcript produces a six-digit, zero-padded decimal short
+authentication string (SAS) for human comparison. Pairing attempts and nonce material are
+not persisted.
 
 Receiving network messages can advance a pairing transcript but can never directly
 create trust. Both remote acceptance and an explicit local confirmation API call are
@@ -54,7 +61,8 @@ repeating pairing.
 The six-digit SAS has limited entropy and is strictly an attended human comparison value,
 not a password, reusable credential, or replacement for Iroh authentication. Pairing has
 explicit phase deadlines and typed sequencing errors; no retry loop or simultaneous-
-pairing resolution is introduced.
+pairing resolution is introduced. A commitment mismatch fails before local confirmation
+or trust persistence.
 
 Revocation affects every new admission immediately. Foundation M3 has no resident daemon
 or global live-connection registry, so it does not retroactively close already-authorized

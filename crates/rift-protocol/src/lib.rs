@@ -37,6 +37,12 @@ pub const PAIRING_ID_LEN: usize = 16;
 /// The fixed byte length of each pairing nonce.
 pub const PAIRING_NONCE_LEN: usize = 32;
 
+/// The fixed byte length of each pairing nonce commitment.
+pub const PAIRING_COMMITMENT_LEN: usize = 32;
+
+/// The domain separator at the start of every pairing nonce commitment.
+pub const PAIRING_COMMITMENT_DOMAIN: &[u8] = b"rift-pairing-commitment-v1";
+
 /// The domain separator at the start of every canonical pairing transcript.
 pub const PAIRING_DOMAIN: &[u8] = b"rift-pairing-v1";
 
@@ -226,6 +232,84 @@ impl<'de> Visitor<'de> for BoundedCapabilitiesVisitor {
     }
 }
 
+/// The role bound into a pairing nonce commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairingCommitmentRole {
+    /// The peer that selected the pairing ID and sent the request.
+    Initiator,
+    /// The peer that answered the pairing request.
+    Responder,
+}
+
+impl PairingCommitmentRole {
+    const fn discriminator(self) -> u8 {
+        match self {
+            Self::Initiator => 0,
+            Self::Responder => 1,
+        }
+    }
+}
+
+/// A role- and attempt-bound BLAKE3 commitment to one pairing nonce.
+#[derive(Clone, Copy, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PairingCommitment([u8; PAIRING_COMMITMENT_LEN]);
+
+impl PairingCommitment {
+    /// Constructs a commitment from its exact wire bytes.
+    pub const fn from_bytes(bytes: [u8; PAIRING_COMMITMENT_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Derives a commitment without disclosing the nonce.
+    pub fn derive(
+        role: PairingCommitmentRole,
+        initiator_device_id: DeviceId,
+        responder_device_id: DeviceId,
+        pairing_id: [u8; PAIRING_ID_LEN],
+        nonce: [u8; PAIRING_NONCE_LEN],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(PAIRING_COMMITMENT_DOMAIN);
+        hasher.update(&PROTOCOL_VERSION.to_be_bytes());
+        hasher.update(&[role.discriminator()]);
+        hasher.update(initiator_device_id.as_bytes());
+        hasher.update(responder_device_id.as_bytes());
+        hasher.update(&pairing_id);
+        hasher.update(&nonce);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Verifies a revealed nonce against this commitment and its public context.
+    pub fn verifies(
+        self,
+        role: PairingCommitmentRole,
+        initiator_device_id: DeviceId,
+        responder_device_id: DeviceId,
+        pairing_id: [u8; PAIRING_ID_LEN],
+        nonce: [u8; PAIRING_NONCE_LEN],
+    ) -> bool {
+        self == Self::derive(
+            role,
+            initiator_device_id,
+            responder_device_id,
+            pairing_id,
+            nonce,
+        )
+    }
+
+    /// Returns the exact commitment bytes.
+    pub const fn as_bytes(&self) -> &[u8; PAIRING_COMMITMENT_LEN] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PairingCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingCommitment(..)")
+    }
+}
+
 /// The complete, role-ordered input to one pairing verification code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PairingTranscript {
@@ -307,19 +391,19 @@ pub enum ControlMessage {
     Ping { nonce: u64 },
     /// The response to a one-shot control-channel ping.
     Pong { nonce: u64 },
-    /// Starts one pairing attempt as its initiator.
+    /// Starts one pairing attempt with the initiator's nonce commitment.
     PairingRequest {
         /// The initiator-selected attempt identifier.
         pairing_id: [u8; PAIRING_ID_LEN],
-        /// Fresh initiator nonce material.
-        nonce: [u8; PAIRING_NONCE_LEN],
+        /// The initiator's role- and attempt-bound nonce commitment.
+        commitment: PairingCommitment,
     },
-    /// Supplies the responder nonce for one pairing attempt.
+    /// Supplies the responder's nonce commitment for one pairing attempt.
     PairingResponse {
         /// The attempt identifier copied from the request.
         pairing_id: [u8; PAIRING_ID_LEN],
-        /// Fresh responder nonce material.
-        nonce: [u8; PAIRING_NONCE_LEN],
+        /// The responder's role- and attempt-bound nonce commitment.
+        commitment: PairingCommitment,
     },
     /// Communicates one peer's explicit local human decision.
     PairingDecision {
@@ -332,6 +416,13 @@ pub enum ControlMessage {
     PairingComplete {
         /// The completed attempt identifier.
         pairing_id: [u8; PAIRING_ID_LEN],
+    },
+    /// Reveals a nonce after both role-bound commitments have been exchanged.
+    PairingReveal {
+        /// The active attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// The sender's previously committed nonce.
+        nonce: [u8; PAIRING_NONCE_LEN],
     },
 }
 
@@ -346,18 +437,27 @@ impl ControlMessage {
             Self::PairingResponse { .. } => MessageKind::PairingResponse,
             Self::PairingDecision { .. } => MessageKind::PairingDecision,
             Self::PairingComplete { .. } => MessageKind::PairingComplete,
+            Self::PairingReveal { .. } => MessageKind::PairingReveal,
         }
     }
 
     /// Converts a control message into the pairing-only representation.
     pub fn into_pairing(self) -> Result<PairingMessage, MessageKind> {
         match self {
-            Self::PairingRequest { pairing_id, nonce } => {
-                Ok(PairingMessage::Request { pairing_id, nonce })
-            }
-            Self::PairingResponse { pairing_id, nonce } => {
-                Ok(PairingMessage::Response { pairing_id, nonce })
-            }
+            Self::PairingRequest {
+                pairing_id,
+                commitment,
+            } => Ok(PairingMessage::Request {
+                pairing_id,
+                commitment,
+            }),
+            Self::PairingResponse {
+                pairing_id,
+                commitment,
+            } => Ok(PairingMessage::Response {
+                pairing_id,
+                commitment,
+            }),
             Self::PairingDecision {
                 pairing_id,
                 accepted,
@@ -366,6 +466,9 @@ impl ControlMessage {
                 accepted,
             }),
             Self::PairingComplete { pairing_id } => Ok(PairingMessage::Complete { pairing_id }),
+            Self::PairingReveal { pairing_id, nonce } => {
+                Ok(PairingMessage::Reveal { pairing_id, nonce })
+            }
             message => Err(message.kind()),
         }
     }
@@ -374,19 +477,19 @@ impl ControlMessage {
 /// A pairing-only view of the v1 control messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PairingMessage {
-    /// Starts a pairing attempt.
+    /// Starts a pairing attempt with the initiator's nonce commitment.
     Request {
         /// The initiator-selected attempt identifier.
         pairing_id: [u8; PAIRING_ID_LEN],
-        /// Fresh initiator nonce material.
-        nonce: [u8; PAIRING_NONCE_LEN],
+        /// The initiator's role- and attempt-bound nonce commitment.
+        commitment: PairingCommitment,
     },
-    /// Supplies the responder's nonce.
+    /// Supplies the responder's nonce commitment.
     Response {
         /// The active attempt identifier.
         pairing_id: [u8; PAIRING_ID_LEN],
-        /// Fresh responder nonce material.
-        nonce: [u8; PAIRING_NONCE_LEN],
+        /// The responder's role- and attempt-bound nonce commitment.
+        commitment: PairingCommitment,
     },
     /// Communicates one explicit local decision.
     Decision {
@@ -400,6 +503,13 @@ pub enum PairingMessage {
         /// The completed attempt identifier.
         pairing_id: [u8; PAIRING_ID_LEN],
     },
+    /// Reveals a nonce after both commitments are fixed.
+    Reveal {
+        /// The active attempt identifier.
+        pairing_id: [u8; PAIRING_ID_LEN],
+        /// The sender's previously committed nonce.
+        nonce: [u8; PAIRING_NONCE_LEN],
+    },
 }
 
 impl PairingMessage {
@@ -410,6 +520,7 @@ impl PairingMessage {
             Self::Response { .. } => MessageKind::PairingResponse,
             Self::Decision { .. } => MessageKind::PairingDecision,
             Self::Complete { .. } => MessageKind::PairingComplete,
+            Self::Reveal { .. } => MessageKind::PairingReveal,
         }
     }
 }
@@ -417,12 +528,20 @@ impl PairingMessage {
 impl From<PairingMessage> for ControlMessage {
     fn from(message: PairingMessage) -> Self {
         match message {
-            PairingMessage::Request { pairing_id, nonce } => {
-                Self::PairingRequest { pairing_id, nonce }
-            }
-            PairingMessage::Response { pairing_id, nonce } => {
-                Self::PairingResponse { pairing_id, nonce }
-            }
+            PairingMessage::Request {
+                pairing_id,
+                commitment,
+            } => Self::PairingRequest {
+                pairing_id,
+                commitment,
+            },
+            PairingMessage::Response {
+                pairing_id,
+                commitment,
+            } => Self::PairingResponse {
+                pairing_id,
+                commitment,
+            },
             PairingMessage::Decision {
                 pairing_id,
                 accepted,
@@ -431,6 +550,9 @@ impl From<PairingMessage> for ControlMessage {
                 accepted,
             },
             PairingMessage::Complete { pairing_id } => Self::PairingComplete { pairing_id },
+            PairingMessage::Reveal { pairing_id, nonce } => {
+                Self::PairingReveal { pairing_id, nonce }
+            }
         }
     }
 }
@@ -452,6 +574,8 @@ pub enum MessageKind {
     PairingDecision,
     /// A pairing completion signal.
     PairingComplete,
+    /// A pairing nonce reveal.
+    PairingReveal,
 }
 
 impl fmt::Display for MessageKind {
@@ -464,6 +588,7 @@ impl fmt::Display for MessageKind {
             Self::PairingResponse => "PairingResponse",
             Self::PairingDecision => "PairingDecision",
             Self::PairingComplete => "PairingComplete",
+            Self::PairingReveal => "PairingReveal",
         };
         formatter.write_str(name)
     }
@@ -969,6 +1094,8 @@ mod tests {
         pairing_id_hex: String,
         initiator_nonce_hex: String,
         responder_nonce_hex: String,
+        initiator_commitment_hex: String,
+        responder_commitment_hex: String,
         code: String,
     }
 
@@ -998,11 +1125,11 @@ mod tests {
         },
         PairingRequest {
             pairing_id_hex: String,
-            nonce_hex: String,
+            commitment_hex: String,
         },
         PairingResponse {
             pairing_id_hex: String,
-            nonce_hex: String,
+            commitment_hex: String,
         },
         PairingDecision {
             pairing_id_hex: String,
@@ -1010,6 +1137,10 @@ mod tests {
         },
         PairingComplete {
             pairing_id_hex: String,
+        },
+        PairingReveal {
+            pairing_id_hex: String,
+            nonce_hex: String,
         },
     }
 
@@ -1049,17 +1180,17 @@ mod tests {
             VectorMessage::Pong { nonce } => ControlMessage::Pong { nonce },
             VectorMessage::PairingRequest {
                 pairing_id_hex,
-                nonce_hex,
+                commitment_hex,
             } => ControlMessage::PairingRequest {
                 pairing_id: vector_bytes(&pairing_id_hex)?,
-                nonce: vector_bytes(&nonce_hex)?,
+                commitment: PairingCommitment::from_bytes(vector_bytes(&commitment_hex)?),
             },
             VectorMessage::PairingResponse {
                 pairing_id_hex,
-                nonce_hex,
+                commitment_hex,
             } => ControlMessage::PairingResponse {
                 pairing_id: vector_bytes(&pairing_id_hex)?,
-                nonce: vector_bytes(&nonce_hex)?,
+                commitment: PairingCommitment::from_bytes(vector_bytes(&commitment_hex)?),
             },
             VectorMessage::PairingDecision {
                 pairing_id_hex,
@@ -1070,6 +1201,13 @@ mod tests {
             },
             VectorMessage::PairingComplete { pairing_id_hex } => ControlMessage::PairingComplete {
                 pairing_id: vector_bytes(&pairing_id_hex)?,
+            },
+            VectorMessage::PairingReveal {
+                pairing_id_hex,
+                nonce_hex,
+            } => ControlMessage::PairingReveal {
+                pairing_id: vector_bytes(&pairing_id_hex)?,
+                nonce: vector_bytes(&nonce_hex)?,
             },
         };
         Ok(message)
@@ -1102,12 +1240,59 @@ mod tests {
             assert_eq!(decode_message(&frame)?, message, "{} decode", vector.name);
         }
         for vector in vectors.pairing_code_vectors {
+            let initiator_device_id =
+                DeviceId::from_bytes(vector_bytes(&vector.initiator_device_id_hex)?);
+            let responder_device_id =
+                DeviceId::from_bytes(vector_bytes(&vector.responder_device_id_hex)?);
+            let pairing_id = vector_bytes(&vector.pairing_id_hex)?;
+            let initiator_nonce = vector_bytes(&vector.initiator_nonce_hex)?;
+            let responder_nonce = vector_bytes(&vector.responder_nonce_hex)?;
+            let initiator_commitment = PairingCommitment::derive(
+                PairingCommitmentRole::Initiator,
+                initiator_device_id,
+                responder_device_id,
+                pairing_id,
+                initiator_nonce,
+            );
+            let responder_commitment = PairingCommitment::derive(
+                PairingCommitmentRole::Responder,
+                initiator_device_id,
+                responder_device_id,
+                pairing_id,
+                responder_nonce,
+            );
+            assert_eq!(
+                hex::encode(initiator_commitment.as_bytes()),
+                vector.initiator_commitment_hex,
+                "{} initiator commitment",
+                vector.name
+            );
+            assert_eq!(
+                hex::encode(responder_commitment.as_bytes()),
+                vector.responder_commitment_hex,
+                "{} responder commitment",
+                vector.name
+            );
+            assert!(initiator_commitment.verifies(
+                PairingCommitmentRole::Initiator,
+                initiator_device_id,
+                responder_device_id,
+                pairing_id,
+                initiator_nonce,
+            ));
+            assert!(responder_commitment.verifies(
+                PairingCommitmentRole::Responder,
+                initiator_device_id,
+                responder_device_id,
+                pairing_id,
+                responder_nonce,
+            ));
             let transcript = PairingTranscript::new(
-                DeviceId::from_bytes(vector_bytes(&vector.initiator_device_id_hex)?),
-                DeviceId::from_bytes(vector_bytes(&vector.responder_device_id_hex)?),
-                vector_bytes(&vector.pairing_id_hex)?,
-                vector_bytes(&vector.initiator_nonce_hex)?,
-                vector_bytes(&vector.responder_nonce_hex)?,
+                initiator_device_id,
+                responder_device_id,
+                pairing_id,
+                initiator_nonce,
+                responder_nonce,
             );
             assert_eq!(
                 transcript.code().to_string(),
@@ -1119,17 +1304,22 @@ mod tests {
         Ok(())
     }
 
-    fn pairing_messages() -> [ControlMessage; 5] {
+    fn pairing_messages() -> [ControlMessage; 6] {
         let pairing_id = [0x10; PAIRING_ID_LEN];
         [
             PairingMessage::Request {
                 pairing_id,
-                nonce: [0x20; PAIRING_NONCE_LEN],
+                commitment: PairingCommitment::from_bytes([0x20; PAIRING_COMMITMENT_LEN]),
             }
             .into(),
             PairingMessage::Response {
                 pairing_id,
-                nonce: [0x30; PAIRING_NONCE_LEN],
+                commitment: PairingCommitment::from_bytes([0x30; PAIRING_COMMITMENT_LEN]),
+            }
+            .into(),
+            PairingMessage::Reveal {
+                pairing_id,
+                nonce: [0x40; PAIRING_NONCE_LEN],
             }
             .into(),
             PairingMessage::Decision {
@@ -1415,6 +1605,73 @@ mod tests {
             validate_hello(&peer, authenticated),
             Err(HandshakeError::TooManyCapabilities { .. })
         ));
+    }
+
+    #[test]
+    fn pairing_commitments_bind_role_attempt_identities_and_nonce() {
+        let baseline = PairingCommitment::derive(
+            PairingCommitmentRole::Initiator,
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [4; PAIRING_NONCE_LEN],
+        );
+        assert!(baseline.verifies(
+            PairingCommitmentRole::Initiator,
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [4; PAIRING_NONCE_LEN],
+        ));
+        for changed in [
+            PairingCommitment::derive(
+                PairingCommitmentRole::Responder,
+                device_id(1),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+            ),
+            PairingCommitment::derive(
+                PairingCommitmentRole::Initiator,
+                device_id(9),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+            ),
+            PairingCommitment::derive(
+                PairingCommitmentRole::Initiator,
+                device_id(1),
+                device_id(9),
+                [3; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+            ),
+            PairingCommitment::derive(
+                PairingCommitmentRole::Initiator,
+                device_id(1),
+                device_id(2),
+                [9; PAIRING_ID_LEN],
+                [4; PAIRING_NONCE_LEN],
+            ),
+            PairingCommitment::derive(
+                PairingCommitmentRole::Initiator,
+                device_id(1),
+                device_id(2),
+                [3; PAIRING_ID_LEN],
+                [9; PAIRING_NONCE_LEN],
+            ),
+        ] {
+            assert_ne!(changed, baseline);
+        }
+        assert!(!baseline.verifies(
+            PairingCommitmentRole::Initiator,
+            device_id(1),
+            device_id(2),
+            [3; PAIRING_ID_LEN],
+            [9; PAIRING_NONCE_LEN],
+        ));
+        assert_eq!(format!("{baseline:?}"), "PairingCommitment(..)");
+        assert_eq!(PAIRING_COMMITMENT_LEN, 32);
+        assert_eq!(PAIRING_COMMITMENT_DOMAIN, b"rift-pairing-commitment-v1");
     }
 
     #[test]

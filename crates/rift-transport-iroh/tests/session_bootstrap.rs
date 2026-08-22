@@ -3,8 +3,8 @@ use std::{error::Error, time::Duration};
 use rift_core::{DEVICE_ID_LEN, DeviceId};
 use rift_protocol::{
     ControlMessage, HandshakeError, Hello, HelloMetadata, MAX_CONTROL_FRAME_LEN, MessageKind,
-    PAIRING_ID_LEN, PAIRING_NONCE_LEN, PROTOCOL_VERSION, PairingMessage, encode_message,
-    exchange_hello_with_timeout, read_message, write_message,
+    PAIRING_COMMITMENT_LEN, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PROTOCOL_VERSION, PairingCommitment,
+    PairingMessage, encode_message, exchange_hello_with_timeout, read_message, write_message,
 };
 use rift_transport_iroh::{
     AuthenticatedConnection, BootstrappedConnection, ControlStream, EndpointConfig, RiftEndpoint,
@@ -415,7 +415,7 @@ async fn pairing_only_transport_exchanges_typed_messages() -> TestResult {
     let pairing_id = [7; PAIRING_ID_LEN];
     let request = PairingMessage::Request {
         pairing_id,
-        nonce: [8; PAIRING_NONCE_LEN],
+        commitment: PairingCommitment::from_bytes([8; PAIRING_COMMITMENT_LEN]),
     };
     client_connection
         .send_pairing(request.clone(), TEST_HANDSHAKE_TIMEOUT)
@@ -428,7 +428,7 @@ async fn pairing_only_transport_exchanges_typed_messages() -> TestResult {
     );
     let response = PairingMessage::Response {
         pairing_id,
-        nonce: [9; PAIRING_NONCE_LEN],
+        commitment: PairingCommitment::from_bytes([9; PAIRING_COMMITMENT_LEN]),
     };
     server_connection
         .send_pairing(response.clone(), TEST_HANDSHAKE_TIMEOUT)
@@ -438,6 +438,19 @@ async fn pairing_only_transport_exchanges_typed_messages() -> TestResult {
             .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
             .await?,
         response
+    );
+    let reveal = PairingMessage::Reveal {
+        pairing_id,
+        nonce: [10; PAIRING_NONCE_LEN],
+    };
+    client_connection
+        .send_pairing(reveal.clone(), TEST_HANDSHAKE_TIMEOUT)
+        .await?;
+    assert_eq!(
+        server_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await?,
+        reveal
     );
 
     client_connection.close();
