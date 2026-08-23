@@ -12,7 +12,7 @@ use rift_protocol::{
     Capability, Hello, HelloMetadata, MessageKind, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingCode,
     PairingCommitment, PairingCommitmentRole, PairingMessage, PairingTranscript,
 };
-use rift_transport_iroh::{BootstrappedConnection, TransportError};
+use rift_transport_iroh::{BootstrappedConnection, DisposableConnectionHandle, TransportError};
 use rift_trust::{TrustEntry, TrustStore, TrustStoreError};
 use thiserror::Error;
 use tokio::time::Instant;
@@ -233,6 +233,16 @@ impl AuthorizedConnection {
     /// Returns the validated Hello for feature negotiation after authorization.
     pub fn peer_hello(&self) -> &Hello {
         self.connection.peer_hello()
+    }
+
+    /// Returns a minimal cloneable handle for runtime liveness and cancellation.
+    pub fn disposable_handle(&self) -> DisposableConnectionHandle {
+        self.connection.disposable_handle()
+    }
+
+    /// Waits until this authorized disposable connection terminates.
+    pub async fn closed(&self) {
+        self.connection.closed().await;
     }
 
     /// Closes this disposable authorized connection.
@@ -541,6 +551,20 @@ impl PendingPairing {
     /// Returns the current explicit state-machine phase.
     pub const fn phase(&self) -> PairingPhase {
         self.machine.phase()
+    }
+
+    /// Returns a minimal cloneable handle while this attempt still owns its connection.
+    pub fn disposable_handle(&self) -> Option<DisposableConnectionHandle> {
+        self.connection
+            .as_ref()
+            .map(BootstrappedConnection::disposable_handle)
+    }
+
+    /// Waits until the pairing connection terminates.
+    pub async fn closed(&self) {
+        if let Some(connection) = &self.connection {
+            connection.closed().await;
+        }
     }
 
     /// Supplies the explicit local human decision and completes the protocol.

@@ -184,6 +184,8 @@ async fn successful_pairing_requires_local_confirmation_and_authorizes_both() ->
     assert_eq!(pending_a.verification_code().to_string().len(), 6);
     assert_eq!(pending_a.peer().device_name, "device-b");
     assert_eq!(pending_b.peer().device_name, "device-a");
+    assert!(pending_a.disposable_handle().is_some());
+    assert!(pending_b.disposable_handle().is_some());
     assert_eq!(pending_a.phase(), PairingPhase::AwaitingLocalDecision);
     assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
     assert_eq!(store_b.state(endpoint_a.device_id()).await, None);
@@ -201,7 +203,10 @@ async fn successful_pairing_requires_local_confirmation_and_authorizes_both() ->
         Some(TrustState::Trusted)
     );
 
-    authorized_a.close();
+    let close_handle = authorized_a.disposable_handle();
+    assert!(!format!("{close_handle:?}").contains("Connection {"));
+    close_handle.close();
+    tokio::time::timeout(CONNECTION_TIMEOUT, authorized_a.closed()).await?;
     authorized_b.close();
     close_endpoints(&endpoint_a, &endpoint_b).await;
     Ok(())

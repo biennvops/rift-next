@@ -6,7 +6,7 @@
 //! metadata, never Iroh keys, addresses, or transient pairing state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, Bound},
     io,
     path::{Path, PathBuf},
 };
@@ -35,6 +35,9 @@ pub const MAX_STORE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum number of mutations replayed from one journal.
 pub const MAX_RECORDS: usize = 100_000;
+
+/// Maximum current trust decisions returned by one bounded page query.
+pub const MAX_LIST_PAGE_SIZE: usize = 128;
 
 /// One durable mutation in the trust journal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,6 +75,15 @@ impl TrustEntry {
             Self::Revoked(_) => TrustState::Revoked,
         }
     }
+}
+
+/// One deterministic bounded page of current trust decisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustPage {
+    /// Entries after the requested exclusive cursor, in `DeviceId` order.
+    pub entries: Vec<TrustEntry>,
+    /// Last returned identity when another page exists.
+    pub next_cursor: Option<DeviceId>,
 }
 
 /// Failures opening, replaying, or durably mutating a trust store.
@@ -120,6 +132,9 @@ pub enum TrustStoreError {
         actual: usize,
         maximum: usize,
     },
+    /// A page query must request at least one entry.
+    #[error("trust-store page limit must be greater than zero")]
+    InvalidPageLimit,
     /// Postcard could not encode a mutation.
     #[error("unable to encode trust mutation: {0}")]
     Encode(#[source] postcard::Error),
@@ -231,11 +246,51 @@ impl TrustStore {
         inner
             .decisions
             .iter()
-            .map(|(device_id, decision)| match decision {
-                StoredDecision::Trusted(peer) => TrustEntry::Trusted(peer.clone()),
-                StoredDecision::Revoked => TrustEntry::Revoked(*device_id),
-            })
+            .map(|(device_id, decision)| trust_entry(*device_id, decision))
             .collect()
+    }
+
+    /// Returns one bounded page after an exclusive `DeviceId` cursor.
+    ///
+    /// Requests above [`MAX_LIST_PAGE_SIZE`] are capped before allocation.
+    pub async fn list_page(
+        &self,
+        after: Option<DeviceId>,
+        limit: usize,
+    ) -> Result<TrustPage, TrustStoreError> {
+        if limit == 0 {
+            return Err(TrustStoreError::InvalidPageLimit);
+        }
+        let limit = limit.min(MAX_LIST_PAGE_SIZE);
+        let mut entries = Vec::with_capacity(limit.saturating_add(1));
+        let inner = self.inner.lock().await;
+        match after {
+            Some(after) => {
+                for (device_id, decision) in inner
+                    .decisions
+                    .range((Bound::Excluded(after), Bound::Unbounded))
+                    .take(limit.saturating_add(1))
+                {
+                    entries.push(trust_entry(*device_id, decision));
+                }
+            }
+            None => {
+                for (device_id, decision) in inner.decisions.iter().take(limit.saturating_add(1)) {
+                    entries.push(trust_entry(*device_id, decision));
+                }
+            }
+        }
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_cursor = if has_more {
+            entries.last().map(TrustEntry::device_id)
+        } else {
+            None
+        };
+        Ok(TrustPage {
+            entries,
+            next_cursor,
+        })
     }
 
     /// Durably trusts a peer before making the decision visible in memory.
@@ -512,6 +567,13 @@ fn validate_mutation(mutation: &TrustMutation) -> Result<(), TrustStoreError> {
     Ok(())
 }
 
+fn trust_entry(device_id: DeviceId, decision: &StoredDecision) -> TrustEntry {
+    match decision {
+        StoredDecision::Trusted(peer) => TrustEntry::Trusted(peer.clone()),
+        StoredDecision::Revoked => TrustEntry::Revoked(device_id),
+    }
+}
+
 fn validate_transition(
     decisions: &BTreeMap<DeviceId, StoredDecision>,
     mutation: &TrustMutation,
@@ -760,6 +822,32 @@ mod tests {
 
         let reopened = TrustStore::open(path).await?;
         assert_eq!(reopened.list().await, entries);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_pages_are_ordered_exclusive_and_server_capped() -> TestResult {
+        let directory = TempDir::new()?;
+        let store = TrustStore::open(store_path(&directory)).await?;
+        for byte in 0_u8..130 {
+            store.trust(peer(byte, "paged peer")).await?;
+        }
+
+        assert!(matches!(
+            store.list_page(None, 0).await,
+            Err(TrustStoreError::InvalidPageLimit)
+        ));
+        let first = store.list_page(None, usize::MAX).await?;
+        assert_eq!(first.entries.len(), MAX_LIST_PAGE_SIZE);
+        assert_eq!(first.entries[0].device_id(), device_id(0));
+        assert_eq!(first.entries[127].device_id(), device_id(127));
+        assert_eq!(first.next_cursor, Some(device_id(127)));
+
+        let second = store.list_page(first.next_cursor, 128).await?;
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(second.entries[0].device_id(), device_id(128));
+        assert_eq!(second.entries[1].device_id(), device_id(129));
+        assert_eq!(second.next_cursor, None);
         Ok(())
     }
 

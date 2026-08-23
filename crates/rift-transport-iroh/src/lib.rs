@@ -454,6 +454,38 @@ impl AuthenticatedConnection {
     }
 }
 
+/// A cloneable, capability-minimal handle for closing or observing one disposable
+/// connection without exposing the raw Iroh connection.
+#[derive(Clone)]
+pub struct DisposableConnectionHandle {
+    connection: Connection,
+}
+
+impl fmt::Debug for DisposableConnectionHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DisposableConnectionHandle")
+            .field(
+                "remote_device_id",
+                &device_id_from_endpoint_id(self.connection.remote_id()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisposableConnectionHandle {
+    /// Immediately closes the disposable connection.
+    pub fn close(&self) {
+        self.connection
+            .close(0_u32.into(), b"Rift connection closed by runtime owner");
+    }
+
+    /// Waits until the underlying disposable connection has terminated.
+    pub async fn closed(&self) {
+        let _closed_reason = self.connection.closed().await;
+    }
+}
+
 /// A successfully Hello-bootstrapped, still-disposable Rift connection.
 pub struct BootstrappedConnection {
     connection: Connection,
@@ -486,6 +518,18 @@ impl BootstrappedConnection {
     /// Returns the identity authenticated by Iroh and matched by Hello.
     pub const fn remote_device_id(&self) -> DeviceId {
         self.peer_hello.device_id
+    }
+
+    /// Returns a minimal cloneable handle for runtime liveness and cancellation.
+    pub fn disposable_handle(&self) -> DisposableConnectionHandle {
+        DisposableConnectionHandle {
+            connection: self.connection.clone(),
+        }
+    }
+
+    /// Waits until this disposable connection terminates.
+    pub async fn closed(&self) {
+        let _closed_reason = self.connection.closed().await;
     }
 
     /// Sends a Ping and waits for the matching Pong before the control deadline.
