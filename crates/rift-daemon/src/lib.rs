@@ -1600,8 +1600,9 @@ mod tests {
         let value = token.descriptor_value().to_owned();
         assert_eq!(value.len(), 64);
         assert!(token.matches(&value));
-        assert!(!token.matches(&value.to_uppercase()));
-        assert!(!token.matches(&format!("{}0", &value[..63])));
+        assert!(!token.matches(&format!("A{}", &value[1..])));
+        let replacement = if value.starts_with('0') { "1" } else { "0" };
+        assert!(!token.matches(&format!("{replacement}{}", &value[1..])));
         assert!(!format!("{token:?}").contains(&value));
         Ok(())
     }
