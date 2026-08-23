@@ -19,6 +19,17 @@ cargo xtask verify
 
 Run coverage and benchmark comparison as required by the change. Individual commands remain useful for diagnosis, but `cargo xtask verify` is the canonical validation firewall.
 
+## Runtime ownership
+
+- Exactly one `riftd` process owns one Rift data directory through the OS-held lock.
+- Local UI/CLI clients use authenticated IPC and never directly mutate `identity.key`,
+  `trust.journal`, `runtime.lock`, or runtime state.
+- `rift-daemon` is the top-level composition crate. Identity, IPC, session, trust,
+  transport, protocol, and core crates must not depend upward on it.
+- Daemon work belongs to its supervisor/registries and must have bounded input,
+  cancellation, cleanup, and a joined task result.
+- No IPC operation may bypass M3 pairing to create trusted state.
+
 ## Every pull request
 
 - New functionality requires meaningful tests.

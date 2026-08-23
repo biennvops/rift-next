@@ -1,59 +1,80 @@
 # Rift vNext
 
-Rift vNext is organized as a production Rust workspace with executable architecture
-boundaries and one validation firewall. Foundation Milestone 3 adds human-confirmed
-pairing, durable identity-keyed trust/revocation, and the first application authorization
-gate above authenticated transport.
+Rift vNext is a production Rust workspace with executable architecture boundaries and one
+validation firewall. Foundation Milestone 4 adds the first real resident process: one
+daemon preserves its Iroh identity, exclusively owns durable trust and live sessions, and
+serves authenticated bounded local IPC for future native clients.
 
 ```text
 crates/rift-core             platform-independent identity and trust types
-crates/rift-protocol         bounded v1 wire and pairing transcript invariants
-crates/rift-transport-iroh   concrete production Iroh integration
+crates/rift-protocol         bounded network v1 and pairing transcript invariants
+crates/rift-transport-iroh   concrete authenticated Iroh integration
 crates/rift-trust            durable trust/revocation journal
 crates/rift-session          pairing state machine and authorization admission
+crates/rift-identity         persistent production Iroh SecretKey storage
+crates/rift-ipc              bounded local JSON control contract
+crates/rift-daemon           resident runtime library and riftd executable
 crates/rift-spike            non-production Prototype 0 evidence
 xtask                        validation and developer automation
 ```
 
-Before changing code, read [the repository agent instructions](AGENTS.md), [architecture](docs/architecture/README.md), and applicable [ADRs](docs/adr/). The canonical validation command is:
+Before changing code, read [the repository agent instructions](AGENTS.md),
+[architecture](docs/architecture/README.md), and applicable [ADRs](docs/adr/). The canonical
+validation command is:
 
 ```bash
 cargo xtask verify
 ```
 
-Coverage and benchmark procedures are documented under `docs/testing/` and `docs/performance/`.
+Coverage and benchmark procedures are documented under `docs/testing/` and
+`docs/performance/`.
 
-## Production Foundation M3 path
+## Production Foundation M4 path
 
 ```text
-caller-owned Iroh SecretKey
-        ↓
-rift-transport-iroh (authenticated QUIC, ALPN rift/1)
-        ↓
-rift-protocol bounded control stream and identity-bound Hello
-        ↓
-BootstrappedConnection (authenticated, not authorized)
-        ↓
-rift-session consults rift-trust
-   ┌────────────┼────────────┐
-trusted       unknown      revoked
-   ↓             ↓            ↓
-Authorized   pairing-only    reject
-Connection   SAS + local
-             confirmation
-                 ↓
-          durable trust commit
-                 ↓
-        AuthorizedConnection
+Native UI / CLI / future platform client
+                  |
+       authenticated local IPC
+                  v
+               riftd
+      +-----------+-----------+
+      |           |           |
+persistent    durable      bounded live
+identity      trust        pairing/session registries
+      |           |           |
+      +-----------+-----------+
+                  v
+       rift-session admission
+                  v
+       rift-transport-iroh
+                  v
+          authenticated QUIC
 ```
 
-The production contract is documented in [protocol v1](docs/protocol/v1.md), with
-machine-readable [conformance vectors](docs/protocol/v1-vectors.json). A successful
-bootstrap proves that the Iroh-authenticated endpoint identity matches the Rift Hello
-identity but grants no application access by itself. Only local durable trust keyed by
-`DeviceId` can produce `AuthorizedConnection`; unknown peers are isolated to pairing and
-revoked peers are rejected. Discovery, daemon lifecycle, durable peer addresses,
-persistent secret-key storage, transfers, and UI remain deferred.
+Exactly one `riftd` process owns one explicit data directory through an OS-held lock. It
+persists the same Iroh `SecretKey`/`DeviceId`, recovers the trust journal, advertises
+pairing (not transfer), admits trusted connections, keeps unknown peers pairing-only,
+rejects revoked peers, and immediately closes matching live authorization after durable
+revoke/forget.
+
+Local control is IPC protocol v1: a private Unix socket on Linux/macOS or named pipe on
+Windows, 4-byte big-endian length plus UTF-8 JSON, 256 KiB frame cap, fresh per-launch
+32-byte bearer token, request IDs, paginated peers, bounded queues, and async events. It has
+no TCP fallback and no direct trust-creation command. Exact encodings are documented in
+[IPC v1](docs/ipc/v1.md) and [vectors](docs/ipc/v1-vectors.json).
+
+Run the foreground daemon with an explicit directory:
+
+```bash
+cargo run -p rift-daemon --bin riftd -- \
+  --data-dir /tmp/rift-daemon \
+  --device-name "My device" \
+  --relay disabled
+```
+
+See the [runtime contract](docs/daemon/runtime.md),
+[architecture map](docs/architecture/README.md), and ADRs 0009–0011. M4 contains no file
+transfer, clipboard, notification, discovery, reconnect, or synchronization feature.
 
 ## Prototype 0: Iroh/QUIC networking spike
 

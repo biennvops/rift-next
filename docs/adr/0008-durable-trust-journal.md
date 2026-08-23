@@ -64,8 +64,8 @@ A newly created store syncs its header before opening successfully. Trusted meta
 be updated by a later trust mutation, but a revoked identity cannot transition directly
 back to trusted: explicit `forget` is required first.
 
-## Deferred
+## Foundation M4 follow-up
 
-Journal compaction, cross-process locking/writer coordination, backups, authenticated or
-encrypted local storage, active-session notification, and daemon ownership are deferred
-until a real lifecycle requirement exists.
+ADR 0009 makes one locked daemon the sole process owner/writer and adds active-session
+notification/invalidation. Cross-process writer coordination is no longer required.
+Journal compaction, backups, and authenticated/encrypted local storage remain deferred.
