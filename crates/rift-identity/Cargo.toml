@@ -1,0 +1,22 @@
+[package]
+name = "rift-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+iroh.workspace = true
+rift-core = { path = "../rift-core", version = "=0.1.0" }
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+tempfile.workspace = true
+
+[[example]]
+name = "identity-benchmark"
+
+[lints]
+workspace = true

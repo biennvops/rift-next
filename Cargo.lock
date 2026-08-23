@@ -2783,6 +2783,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-identity"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "iroh",
+ "rift-core",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rift-protocol"
 version = "0.1.0"
 dependencies = [
