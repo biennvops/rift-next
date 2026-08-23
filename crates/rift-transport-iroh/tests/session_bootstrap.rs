@@ -3,7 +3,8 @@ use std::{error::Error, time::Duration};
 use rift_core::{DEVICE_ID_LEN, DeviceId};
 use rift_protocol::{
     ControlMessage, HandshakeError, Hello, HelloMetadata, MAX_CONTROL_FRAME_LEN, MessageKind,
-    PROTOCOL_VERSION, encode_message, exchange_hello_with_timeout, read_message, write_message,
+    PAIRING_COMMITMENT_LEN, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PROTOCOL_VERSION, PairingCommitment,
+    PairingMessage, encode_message, exchange_hello_with_timeout, read_message, write_message,
 };
 use rift_transport_iroh::{
     AuthenticatedConnection, BootstrappedConnection, ControlStream, EndpointConfig, RiftEndpoint,
@@ -88,6 +89,8 @@ async fn production_endpoints_bootstrap_authenticate_and_use_ping_pong() -> Test
         .await?;
     let mut connection_b = accept_task.await??;
 
+    assert_eq!(connection_a.local_device_id(), endpoint_a.device_id());
+    assert_eq!(connection_b.local_device_id(), endpoint_b.device_id());
     assert_eq!(connection_a.remote_device_id(), endpoint_b.device_id());
     assert_eq!(connection_b.remote_device_id(), endpoint_a.device_id());
     assert_eq!(connection_a.peer_hello().device_name, "laptop");
@@ -385,6 +388,123 @@ async fn sequencing_error_poisoned_connection_cannot_be_reused() -> TestResult {
     ));
     assert!(matches!(
         client_connection.respond_to_ping().await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
+
+    client_connection.close();
+    server_connection.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pairing_only_transport_exchanges_typed_messages() -> TestResult {
+    let (client, server) = bind_pair().await?;
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .accept_and_bootstrap(metadata("server", "test"))
+                .await
+        }
+    });
+    let mut client_connection = client
+        .connect_and_bootstrap(server.local_addr(), metadata("client", "test"))
+        .await?;
+    let mut server_connection = server_task.await??;
+    let pairing_id = [7; PAIRING_ID_LEN];
+    let request = PairingMessage::Request {
+        pairing_id,
+        commitment: PairingCommitment::from_bytes([8; PAIRING_COMMITMENT_LEN]),
+    };
+    client_connection
+        .send_pairing(request.clone(), TEST_HANDSHAKE_TIMEOUT)
+        .await?;
+    assert_eq!(
+        server_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await?,
+        request
+    );
+    let response = PairingMessage::Response {
+        pairing_id,
+        commitment: PairingCommitment::from_bytes([9; PAIRING_COMMITMENT_LEN]),
+    };
+    server_connection
+        .send_pairing(response.clone(), TEST_HANDSHAKE_TIMEOUT)
+        .await?;
+    assert_eq!(
+        client_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await?,
+        response
+    );
+    let reveal = PairingMessage::Reveal {
+        pairing_id,
+        nonce: [10; PAIRING_NONCE_LEN],
+    };
+    client_connection
+        .send_pairing(reveal.clone(), TEST_HANDSHAKE_TIMEOUT)
+        .await?;
+    assert_eq!(
+        server_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await?,
+        reveal
+    );
+
+    client_connection.close();
+    server_connection.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn general_control_message_poisoned_pairing_only_connection() -> TestResult {
+    let (client, server, mut client_connection, server_connection, mut server_control) =
+        bootstrap_client_with_manual_server().await?;
+    write_message(
+        &mut server_control.send,
+        &ControlMessage::Ping { nonce: 17 },
+    )
+    .await?;
+
+    assert!(matches!(
+        client_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await,
+        Err(TransportError::UnexpectedPairingMessage {
+            received: MessageKind::Ping
+        })
+    ));
+    assert!(matches!(
+        client_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
+
+    client_connection.close();
+    server_connection.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pairing_receive_timeout_poisoned_connection() -> TestResult {
+    let (client, server, mut client_connection, server_connection, _server_control) =
+        bootstrap_client_with_manual_server().await?;
+
+    assert!(matches!(
+        client_connection
+            .receive_pairing(Duration::from_millis(20))
+            .await,
+        Err(TransportError::ControlTimeout)
+    ));
+    assert!(matches!(
+        client_connection
+            .receive_pairing(TEST_HANDSHAKE_TIMEOUT)
+            .await,
         Err(TransportError::ControlConnectionPoisoned)
     ));
 

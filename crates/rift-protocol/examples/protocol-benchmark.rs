@@ -1,7 +1,10 @@
 use std::{env, error::Error, hint::black_box, time::Instant};
 
 use rift_core::DeviceId;
-use rift_protocol::{ControlMessage, Hello, HelloMetadata, decode_message, encode_message};
+use rift_protocol::{
+    ControlMessage, Hello, HelloMetadata, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingTranscript,
+    decode_message, encode_message,
+};
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let iterations = env::args()
@@ -41,6 +44,19 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let ping_seconds = ping_start.elapsed().as_secs_f64().max(f64::EPSILON);
     let ping_pong_operations = iterations.saturating_mul(2);
 
+    let pairing_transcript = PairingTranscript::new(
+        DeviceId::from_bytes([0x11; 32]),
+        DeviceId::from_bytes([0x22; 32]),
+        [0x33; PAIRING_ID_LEN],
+        [0x44; PAIRING_NONCE_LEN],
+        [0x55; PAIRING_NONCE_LEN],
+    );
+    let pairing_start = Instant::now();
+    for _ in 0..iterations {
+        black_box(pairing_transcript.code());
+    }
+    let pairing_seconds = pairing_start.elapsed().as_secs_f64().max(f64::EPSILON);
+
     println!(
         "production.protocol_v1.hello_encode_decode.ops_per_second={:.2}",
         iterations as f64 / hello_seconds
@@ -48,6 +64,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!(
         "production.protocol_v1.ping_pong_encode_decode.ops_per_second={:.2}",
         ping_pong_operations as f64 / ping_seconds
+    );
+    println!(
+        "production.protocol_v1.pairing_code.ops_per_second={:.2}",
+        iterations as f64 / pairing_seconds
     );
     println!(
         "production.protocol_v1.hello_frame_bytes={}",

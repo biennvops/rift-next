@@ -18,8 +18,8 @@ use iroh::{Endpoint, RelayMode};
 pub use iroh::{EndpointAddr, RelayUrl, SecretKey, TransportAddr};
 use rift_core::DeviceId;
 use rift_protocol::{
-    ControlChannel, ControlError, HandshakeError, Hello, HelloMetadata, PROTOCOL_VERSION,
-    exchange_hello_with_timeout,
+    ControlChannel, ControlError, ControlMessage, FrameError, HandshakeError, Hello, HelloMetadata,
+    MessageKind, PROTOCOL_VERSION, PairingMessage, exchange_hello_with_timeout,
 };
 use thiserror::Error;
 use tokio::time;
@@ -157,6 +157,12 @@ pub enum TransportError {
     /// A post-bootstrap control message failed.
     #[error("Rift control message failed: {0}")]
     Control(#[from] ControlError),
+    /// Pairing control framing failed.
+    #[error("Rift pairing control framing failed: {0}")]
+    PairingFrame(#[source] FrameError),
+    /// Pairing-only control received a non-pairing message.
+    #[error("pairing-only connection received {received}")]
+    UnexpectedPairingMessage { received: MessageKind },
     /// A prior control failure invalidated and closed this disposable connection.
     #[error("Rift control connection is poisoned by a prior failure")]
     ControlConnectionPoisoned,
@@ -381,6 +387,7 @@ impl RiftEndpoint {
         Ok(BootstrappedConnection {
             connection: connection.connection,
             control: Some(control),
+            local_device_id: self.device_id,
             peer_hello,
             control_timeout: self.config.handshake_timeout,
         })
@@ -451,6 +458,7 @@ impl AuthenticatedConnection {
 pub struct BootstrappedConnection {
     connection: Connection,
     control: Option<ControlStream>,
+    local_device_id: DeviceId,
     peer_hello: Hello,
     control_timeout: Duration,
 }
@@ -465,6 +473,11 @@ impl fmt::Debug for BootstrappedConnection {
 }
 
 impl BootstrappedConnection {
+    /// Returns the endpoint-owned local public identity used in Hello.
+    pub const fn local_device_id(&self) -> DeviceId {
+        self.local_device_id
+    }
+
     /// Returns the validated peer Hello metadata and identity.
     pub const fn peer_hello(&self) -> &Hello {
         &self.peer_hello
@@ -513,6 +526,67 @@ impl BootstrappedConnection {
             Ok(Err(error)) => {
                 self.poison();
                 Err(TransportError::Control(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    /// Sends one pairing message before the supplied pairing phase deadline.
+    /// Any failure poisons this disposable connection.
+    pub async fn send_pairing(
+        &mut self,
+        message: PairingMessage,
+        timeout: Duration,
+    ) -> Result<(), TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        let message = ControlMessage::from(message);
+        let result = time::timeout(
+            timeout,
+            rift_protocol::write_message(&mut control.send, &message),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::PairingFrame(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    /// Receives one pairing message before the supplied pairing phase deadline.
+    ///
+    /// General control messages are rejected and poison the pairing-only connection.
+    pub async fn receive_pairing(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<PairingMessage, TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        let result = time::timeout(timeout, rift_protocol::read_message(&mut control.recv)).await;
+        match result {
+            Ok(Ok(message)) => match message.into_pairing() {
+                Ok(pairing) => Ok(pairing),
+                Err(received) => {
+                    self.poison();
+                    Err(TransportError::UnexpectedPairingMessage { received })
+                }
+            },
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::PairingFrame(error))
             }
             Err(_) => {
                 self.poison();

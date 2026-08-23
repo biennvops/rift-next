@@ -113,6 +113,20 @@ fn benchmark_smoke() -> Result<()> {
             "run",
             "--locked",
             "--package",
+            "rift-trust",
+            "--example",
+            "trust-benchmark",
+            "--",
+            "10",
+            "100",
+        ],
+        &[],
+    )?;
+    run_cargo(
+        &[
+            "run",
+            "--locked",
+            "--package",
             "rift-spike",
             "--",
             "bench",
@@ -280,19 +294,70 @@ impl DependencyPolicy {
     }
 
     fn validate(&self) -> Result<()> {
-        for package in ["rift-core", "rift-protocol", "rift-transport-iroh"] {
+        for package in [
+            "rift-core",
+            "rift-protocol",
+            "rift-transport-iroh",
+            "rift-trust",
+            "rift-session",
+        ] {
             self.workspace_package_id(package)?;
         }
 
         self.require_direct("rift-protocol", "rift-core")?;
         self.require_direct("rift-transport-iroh", "rift-core")?;
         self.require_direct("rift-transport-iroh", "rift-protocol")?;
-        self.reject_reachable("rift-core", &["iroh", "iroh-relay", "rift-transport-iroh"])?;
+        self.require_direct("rift-trust", "rift-core")?;
+        for dependency in [
+            "rift-core",
+            "rift-protocol",
+            "rift-transport-iroh",
+            "rift-trust",
+        ] {
+            self.require_direct("rift-session", dependency)?;
+        }
+
+        self.reject_reachable(
+            "rift-core",
+            &[
+                "rift-protocol",
+                "rift-transport-iroh",
+                "rift-trust",
+                "rift-session",
+                "iroh",
+                "iroh-relay",
+            ],
+        )?;
         self.reject_reachable(
             "rift-protocol",
-            &["iroh", "iroh-relay", "rift-transport-iroh"],
+            &[
+                "rift-transport-iroh",
+                "rift-trust",
+                "rift-session",
+                "iroh",
+                "iroh-relay",
+            ],
         )?;
-        self.reject_direct("rift-transport-iroh", "iroh-relay")?;
+        self.reject_reachable(
+            "rift-trust",
+            &[
+                "rift-protocol",
+                "rift-transport-iroh",
+                "rift-session",
+                "iroh",
+                "iroh-relay",
+            ],
+        )?;
+        self.reject_reachable("rift-transport-iroh", &["rift-trust", "rift-session"])?;
+        for package in [
+            "rift-core",
+            "rift-protocol",
+            "rift-transport-iroh",
+            "rift-trust",
+            "rift-session",
+        ] {
+            self.reject_direct(package, "iroh-relay")?;
+        }
         self.require_exact("rift-transport-iroh", "iroh", "=1.0.3")?;
         self.require_exact("rift-spike", "iroh", "=1.0.3")?;
         self.require_exact("rift-spike", "iroh-relay", "=1.0.3")?;
@@ -432,8 +497,10 @@ mod tests {
         let workspace_packages = [
             ("workspace#rift-core", "rift-core"),
             ("workspace#rift-protocol", "rift-protocol"),
+            ("workspace#rift-session", "rift-session"),
             ("workspace#rift-spike", "rift-spike"),
             ("workspace#rift-transport-iroh", "rift-transport-iroh"),
+            ("workspace#rift-trust", "rift-trust"),
         ];
         for (package_id, package_name) in workspace_packages {
             policy
@@ -456,11 +523,24 @@ mod tests {
             BTreeSet::from(["workspace#rift-core".to_owned()]),
         );
         policy.resolved_dependencies.insert(
+            "workspace#rift-trust".to_owned(),
+            BTreeSet::from(["workspace#rift-core".to_owned()]),
+        );
+        policy.resolved_dependencies.insert(
             "workspace#rift-transport-iroh".to_owned(),
             BTreeSet::from([
                 "registry#iroh@1.0.3".to_owned(),
                 "workspace#rift-core".to_owned(),
                 "workspace#rift-protocol".to_owned(),
+            ]),
+        );
+        policy.resolved_dependencies.insert(
+            "workspace#rift-session".to_owned(),
+            BTreeSet::from([
+                "workspace#rift-core".to_owned(),
+                "workspace#rift-protocol".to_owned(),
+                "workspace#rift-transport-iroh".to_owned(),
+                "workspace#rift-trust".to_owned(),
             ]),
         );
         policy.resolved_dependencies.insert(
@@ -528,6 +608,65 @@ mod tests {
             dependencies.remove("workspace#rift-core");
         }
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn trust_must_depend_directly_on_core() {
+        let mut policy = valid_policy();
+        if let Some(dependencies) = policy.resolved_dependencies.get_mut("workspace#rift-trust") {
+            dependencies.remove("workspace#rift-core");
+        }
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn session_must_depend_directly_on_every_foundation_owner() {
+        for dependency in [
+            "workspace#rift-core",
+            "workspace#rift-protocol",
+            "workspace#rift-transport-iroh",
+            "workspace#rift-trust",
+        ] {
+            let mut policy = valid_policy();
+            if let Some(dependencies) = policy
+                .resolved_dependencies
+                .get_mut("workspace#rift-session")
+            {
+                dependencies.remove(dependency);
+            }
+            assert!(policy.validate().is_err(), "accepted missing {dependency}");
+        }
+    }
+
+    #[test]
+    fn every_forbidden_internal_production_edge_is_rejected() {
+        for (source, forbidden) in [
+            ("rift-core", "rift-protocol"),
+            ("rift-core", "rift-transport-iroh"),
+            ("rift-core", "rift-trust"),
+            ("rift-core", "rift-session"),
+            ("rift-protocol", "rift-transport-iroh"),
+            ("rift-protocol", "rift-trust"),
+            ("rift-protocol", "rift-session"),
+            ("rift-trust", "rift-protocol"),
+            ("rift-trust", "rift-transport-iroh"),
+            ("rift-trust", "rift-session"),
+            ("rift-transport-iroh", "rift-trust"),
+            ("rift-transport-iroh", "rift-session"),
+        ] {
+            let mut policy = valid_policy();
+            let source_id = format!("workspace#{source}");
+            let forbidden_id = format!("workspace#{forbidden}");
+            policy
+                .resolved_dependencies
+                .entry(source_id)
+                .or_default()
+                .insert(forbidden_id);
+            assert!(
+                policy.validate().is_err(),
+                "accepted forbidden edge {source} -> {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -616,6 +755,23 @@ mod tests {
                     ]
                 },
                 {
+                    "id": "workspace#rift-trust",
+                    "name": "rift-trust",
+                    "dependencies": [
+                        { "name": "rift-core", "req": "=0.1.0" }
+                    ]
+                },
+                {
+                    "id": "workspace#rift-session",
+                    "name": "rift-session",
+                    "dependencies": [
+                        { "name": "rift-core", "req": "=0.1.0" },
+                        { "name": "rift-protocol", "req": "=0.1.0" },
+                        { "name": "rift-transport-iroh", "req": "=0.1.0" },
+                        { "name": "rift-trust", "req": "=0.1.0" }
+                    ]
+                },
+                {
                     "id": "registry#iroh@1.0.3",
                     "name": "iroh",
                     "dependencies": []
@@ -641,8 +797,10 @@ mod tests {
             "workspace_members": [
                 "workspace#rift-core",
                 "workspace#rift-protocol",
+                "workspace#rift-session",
                 "workspace#rift-spike",
-                "workspace#rift-transport-iroh"
+                "workspace#rift-transport-iroh",
+                "workspace#rift-trust"
             ],
             "resolve": {
                 "nodes": [
@@ -671,6 +829,21 @@ mod tests {
                             { "pkg": "registry#iroh@1.0.3" },
                             { "pkg": "workspace#rift-core" },
                             { "pkg": "workspace#rift-protocol" }
+                        ]
+                    },
+                    {
+                        "id": "workspace#rift-trust",
+                        "deps": [
+                            { "pkg": "workspace#rift-core" }
+                        ]
+                    },
+                    {
+                        "id": "workspace#rift-session",
+                        "deps": [
+                            { "pkg": "workspace#rift-core" },
+                            { "pkg": "workspace#rift-protocol" },
+                            { "pkg": "workspace#rift-transport-iroh" },
+                            { "pkg": "workspace#rift-trust" }
                         ]
                     },
                     {

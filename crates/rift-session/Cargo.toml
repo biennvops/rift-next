@@ -1,22 +1,22 @@
 [package]
-name = "rift-protocol"
+name = "rift-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-blake3.workspace = true
-postcard.workspace = true
+getrandom.workspace = true
 rift-core = { path = "../rift-core", version = "=0.1.0" }
-serde.workspace = true
+rift-protocol = { path = "../rift-protocol", version = "=0.1.0" }
+rift-transport-iroh = { path = "../rift-transport-iroh", version = "=0.1.0" }
+rift-trust = { path = "../rift-trust", version = "=0.1.0" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-hex.workspace = true
-serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
