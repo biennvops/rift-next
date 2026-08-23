@@ -52,7 +52,7 @@ pub const DEFAULT_MAX_IPC_CLIENTS: usize = 8;
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HARD_MAX_INFLIGHT_CONNECTIONS: usize = 256;
-const HARD_MAX_ACTIVE_SESSIONS: usize = 1024;
+const HARD_MAX_ACTIVE_SESSIONS: usize = 128;
 const HARD_MAX_SESSIONS_PER_PEER: usize = 16;
 const HARD_MAX_PENDING_PAIRINGS: usize = 64;
 const HARD_MAX_IPC_CLIENTS: usize = 64;
@@ -1604,6 +1604,55 @@ mod tests {
         let replacement = if value.starts_with('0') { "1" } else { "0" };
         assert!(!token.matches(&format!("{replacement}{}", &value[1..])));
         assert!(!format!("{token:?}").contains(&value));
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_registry_responses_fit_the_ipc_frame_bound() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let device_id = DeviceId::from_bytes([u8::MAX; 32]);
+        let device_name = "\0".repeat(rift_core::MAX_DEVICE_NAME_LEN);
+        let platform = "\0".repeat(rift_core::MAX_PLATFORM_LEN);
+        let sessions = (0..HARD_MAX_ACTIVE_SESSIONS)
+            .map(|index| SessionInfo {
+                session_id: SessionId(u64::try_from(index).unwrap_or(u64::MAX)),
+                device_id,
+                device_name: device_name.clone(),
+                platform: platform.clone(),
+            })
+            .collect();
+        let pairings = (0..HARD_MAX_PENDING_PAIRINGS)
+            .map(|index| PendingPairingInfo {
+                attempt_id: PairingAttemptId(u64::try_from(index).unwrap_or(u64::MAX)),
+                device_id,
+                device_name: device_name.clone(),
+                platform: platform.clone(),
+                verification_code: "999999".to_owned(),
+                timeout_remaining_ms: u64::MAX,
+            })
+            .collect();
+        let entries = (0..usize::from(MAX_PEER_PAGE_SIZE))
+            .map(|_| PeerInfo {
+                device_id,
+                state: TrustState::Trusted,
+                device_name: Some(device_name.clone()),
+                platform: Some(platform.clone()),
+            })
+            .collect();
+        let responses = [
+            Response::Sessions { sessions },
+            Response::PendingPairings { pairings },
+            Response::Peers {
+                page: PeerPage {
+                    entries,
+                    next_cursor: Some(device_id),
+                },
+            },
+        ];
+        for response in responses {
+            let frame = rift_ipc::encode_json_frame(&response)?;
+            assert!(frame.len() - size_of::<u32>() <= rift_ipc::MAX_IPC_FRAME_LEN);
+        }
         Ok(())
     }
 

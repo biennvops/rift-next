@@ -99,7 +99,7 @@ Default limits are:
 | Resource | Default | Hard configuration maximum |
 | --- | ---: | ---: |
 | Incoming bootstrap/setup tasks | 32 | 256 |
-| Active authorized sessions | 64 | 1,024 |
+| Active authorized sessions | 64 | 128 |
 | Active sessions per `DeviceId` | 4 | 16 |
 | Pending pairing confirmations | 8 | 64 |
 | Local IPC clients | 8 | 64 |
