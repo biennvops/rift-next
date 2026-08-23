@@ -2795,6 +2795,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-ipc"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rift-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "rift-protocol"
 version = "0.1.0"
 dependencies = [

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rift-core",
     "crates/rift-identity",
+    "crates/rift-ipc",
     "crates/rift-protocol",
     "crates/rift-session",
     "crates/rift-spike",
