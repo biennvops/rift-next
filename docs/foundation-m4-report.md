@@ -4,7 +4,7 @@
 
 - M4 base SHA: `19213ca2e907d98321cf00498c22700b8985c2f6`
 - M4 implementation/documentation handoff SHA:
-  `fbd68e14c82c5bd2ef06c2bbee6f8c54e0071c76`
+  `cc1f1738a9c9f37cceeee154c50a49f943358fd4`
 - Branch: `feat/foundation-m4-daemon-runtime`
 - Reconstructed M3 baseline report:
   [`foundation-m3-report.md`](foundation-m3-report.md), added in
@@ -12,7 +12,7 @@
 - M3 implementation head: `4561f949186cab10328f6d59264dcac9377a24d1`
 - M3 merge/base: `19213ca2e907d98321cf00498c22700b8985c2f6`
 - Report status: this report is an evidence-only commit after the named M4 handoff; no
-  implementation behavior changed after final validation at `fbd68e1`.
+  implementation behavior changed after final validation at `cc1f173`.
 
 Local evidence was collected on 2026-08-23 using:
 
@@ -168,15 +168,17 @@ Default and hard configuration bounds are:
 | Resource | Default | Hard maximum |
 | --- | ---: | ---: |
 | Incoming bootstrap/setup tasks | 32 | 256 |
-| Active authorized sessions | 64 | 1,024 |
+| Active authorized sessions | 64 | 128 |
 | Sessions per `DeviceId` | 4 | 16 |
 | Pending pairing confirmations | 8 | 64 |
 | Local IPC clients | 8 | 64 |
 
 All counts and relevant deadlines must be nonzero. Capacity rejection closes the new
-connection and does not evict unrelated sessions. A pending-pairing semaphore is acquired
-before responder/initiator setup and remains owned by its task until success, rejection,
-expiry, cancellation, connection loss, or failure.
+connection and does not evict unrelated sessions. The active-session hard maximum is 128
+so its unpaginated listing remains below 256 KiB; a worst-case escaped-metadata test also
+pins peer-page and pending-pairing responses below the frame bound. A pending-pairing
+semaphore is acquired before responder/initiator setup and remains owned by its task until
+success, rejection, expiry, cancellation, connection loss, or failure.
 
 One supervisor `JoinSet` owns incoming, outbound, pairing, session, and IPC client tasks;
 each IPC client owns its nested writer `JoinSet`. Production code drops no spawned task
@@ -282,7 +284,7 @@ disposable connection liveness, M3 pairing failures, and journal persistence/rep
 
 ## Coverage
 
-Final coverage at handoff SHA `fbd68e1` passed the unchanged 60% workspace line floor:
+Final coverage at handoff SHA `cc1f173` passed the unchanged 60% workspace line floor:
 
 | Package | Line coverage |
 | --- | ---: |
@@ -293,11 +295,11 @@ Final coverage at handoff SHA `fbd68e1` passed the unchanged 60% workspace line 
 | `rift-session` | 90.92% |
 | `rift-identity` | 87.25% |
 | `rift-ipc` | 95.77% |
-| `rift-daemon` | 76.13% |
-| **Workspace** | **80.34%** |
+| `rift-daemon` | 76.79% |
+| **Workspace** | **80.45%** |
 
 The `rift-daemon` aggregate includes the thin foreground binary at 0% under library-driven
-coverage; its library is 79.02%, local runtime artifact code 83.41%, and IPC server 71.33%.
+coverage; its library is 79.81%, local runtime artifact code 83.41%, and IPC server 71.33%.
 Security-sensitive identity/IPC failure paths have targeted tests in addition to their
 aggregate percentages.
 
@@ -311,20 +313,20 @@ records, 100 lookups, 10 daemon IPC requests, 100 daemon replay records) reporte
 
 | Measurement | Result |
 | --- | ---: |
-| Hello encode/decode | 114,334.71 ops/s |
-| Ping/Pong encode/decode | 1,636,554.07 ops/s |
-| Pairing-code derivation | 184,020.74 ops/s |
+| Hello encode/decode | 119,940.03 ops/s |
+| Ping/Pong encode/decode | 1,622,165.27 ops/s |
+| Pairing-code derivation | 183,865.78 ops/s |
 | Trust replay (10 records / 835 bytes) | 0.000155 s |
-| Trust lookup | 1,248,704.47 ops/s |
-| Identity cold create | 0.012314 s |
-| Identity warm load | 0.000127 s |
+| Trust lookup | 1,256,549.77 ops/s |
+| Identity cold create | 0.016334 s |
+| Identity warm load | 0.000128 s |
 | Identity file | 74 bytes |
-| IPC JSON encode/decode | 38,327.64 ops/s |
+| IPC JSON encode/decode | 38,420.28 ops/s |
 | IPC benchmark frame/payload | 148 / 144 bytes |
-| Daemon cold start | 0.116587 s |
-| Daemon warm restart | 0.018925 s |
-| Authenticated IPC GetStatus round trip | 0.000129 s |
-| Daemon startup with 100 trust mutations | 0.052989 s |
+| Daemon cold start | 0.115711 s |
+| Daemon warm restart | 0.018737 s |
+| Authenticated IPC GetStatus round trip | 0.000124 s |
+| Daemon startup with 100 trust mutations | 0.054972 s |
 
 The explicit 1,000-record daemon command:
 
@@ -333,8 +335,8 @@ cargo run --locked --quiet -p rift-daemon \
   --example daemon-benchmark -- 100 1000
 ```
 
-reported cold start `0.111281 s`, warm restart `0.019581 s`, real framed/authenticated IPC
-GetStatus round trip `0.000076 s`, and startup with 1,000 trust mutations `0.062928 s`.
+reported cold start `0.122194 s`, warm restart `0.017790 s`, real framed/authenticated IPC
+GetStatus round trip `0.000076 s`, and startup with 1,000 trust mutations `0.060919 s`.
 No public relay was started by any M4 benchmark.
 
 ## Validation and platform status
@@ -343,7 +345,7 @@ Final handoff validation:
 
 ```text
 cargo xtask verify                                      PASS
-cargo xtask coverage                                    PASS (80.34% lines)
+cargo xtask coverage                                    PASS (80.45% lines)
 cargo xtask benchmark-smoke                             PASS
 cargo test --locked -p rift-identity                    PASS
 cargo test --locked -p rift-ipc                         PASS
