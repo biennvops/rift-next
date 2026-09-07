@@ -4,17 +4,19 @@
 
 - M4 base SHA: `19213ca2e907d98321cf00498c22700b8985c2f6`
 - M4 implementation/documentation handoff SHA:
-  `cc1f1738a9c9f37cceeee154c50a49f943358fd4`
+  `fcaf577c19a0e7d807e2409ff0050c24ee18cdc1`
 - Branch: `feat/foundation-m4-daemon-runtime`
 - Reconstructed M3 baseline report:
   [`foundation-m3-report.md`](foundation-m3-report.md), added in
   `29858bc87ab7d86eed201c49ed33436b70c2348c`
 - M3 implementation head: `4561f949186cab10328f6d59264dcac9377a24d1`
 - M3 merge/base: `19213ca2e907d98321cf00498c22700b8985c2f6`
-- Report status: this report is an evidence-only commit after the named M4 handoff; no
-  implementation behavior changed after final validation at `cc1f173`.
+- Report status: final handoff evidence for the current M4 head; post-review implementation
+  changes after the prior `cc1f1738a9c9f37cceeee154c50a49f943358fd4` evidence snapshot are
+  recorded below and covered by CI run #31.
 
-Local evidence was collected on 2026-08-23 using:
+The original local evidence snapshot, used for the historical measurements below, was collected on
+2026-08-23 using:
 
 - Rust `1.97.1 (8bab26f4f 2026-07-14)`, LLVM `22.1.8` for macOS validation/coverage;
 - pinned Rust `1.91.0` for the advisory Windows cross-target check;
@@ -30,7 +32,23 @@ admission manager, bounded pending pairings, bounded authorized sessions, local 
 all child tasks. It runs in the foreground and contains no synchronization or feature data
 plane.
 
-The workspace now contains:
+## Post-review changes
+
+The final handoff includes the following post-review changes after the earlier `cc1f173` evidence
+snapshot:
+
+- `19824008c02c17e8af3475d85d25046b9ee745e0` adds the per-peer generation fence that makes
+  `ForgetPeer` linearizable against an in-flight pairing confirmation, with trust-store and
+  daemon regression coverage and updated security/runtime evidence;
+- `d975de686db923d88b6b744fc038fa3d38467e60` gives the pairing-expiry integration test
+  asymmetric deadlines, accepts the peer-side connection-loss result, and verifies pending-slot
+  reuse; and
+- `fcaf577c19a0e7d807e2409ff0050c24ee18cdc1` groups the pending-pairing construction context
+  without changing protocol behavior.
+
+These changes are included in the current handoff head and were validated by hosted CI run #31.
+
+## Workspace structure
 
 ```text
 rift-core
@@ -288,31 +306,34 @@ disposable connection liveness, M3 pairing failures, and journal persistence/rep
 
 ## Coverage
 
-Final coverage at handoff SHA `cc1f173` passed the unchanged 60% workspace line floor:
+Coverage from hosted CI run #31 at the current handoff SHA `fcaf577c` passed the unchanged 60%
+workspace line floor:
 
 | Package | Line coverage |
 | --- | ---: |
 | `rift-core` | 92.47% |
-| `rift-protocol` | 94.24% |
-| `rift-transport-iroh` | 86.77% |
-| `rift-trust` | 93.50% |
-| `rift-session` | 90.92% |
-| `rift-identity` | 87.25% |
-| `rift-ipc` | 95.77% |
-| `rift-daemon` | 76.79% |
-| **Workspace** | **80.45%** |
+| `rift-protocol` | 93.55% |
+| `rift-transport-iroh` | 85.58% |
+| `rift-trust` | 93.87% |
+| `rift-session` | 90.80% |
+| `rift-identity` | 87.29% |
+| `rift-ipc` | 95.79% |
+| `rift-daemon` | 78.58% |
+| **Workspace** | **80.55%** |
 
 The `rift-daemon` aggregate includes the thin foreground binary at 0% under library-driven
-coverage; its library is 79.81%, local runtime artifact code 83.41%, and IPC server 71.33%.
+coverage; its library is 81.95%, local runtime artifact code 83.49%, and IPC server 73.43%.
 Security-sensitive identity/IPC failure paths have targeted tests in addition to their
 aggregate percentages.
 
 ## Performance measurements
 
-These are historical, non-gating debug-profile measurements on the host above. Shared
-runner timing is not a performance promise.
+These are historical, non-gating debug-profile measurements collected at the prior evidence
+snapshot `cc1f1738a9c9f37cceeee154c50a49f943358fd4` on the host above. They are not final
+measurements for the current handoff head, and shared runner timing is not a performance
+promise.
 
-Final `cargo xtask benchmark-smoke` (100 protocol/identity/IPC iterations, 10 journal
+Historical `cargo xtask benchmark-smoke` (100 protocol/identity/IPC iterations, 10 journal
 records, 100 lookups, 10 daemon IPC requests, 100 daemon replay records) reported:
 
 | Measurement | Result |
@@ -332,7 +353,7 @@ records, 100 lookups, 10 daemon IPC requests, 100 daemon replay records) reporte
 | Authenticated IPC GetStatus round trip | 0.000124 s |
 | Daemon startup with 100 trust mutations | 0.054972 s |
 
-The explicit 1,000-record daemon command:
+The same historical explicit 1,000-record daemon command:
 
 ```bash
 cargo run --locked --quiet -p rift-daemon \
@@ -345,49 +366,36 @@ No public relay was started by any M4 benchmark.
 
 ## Validation and platform status
 
-Final handoff validation:
+Final hosted validation for the current handoff head `fcaf577c19a0e7d807e2409ff0050c24ee18cdc1`
+was provided by [GitHub Actions CI run #31](https://github.com/biennvops/rift-next/actions/runs/34075944432),
+which completed successfully on 2026-09-07. The pull-request workflow checked out merge ref
+`43d77f841f7c345c48ccd47c85f8fb0eab6dcddb`, containing the reported head, and recorded:
 
-```text
-cargo xtask verify                                      PASS
-cargo xtask coverage                                    PASS (80.45% lines)
-cargo xtask benchmark-smoke                             PASS
-cargo test --locked -p rift-identity                    PASS
-cargo test --locked -p rift-ipc                         PASS
-cargo test --locked -p rift-daemon                      PASS
-cargo test --locked -p rift-session                     PASS
-cargo test --locked -p rift-trust                       PASS
-cargo xtask architecture                                PASS
-```
+| Job | Result |
+| --- | --- |
+| Quality firewall (Linux) | `cargo xtask verify` — PASS |
+| Coverage floor (Linux) | `cargo xtask coverage` — PASS (80.55% lines) |
+| Production crates (macOS) | production-crate test suite — PASS |
+| Production crates (Windows, advisory) | production-crate test suite — PASS |
+| Benchmark smoke | `cargo xtask benchmark-smoke` — PASS |
 
-The first firewall attempt at the final benchmark stage exposed a nondeterministic test
-fixture: replacing a random token's final nibble with `0` could leave it unchanged. Commit
-`fbd68e1` changed the fixture to deterministically alter the first nibble; the unchanged
-runtime comparison then passed the focused test and complete firewall. No retry, timeout,
-or production behavior masked the failure.
+The prior evidence snapshot's first firewall attempt exposed a nondeterministic test fixture:
+replacing a random token's final nibble with `0` could leave it unchanged. Commit `fbd68e1`
+changed the fixture to deterministically alter the first nibble; the unchanged runtime comparison
+then passed the focused test and complete firewall. No retry, timeout, or production behavior
+masked the failure.
 
-Pinned Windows advisory compile evidence:
-
-```text
-RUSTC=<rustup 1.91 rustc> rustup run 1.91.0 cargo check --locked \
-  -p rift-identity -p rift-ipc -p rift-daemon \
-  --all-targets --all-features --target x86_64-pc-windows-gnu   PASS
-```
-
-This compiles named-pipe production code and cfg-specific integration tests. Actual named
-pipe execution was not possible on the macOS host and remains evidence expected from the
-advisory Windows CI job. macOS executed the full workspace firewall and real Unix IPC
-suite locally.
-
-No GitHub Actions run exists for this unpushed M4 branch at report time. The CI workflow
-has been extended so macOS and advisory Windows production smoke include `rift-identity`,
-`rift-ipc`, and `rift-daemon`; claiming a hosted result before push would be fabrication.
-PR #3's historical M3 CI result remains documented only in the reconstructed M3 report.
+Run #31 provides hosted macOS and advisory Windows production-crate test evidence, including
+cfg-specific named-pipe coverage. The Windows job remains advisory and does not replace a
+release-platform support decision. macOS also executed the full workspace firewall and real Unix
+IPC suite locally during the original evidence collection.
 
 ## Known limitations and deferred work
 
 - Identity confidentiality is private-filesystem/user-account based, not encrypted or
   keychain/hardware backed.
-- Windows named-pipe behavior is cross-compiled locally but awaits hosted/runtime evidence.
+- Windows named-pipe behavior has hosted advisory compile/test evidence; release-platform support,
+  service integration, and final platform path remain deferred.
 - `riftd` runs in the foreground with explicit data directory; no service manager,
   autostart, daemonization, or final platform path is selected.
 - The runtime persists no peer address and implements no discovery, reconnect, backoff, or
