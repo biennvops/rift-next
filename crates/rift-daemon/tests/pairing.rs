@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, error::Error, io, time::Duration};
 
 use rift_core::{DeviceId, TrustState};
-use rift_daemon::{Daemon, DaemonConfig, DaemonError, DaemonHandle};
+use rift_daemon::{Daemon, DaemonConfig, DaemonError, DaemonHandle, DaemonHandleError};
 use rift_ipc::{
-    ClientMessage, ErrorResponse, Event, IPC_PROTOCOL_VERSION, PairingAttemptId,
+    ClientMessage, ErrorCode, ErrorResponse, Event, IPC_PROTOCOL_VERSION, PairingAttemptId,
     PendingPairingInfo, Request, Response, RuntimeDescriptor, ServerMessage, SessionInfo,
     read_json_frame, write_json_frame,
 };
@@ -643,6 +643,99 @@ async fn revoke_racing_pairing_confirmation_cannot_leave_authorization() -> Test
     })
     .await
     .map_err(|_| "pairing/revocation race test timed out")??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forget_racing_pairing_confirmation_cannot_leave_trust_or_authorization() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let first = RunningDaemon::start(&first_directory, "Forget race A").await?;
+        let second = RunningDaemon::start(&second_directory, "Forget race B").await?;
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        first
+            .handle
+            .begin_pairing(second.handle.endpoint_addr())
+            .await?;
+        let first_pending = first_client.pairing_pending().await?;
+        let second_pending = second_client.pairing_pending().await?;
+
+        let first_confirmation = first_client
+            .send_request(Request::ConfirmPairing {
+                attempt_id: first_pending.attempt_id,
+                accepted: true,
+            })
+            .await?;
+        let forget = first_client
+            .send_request(Request::ForgetPeer {
+                device_id: second.handle.device_id(),
+            })
+            .await?;
+        let second_confirmation = second_client
+            .send_request(Request::ConfirmPairing {
+                attempt_id: second_pending.attempt_id,
+                accepted: true,
+            })
+            .await?;
+
+        assert_eq!(
+            first_client.wait_response(forget).await?,
+            Response::PeerForgotten {
+                device_id: second.handle.device_id(),
+            }
+        );
+        let _first_resolution = first_client.wait_response(first_confirmation).await;
+        let _second_resolution = second_client.wait_response(second_confirmation).await;
+
+        let Response::Peers { page } = first_client
+            .request(Request::ListPeers {
+                after: None,
+                limit: 128,
+            })
+            .await?
+        else {
+            return Err("ListPeers returned the wrong forget-race response".into());
+        };
+        assert!(
+            !page
+                .entries
+                .iter()
+                .any(|peer| peer.device_id == second.handle.device_id())
+        );
+
+        let Response::Sessions { sessions } =
+            first_client.request(Request::ListSessions {}).await?
+        else {
+            return Err("ListSessions returned the wrong forget-race response".into());
+        };
+        assert!(sessions.is_empty());
+        let Response::PendingPairings { pairings } = first_client
+            .request(Request::ListPendingPairings {})
+            .await?
+        else {
+            return Err("ListPendingPairings returned the wrong forget-race response".into());
+        };
+        assert!(pairings.is_empty());
+
+        assert!(matches!(
+            first
+                .handle
+                .connect_authenticated(second.handle.endpoint_addr())
+                .await,
+            Err(DaemonHandleError::Operation(error))
+                if error.code == ErrorCode::PeerNotTrusted
+        ));
+
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|_| "pairing/forget race test timed out")??;
     Ok(())
 }
 

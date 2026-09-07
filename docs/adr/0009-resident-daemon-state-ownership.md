@@ -38,7 +38,9 @@ not leave the transport/session boundary.
 
 Durable revoke or forget commits before live authorization changes. On success the daemon
 cancels matching pending pairings and closes every matching active session before returning
-to local control. Session loss removes only runtime state; it does not mutate durable trust.
+to local control. Pending pairing trust commits are fenced by a per-peer in-memory generation,
+so a pairing that was already resolving cannot recreate Trusted after a successful forget. Session
+loss removes only runtime state; it does not mutate durable trust.
 
 ## Consequences
 

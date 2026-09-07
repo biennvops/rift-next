@@ -140,11 +140,14 @@ durably append/sync Revoked
     -> return success
 ```
 
-Forget uses the same live invalidation after durably removing the decision. Fresh admission
-then treats the peer as unknown/pairable. The trust journal remains authoritative in a
-confirm/revoke race: revoke-before-trust makes `TrustStore::trust` fail, while
-trust-before-revoke is overwritten by the later durable revoke; session registration
-rechecks durable trust before accepting the result.
+Forget uses the same live invalidation after durably removing the decision. A pending pairing
+captures a per-peer in-memory trust generation before it waits for confirmation. Forget advances
+that generation while holding the trust-store mutation lock, so a pre-existing pairing can either
+commit before the forget (and then be durably removed) or fail its stale-generation check; it
+cannot recreate Trusted after ForgetPeer returns. Fresh admission then treats the peer as
+unknown/pairable. The trust journal remains authoritative in a confirm/revoke race:
+revoke-before-trust makes `TrustStore::trust` fail, while trust-before-revoke is overwritten by the
+later durable revoke; session registration rechecks durable trust before accepting the result.
 
 ## Shutdown
 

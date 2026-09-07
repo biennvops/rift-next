@@ -235,9 +235,12 @@ without a pairing event. Natural connection closure removes only runtime session
 There is no persisted address or reconnect loop.
 
 Revoke and forget first durably mutate the journal, then cancel matching pairings, close
-matching sessions, emit events, and return. Session registration rechecks durable trust.
-The confirmation/revoke race test permits either operation ordering but requires the final
-journal state to be Revoked and no authorized session/pending pairing to survive.
+matching sessions, emit events, and return. Session registration rechecks durable trust. A
+pending pairing captures a per-peer in-memory generation; Forget advances that generation under
+the trust-store mutation lock, preventing an already-resolving pairing from recreating Trusted
+after `ForgetPeer` returns. The confirm/forget race test requires the final local state to be
+Unknown, with no authorized session or pending pairing, and a fresh authenticated dial to remain
+pairing-only.
 
 Forget returns the peer to unknown, closes current sessions, makes authenticated dial
 pairing-only, and permits a fresh attended pairing after both peers forget. Active global
@@ -274,6 +277,7 @@ and per-peer overflow rejects a new session while preserving the existing one.
 - restart with stable identities/trust and direct authorized reconnect without pairing;
 - live durable revoke, session close, and blocked fresh admission;
 - pairing-confirmation/revoke race final invariant;
+- pairing-confirmation/forget race final Unknown state, cleanup, and pairing-only admission;
 - pending expiry and slot release;
 - pending capacity; and
 - global/per-peer active-session bounds without eviction.

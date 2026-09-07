@@ -141,6 +141,9 @@ pub enum TrustStoreError {
     /// A revoked identity cannot be trusted until it is explicitly forgotten.
     #[error("revoked peer {0} must be forgotten before it can be trusted again")]
     RevokedIdentity(DeviceId),
+    /// A durable trust commit was superseded by a forget operation.
+    #[error("pairing trust commit was superseded by forgetting peer")]
+    StaleTrustAttempt,
     /// A prior persistence failure poisoned this store instance.
     #[error("trust store is poisoned by a prior persistence failure")]
     StorePoisoned,
@@ -173,6 +176,8 @@ struct StoreInner {
     decisions: BTreeMap<DeviceId, StoredDecision>,
     file_len: usize,
     record_count: usize,
+    /// Ephemeral pairing generations, keyed by peer and not persisted in the journal.
+    generations: BTreeMap<DeviceId, u64>,
     poisoned: bool,
     #[cfg(test)]
     fail_next_persist: Option<PersistFailure>,
@@ -232,6 +237,18 @@ impl TrustStore {
         self.entry(device_id).await.map(|entry| entry.state())
     }
 
+    /// Returns the current in-memory generation used to fence pairing attempts for a peer.
+    ///
+    /// Generations are reset when the store is reopened and are not persisted.
+    pub async fn current_generation(&self, device_id: DeviceId) -> u64 {
+        self.inner
+            .lock()
+            .await
+            .generations
+            .get(&device_id)
+            .copied()
+            .unwrap_or(0)
+    }
     /// Returns trusted metadata only when the current state is trusted.
     pub async fn peer(&self, device_id: DeviceId) -> Option<TrustedPeer> {
         match self.entry(device_id).await {
@@ -296,19 +313,32 @@ impl TrustStore {
     /// Durably trusts a peer before making the decision visible in memory.
     pub async fn trust(&self, peer: TrustedPeer) -> Result<(), TrustStoreError> {
         validate_peer(&peer)?;
-        self.commit(TrustMutation::Trust { peer }).await
+        self.commit(TrustMutation::Trust { peer }, None).await
+    }
+
+    /// Durably trusts a peer only if no successful forget has advanced `generation`.
+    pub async fn trust_if_generation(
+        &self,
+        peer: TrustedPeer,
+        generation: u64,
+    ) -> Result<(), TrustStoreError> {
+        validate_peer(&peer)?;
+        let device_id = peer.device_id;
+        self.commit(TrustMutation::Trust { peer }, Some((device_id, generation)))
+            .await
     }
 
     /// Durably revokes an identity. Revoking unknown or revoked peers is allowed.
     pub async fn revoke(&self, device_id: DeviceId) -> Result<(), TrustStoreError> {
-        self.commit(TrustMutation::Revoke { device_id }).await?;
+        self.commit(TrustMutation::Revoke { device_id }, None)
+            .await?;
         info!(remote_device_id = %device_id, "peer_revoked");
         Ok(())
     }
 
     /// Removes any durable trust/revocation decision, making the identity unknown.
     pub async fn forget(&self, device_id: DeviceId) -> Result<(), TrustStoreError> {
-        self.commit(TrustMutation::Forget { device_id }).await
+        self.commit(TrustMutation::Forget { device_id }, None).await
     }
 
     async fn open_existing(path: PathBuf) -> Result<Self, TrustStoreError> {
@@ -384,6 +414,7 @@ impl TrustStore {
                 decisions,
                 file_len,
                 record_count,
+                generations: BTreeMap::new(),
                 poisoned: false,
                 #[cfg(test)]
                 fail_next_persist: None,
@@ -391,7 +422,11 @@ impl TrustStore {
         }
     }
 
-    async fn commit(&self, mutation: TrustMutation) -> Result<(), TrustStoreError> {
+    async fn commit(
+        &self,
+        mutation: TrustMutation,
+        expected_generation: Option<(DeviceId, u64)>,
+    ) -> Result<(), TrustStoreError> {
         validate_mutation(&mutation)?;
         let payload = postcard::to_stdvec(&mutation).map_err(TrustStoreError::Encode)?;
         if payload.len() > MAX_RECORD_LEN {
@@ -406,6 +441,11 @@ impl TrustStore {
         let mut inner = self.inner.lock().await;
         if inner.poisoned {
             return Err(TrustStoreError::StorePoisoned);
+        }
+        if let Some((device_id, expected_generation)) = expected_generation
+            && inner.generations.get(&device_id).copied().unwrap_or(0) != expected_generation
+        {
+            return Err(TrustStoreError::StaleTrustAttempt);
         }
         validate_transition(&inner.decisions, &mutation)?;
         if inner.record_count >= MAX_RECORDS {
@@ -441,6 +481,10 @@ impl TrustStore {
         }
 
         apply_mutation(&mut inner.decisions, &mutation);
+        if let TrustMutation::Forget { device_id } = &mutation {
+            let generation = inner.generations.entry(*device_id).or_default();
+            *generation = generation.saturating_add(1);
+        }
         inner.file_len = next_len;
         inner.record_count += 1;
         Ok(())
@@ -1012,6 +1056,32 @@ mod tests {
         store.forget(device_id(1)).await?;
         store.trust(peer(1, "allowed after forget")).await?;
         assert_eq!(store.state(device_id(1)).await, Some(TrustState::Trusted));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_supersedes_pairing_trust_from_an_older_generation() -> TestResult {
+        let directory = TempDir::new()?;
+        let store = TrustStore::open(store_path(&directory)).await?;
+        let trusted = peer(1, "stale pairing");
+        let generation = store.current_generation(trusted.device_id).await;
+
+        store.forget(trusted.device_id).await?;
+        assert_ne!(
+            store.current_generation(trusted.device_id).await,
+            generation
+        );
+        assert!(matches!(
+            store.trust_if_generation(trusted.clone(), generation).await,
+            Err(TrustStoreError::StaleTrustAttempt)
+        ));
+        assert_eq!(store.state(trusted.device_id).await, None);
+
+        let current_generation = store.current_generation(trusted.device_id).await;
+        store
+            .trust_if_generation(trusted.clone(), current_generation)
+            .await?;
+        assert_eq!(store.peer(trusted.device_id).await, Some(trusted));
         Ok(())
     }
 

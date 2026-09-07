@@ -51,7 +51,9 @@ them.
 27. Verification codes leave the daemon only through authenticated local IPC. Secret key
     bytes, pairing nonces/commitments, network pairing IDs, and raw Iroh objects do not.
 28. Durable revoke/forget completes before the daemon invalidates matching pending pairings
-    and active sessions or reports success. Session registration rechecks durable trust.
+    and active sessions or reports success. A pending pairing captures a per-peer in-memory
+    generation; a successful forget advances it under the trust-store mutation lock, so an
+    older pairing cannot subsequently commit Trusted.
 29. The resident supervisor owns, cancels, and joins every network, pairing, session, and
     IPC task under a bounded shutdown deadline.
 

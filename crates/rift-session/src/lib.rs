@@ -365,6 +365,7 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
+        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
@@ -373,6 +374,7 @@ impl PairableConnection {
             code,
             machine,
             self.pairing_timeout,
+            trust_generation,
         ))
     }
 
@@ -465,6 +467,7 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
+        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
@@ -473,6 +476,7 @@ impl PairableConnection {
             code,
             machine,
             self.pairing_timeout,
+            trust_generation,
         ))
     }
 
@@ -504,6 +508,7 @@ pub struct PendingPairing {
     machine: PairingStateMachine,
     pairing_timeout: Duration,
     local_confirmation_deadline: Instant,
+    trust_generation: u64,
 }
 
 impl PendingPairing {
@@ -515,6 +520,7 @@ impl PendingPairing {
         code: PairingCode,
         machine: PairingStateMachine,
         pairing_timeout: Duration,
+        trust_generation: u64,
     ) -> Self {
         Self {
             connection: Some(connection),
@@ -525,6 +531,7 @@ impl PendingPairing {
             machine,
             pairing_timeout,
             local_confirmation_deadline: Instant::now() + pairing_timeout,
+            trust_generation,
         }
     }
 
@@ -624,7 +631,11 @@ impl PendingPairing {
             });
         }
 
-        if let Err(error) = self.trust_store.trust(self.peer.clone()).await {
+        if let Err(error) = self
+            .trust_store
+            .trust_if_generation(self.peer.clone(), self.trust_generation)
+            .await
+        {
             self.machine.fail();
             connection.close();
             warn!(
