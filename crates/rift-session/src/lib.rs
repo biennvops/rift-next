@@ -370,11 +370,13 @@ impl PairableConnection {
             self.connection,
             self.trust_store,
             peer,
-            material.pairing_id,
-            code,
-            machine,
-            self.pairing_timeout,
-            trust_generation,
+            PendingPairingContext {
+                pairing_id: material.pairing_id,
+                code,
+                machine,
+                pairing_timeout: self.pairing_timeout,
+                trust_generation,
+            },
         ))
     }
 
@@ -472,11 +474,13 @@ impl PairableConnection {
             self.connection,
             self.trust_store,
             peer,
-            pairing_id,
-            code,
-            machine,
-            self.pairing_timeout,
-            trust_generation,
+            PendingPairingContext {
+                pairing_id,
+                code,
+                machine,
+                pairing_timeout: self.pairing_timeout,
+                trust_generation,
+            },
         ))
     }
 
@@ -493,6 +497,15 @@ impl PairableConnection {
             Err(PairingError::PairingUnsupported(self.remote_device_id()))
         }
     }
+}
+
+/// Ephemeral pairing state carried into local confirmation.
+struct PendingPairingContext {
+    pairing_id: [u8; PAIRING_ID_LEN],
+    code: PairingCode,
+    machine: PairingStateMachine,
+    pairing_timeout: Duration,
+    trust_generation: u64,
 }
 
 /// A pairing transcript ready for explicit local human confirmation.
@@ -516,22 +529,18 @@ impl PendingPairing {
         connection: BootstrappedConnection,
         trust_store: Arc<TrustStore>,
         peer: TrustedPeer,
-        pairing_id: [u8; PAIRING_ID_LEN],
-        code: PairingCode,
-        machine: PairingStateMachine,
-        pairing_timeout: Duration,
-        trust_generation: u64,
+        context: PendingPairingContext,
     ) -> Self {
         Self {
             connection: Some(connection),
             trust_store,
             peer,
-            pairing_id,
-            code,
-            machine,
-            pairing_timeout,
-            local_confirmation_deadline: Instant::now() + pairing_timeout,
-            trust_generation,
+            pairing_id: context.pairing_id,
+            code: context.code,
+            machine: context.machine,
+            pairing_timeout: context.pairing_timeout,
+            local_confirmation_deadline: Instant::now() + context.pairing_timeout,
+            trust_generation: context.trust_generation,
         }
     }
 
