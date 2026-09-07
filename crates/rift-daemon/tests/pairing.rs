@@ -499,8 +499,8 @@ async fn pending_pairings_expire_and_release_registry_slots() -> TestResult {
         let second_directory = TempDir::new()?;
         let mut first_config = test_config(&first_directory, "Expiry A");
         let mut second_config = test_config(&second_directory, "Expiry B");
-        first_config.pairing_timeout = Duration::from_secs(1);
-        second_config.pairing_timeout = Duration::from_secs(1);
+        first_config.pairing_timeout = Duration::from_secs(2);
+        second_config.pairing_timeout = Duration::from_secs(30);
         first_config.max_pending_pairings = 1;
         second_config.max_pending_pairings = 1;
         let first = RunningDaemon::spawn(Daemon::start(first_config).await?);
@@ -538,15 +538,21 @@ async fn pending_pairings_expire_and_release_registry_slots() -> TestResult {
             second_client
                 .pairing_resolved(second_pending.attempt_id)
                 .await?,
-            rift_ipc::PairingOutcome::Expired
+            rift_ipc::PairingOutcome::Failed
         );
+        let replacement_attempt = first
+            .handle
+            .begin_pairing(second.handle.endpoint_addr())
+            .await?;
+        assert_ne!(replacement_attempt, first_pending.attempt_id);
         let Response::PendingPairings { pairings } = first_client
             .request(Request::ListPendingPairings {})
             .await?
         else {
-            return Err("ListPendingPairings returned the wrong expiry response".into());
+            return Err("ListPendingPairings returned the wrong replacement response".into());
         };
-        assert!(pairings.is_empty());
+        assert_eq!(pairings.len(), 1);
+        assert_eq!(pairings[0].attempt_id, replacement_attempt);
 
         drop(first_client);
         drop(second_client);
