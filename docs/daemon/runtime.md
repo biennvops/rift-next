@@ -106,6 +106,7 @@ Default limits are:
 | Shared outbound setup tasks | 8 | 64 |
 | Managed trusted peers | 4096 | 4096 |
 | Coalesced waiters per outbound peer | 16 | 16 |
+| Total owned tasks (including unjoined results) | 1024 | 1024 |
 | Pending pairing confirmations | 8 | 64 |
 | Local IPC clients | 8 | 64 |
 
@@ -221,6 +222,8 @@ is created per peer. Connecting includes Iroh lookup as well as connection estab
 Each manual/automatic outbound setup consumes the shared bound until its result is
 joined, including cancelled tasks. Concurrent Session requests coalesce with at most
 16 waiting replies. Excess manual requests fail CapacityExceeded, not queued retries.
+A total 1,024-task ceiling also bounds cancelled/finished work awaiting join; session
+and pending-pairing registration reserve one slot for incoming-worker replacement.
 
 Automatic starts are spaced by at least 100 ms. Equal-jitter backoff is 50–100% of a
 1-second initial exponential ceiling, doubling to 60 seconds. A connected interval of

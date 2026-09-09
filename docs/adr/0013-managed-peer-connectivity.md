@@ -47,7 +47,9 @@ dials coalesce by peer, retaining at most 16 waiting replies per active dial. Ex
 manual requests receive CapacityExceeded, never an unbounded pending queue. Each
 setup has a unique runtime token and cancellation watch. Cancelled work continues
 occupying capacity until its joined result is consumed, preventing cancellation churn
-from bypassing bounds. Replacement/invalidation cannot register a stale result.
+from bypassing bounds. A 1,024-task overall ceiling includes unjoined results, with
+one slot reserved during registry insertion for incoming-worker replacement.
+Replacement/invalidation cannot register a stale result.
 
 DisconnectSession suspends local automatic outbound until ConnectPeer. Inbound
 trusted sessions remain allowed and do not clear that suspension. ConnectPeer resumes

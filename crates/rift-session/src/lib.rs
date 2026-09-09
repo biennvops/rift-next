@@ -2,8 +2,9 @@
 //!
 //! A bootstrapped connection is authenticated but not authorized. This crate is the
 //! only production layer that combines a concrete [`BootstrappedConnection`] with
-//! local trust policy. Unknown peers receive a pairing-only wrapper; revoked peers
-//! are rejected; trusted peers receive [`AuthorizedConnection`].
+//! local trust policy and the explicit connection purpose. Unknown + Pairing receives
+//! a pairing-only wrapper; Trusted + AuthorizedSession receives [`AuthorizedConnection`];
+//! every other combination is rejected without an automatic pairing fallback.
 
 use std::{fmt, sync::Arc, time::Duration};
 

@@ -60,6 +60,7 @@ const HARD_MAX_ACTIVE_SESSIONS: usize = 128;
 pub const DEFAULT_MAX_OUTBOUND_CONNECTS: usize = 8;
 const HARD_MAX_OUTBOUND_CONNECTS: usize = 64;
 const MAX_DIAL_WAITERS: usize = 16;
+const HARD_MAX_OWNED_TASKS: usize = 1024;
 const HARD_MAX_PENDING_PAIRINGS: usize = 64;
 const HARD_MAX_IPC_CLIENTS: usize = 64;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -551,7 +552,7 @@ impl Daemon {
                         self.spawn_outbound(device_id, false, None).await;
                     }
                 }
-                accepted = self.listener.accept(), if self.ipc_clients < self.config.max_ipc_clients => {
+                accepted = self.listener.accept(), if self.ipc_clients < self.config.max_ipc_clients && self.tasks.len() < HARD_MAX_OWNED_TASKS => {
                     match accepted {
                         Ok(stream) => self.spawn_ipc_client(stream),
                         Err(source) => {
@@ -820,7 +821,9 @@ impl Daemon {
             }
             return Ok(None);
         }
-        if self.outbound.len() >= self.config.max_outbound_connects {
+        if self.outbound.len() >= self.config.max_outbound_connects
+            || self.tasks.len() >= HARD_MAX_OWNED_TASKS
+        {
             return Err(operation_error(
                 ErrorCode::CapacityExceeded,
                 "outbound setup capacity reached",
@@ -1310,7 +1313,9 @@ impl Daemon {
                 "pairing setup was invalidated before registration",
             ));
         }
-        if self.pending_pairings.len() >= self.config.max_pending_pairings {
+        if self.pending_pairings.len() >= self.config.max_pending_pairings
+            || self.tasks.len() >= HARD_MAX_OWNED_TASKS - 1
+        {
             if let Some(handle) = pending.disposable_handle() {
                 handle.close();
             }
@@ -1407,6 +1412,14 @@ impl Daemon {
             return Err(operation_error(
                 ErrorCode::CapacityExceeded,
                 "active session capacity reached",
+            ));
+        }
+        // Keep one slot for the incoming worker respawn after this candidate result.
+        if self.tasks.len() >= HARD_MAX_OWNED_TASKS - 1 {
+            connection.close();
+            return Err(operation_error(
+                ErrorCode::CapacityExceeded,
+                "owned task capacity reached",
             ));
         }
         let session_id = SessionId(self.allocate_session_id()?);
@@ -2626,6 +2639,45 @@ mod tests {
         assert_eq!(a.trust_store.state(b.device_id).await, None);
         drop(incoming);
         a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unjoined_task_results_cannot_bypass_the_owned_work_bound() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&b, a.device_id).await?;
+        let (candidate, remote) = test_candidate_pair(&a, &b).await?;
+        for _ in 0..HARD_MAX_OWNED_TASKS - 1 {
+            let mut shutdown = a.shutdown.subscribe();
+            a.tasks.spawn(async move {
+                let _changed = shutdown.changed().await;
+                TaskOutput::IpcClient(Ok(()))
+            });
+        }
+        let ConnectionCandidate::Authorized(candidate) = candidate else {
+            return Err("not authorized".into());
+        };
+        assert!(
+            matches!(a.register_session(candidate, SessionOrigin::Outbound).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        let mut shutdown = a.shutdown.subscribe();
+        a.tasks.spawn(async move {
+            let _changed = shutdown.changed().await;
+            TaskOutput::IpcClient(Ok(()))
+        });
+        assert!(
+            matches!(a.start_outbound(b.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        assert_eq!(a.tasks.len(), HARD_MAX_OWNED_TASKS);
+        assert!(a.sessions.is_empty());
+        drop(remote);
+        a.shutdown_runtime().await?;
+        assert!(a.tasks.is_empty());
         b.shutdown_runtime().await?;
         Ok(())
     }
