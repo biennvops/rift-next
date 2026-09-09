@@ -104,6 +104,42 @@
       },
       "postcard_payload_hex": "07000102030405060708090a0b0c0d0e0f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
       "frame_hex": "0000003107000102030405060708090a0b0c0d0e0f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f"
+    },
+    {
+      "name": "intent-session",
+      "message": {
+        "type": "connection_intent",
+        "purpose": "AuthorizedSession"
+      },
+      "postcard_payload_hex": "0800",
+      "frame_hex": "000000020800"
+    },
+    {
+      "name": "intent-pairing",
+      "message": {
+        "type": "connection_intent",
+        "purpose": "Pairing"
+      },
+      "postcard_payload_hex": "0801",
+      "frame_hex": "000000020801"
+    },
+    {
+      "name": "intent-accepted",
+      "message": {
+        "type": "connection_intent_result",
+        "accepted": true
+      },
+      "postcard_payload_hex": "0901",
+      "frame_hex": "000000020901"
+    },
+    {
+      "name": "intent-rejected",
+      "message": {
+        "type": "connection_intent_result",
+        "accepted": false
+      },
+      "postcard_payload_hex": "0900",
+      "frame_hex": "000000020900"
     }
   ],
   "pairing_code_vectors": [

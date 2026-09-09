@@ -24,8 +24,8 @@ use rift_ipc::{
     RuntimeDescriptor, RuntimeState, SessionCloseReason, SessionId, SessionInfo, Status,
 };
 use rift_session::{
-    AuthorizedConnection, PairingError, PendingPairing, SessionAdmission, SessionConfig,
-    SessionError, SessionManager, pairing_metadata,
+    AuthorizedConnection, ConnectionPurpose, PairingError, PendingPairing, SessionAdmission,
+    SessionConfig, SessionError, SessionManager, pairing_metadata,
 };
 use rift_transport_iroh::{
     AddressLookupConfiguration, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT,
@@ -1307,7 +1307,11 @@ async fn accept_incoming(
         .accept_and_bootstrap(metadata)
         .await
         .map_err(connection_error)?;
-    match manager.admit(bootstrapped).await.map_err(session_error)? {
+    match manager
+        .accept_inbound(bootstrapped)
+        .await
+        .map_err(session_error)?
+    {
         SessionAdmission::Authorized(connection) => Ok(ConnectionCandidate::Authorized(connection)),
         SessionAdmission::Pairable(pairable) => {
             let permit = pending_slots.try_acquire_owned().map_err(|_| {
@@ -1341,7 +1345,18 @@ async fn prepare_outbound(
         .connect_and_bootstrap(peer, metadata)
         .await
         .map_err(connection_error)?;
-    match manager.admit(bootstrapped).await.map_err(session_error)? {
+    match manager
+        .prepare_outbound(
+            bootstrapped,
+            if pairing {
+                ConnectionPurpose::Pairing
+            } else {
+                ConnectionPurpose::AuthorizedSession
+            },
+        )
+        .await
+        .map_err(session_error)?
+    {
         SessionAdmission::Authorized(connection) => Ok(ConnectionCandidate::Authorized(connection)),
         SessionAdmission::Pairable(pairable) if pairing => {
             let permit = pending_slots.try_acquire_owned().map_err(|_| {
@@ -1531,6 +1546,11 @@ fn random_hex(byte_len: usize) -> Result<String, DaemonError> {
 
 fn session_error(error: SessionError) -> ErrorResponse {
     match error {
+        SessionError::Intent(error) => connection_error(error),
+        SessionError::PurposeNotAllowed { .. } => operation_error(
+            ErrorCode::PeerNotTrusted,
+            "requested connection purpose is not allowed",
+        ),
         SessionError::PeerRevoked(_) => {
             operation_error(ErrorCode::PeerNotTrusted, "peer is durably revoked")
         }

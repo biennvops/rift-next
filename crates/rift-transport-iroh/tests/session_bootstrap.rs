@@ -613,3 +613,83 @@ async fn hint_path_capacity_and_self_dial_fail_before_network_work() -> TestResu
     close_pair(&client, &server).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn intent_rejects_premature_control_and_poisoned_retry() -> TestResult {
+    let messages = [
+        ControlMessage::Ping { nonce: 1 },
+        ControlMessage::ConnectionIntentResult { accepted: true },
+        ControlMessage::PairingRequest {
+            pairing_id: [1; PAIRING_ID_LEN],
+            commitment: PairingCommitment::from_bytes([2; PAIRING_COMMITMENT_LEN]),
+        },
+    ];
+    for message in messages {
+        let (client, server) = bind_pair().await?;
+        let incoming = async {
+            let mut connection = server
+                .accept_and_bootstrap(metadata("server", "test"))
+                .await?;
+            let result = connection.receive_intent().await;
+            assert!(
+                matches!(result, Err(TransportError::UnexpectedIntentMessage { expected: MessageKind::ConnectionIntent, received }) if received == message.kind())
+            );
+            assert!(matches!(
+                connection.receive_intent().await,
+                Err(TransportError::ControlConnectionPoisoned)
+            ));
+            Ok::<_, TransportError>(())
+        };
+        let outgoing = async {
+            let connection = client.connect(server.local_addr()).await?;
+            let mut control = connection.open_control().await?;
+            exchange_hello_with_timeout(
+                &mut control,
+                client.device_id(),
+                &metadata("client", "test"),
+                server.device_id(),
+                TEST_HANDSHAKE_TIMEOUT,
+            )
+            .await?;
+            write_message(&mut control.send, &message).await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(connection)
+        };
+        let (incoming, outgoing) = tokio::join!(incoming, outgoing);
+        incoming?;
+        outgoing?.close();
+        close_pair(&client, &server).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn intent_result_timeout_and_duplicate_local_gate_operations_poison() -> TestResult {
+    use rift_protocol::ConnectionPurpose;
+    let (client, server) = bind_pair().await?;
+    let (outgoing, incoming) = tokio::join!(
+        client.connect_and_bootstrap(server.local_addr(), metadata("client", "test")),
+        server.accept_and_bootstrap(metadata("server", "test")),
+    );
+    let mut outgoing = outgoing?;
+    let mut incoming = incoming?;
+    let (requested, received) = tokio::join!(
+        outgoing.request_intent(ConnectionPurpose::Pairing),
+        incoming.receive_intent()
+    );
+    assert_eq!(received?, ConnectionPurpose::Pairing);
+    assert!(matches!(requested, Err(TransportError::ControlTimeout)));
+    assert!(matches!(
+        outgoing.request_intent(ConnectionPurpose::Pairing).await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
+    assert!(matches!(
+        incoming.receive_intent().await,
+        Err(TransportError::IntentSequence)
+    ));
+    assert!(matches!(
+        incoming.send_intent_result(true).await,
+        Err(TransportError::ControlConnectionPoisoned)
+    ));
+    close_pair(&client, &server).await;
+    Ok(())
+}

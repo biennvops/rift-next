@@ -382,6 +382,15 @@ impl fmt::Display for PairingCode {
     }
 }
 
+/// Explicit purpose selected by the dialer after Hello; never inferred from trust.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ConnectionPurpose {
+    /// Request application authorization from existing durable trust.
+    AuthorizedSession,
+    /// Request attended pairing with an unknown peer.
+    Pairing,
+}
+
 /// The production control message set for v1.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ControlMessage {
@@ -424,6 +433,10 @@ pub enum ControlMessage {
         /// The sender's previously committed nonce.
         nonce: [u8; PAIRING_NONCE_LEN],
     },
+    /// Selects the purpose of this disposable connection after Hello.
+    ConnectionIntent { purpose: ConnectionPurpose },
+    /// Coarse admission result; never carries the remote trust database reason.
+    ConnectionIntentResult { accepted: bool },
 }
 
 impl ControlMessage {
@@ -438,6 +451,8 @@ impl ControlMessage {
             Self::PairingDecision { .. } => MessageKind::PairingDecision,
             Self::PairingComplete { .. } => MessageKind::PairingComplete,
             Self::PairingReveal { .. } => MessageKind::PairingReveal,
+            Self::ConnectionIntent { .. } => MessageKind::ConnectionIntent,
+            Self::ConnectionIntentResult { .. } => MessageKind::ConnectionIntentResult,
         }
     }
 
@@ -576,6 +591,10 @@ pub enum MessageKind {
     PairingComplete,
     /// A pairing nonce reveal.
     PairingReveal,
+    /// A connection purpose request.
+    ConnectionIntent,
+    /// A coarse connection purpose result.
+    ConnectionIntentResult,
 }
 
 impl fmt::Display for MessageKind {
@@ -589,6 +608,8 @@ impl fmt::Display for MessageKind {
             Self::PairingDecision => "PairingDecision",
             Self::PairingComplete => "PairingComplete",
             Self::PairingReveal => "PairingReveal",
+            Self::ConnectionIntent => "ConnectionIntent",
+            Self::ConnectionIntentResult => "ConnectionIntentResult",
         };
         formatter.write_str(name)
     }
@@ -1142,6 +1163,12 @@ mod tests {
             pairing_id_hex: String,
             nonce_hex: String,
         },
+        ConnectionIntent {
+            purpose: ConnectionPurpose,
+        },
+        ConnectionIntentResult {
+            accepted: bool,
+        },
     }
 
     fn vector_bytes<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], String> {
@@ -1175,6 +1202,12 @@ mod tests {
                     platform: metadata.platform,
                     capabilities: metadata.capabilities,
                 })
+            }
+            VectorMessage::ConnectionIntent { purpose } => {
+                ControlMessage::ConnectionIntent { purpose }
+            }
+            VectorMessage::ConnectionIntentResult { accepted } => {
+                ControlMessage::ConnectionIntentResult { accepted }
             }
             VectorMessage::Ping { nonce } => ControlMessage::Ping { nonce },
             VectorMessage::Pong { nonce } => ControlMessage::Pong { nonce },
@@ -1211,6 +1244,18 @@ mod tests {
             },
         };
         Ok(message)
+    }
+
+    #[test]
+    fn malformed_intent_payloads_are_rejected() {
+        for payload in [&[8][..], &[8, 2], &[9], &[9, 2], &[8, 0, 0], &[10, 0]] {
+            let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(payload);
+            assert!(
+                decode_message(&frame).is_err(),
+                "accepted malformed intent {payload:?}"
+            );
+        }
     }
 
     #[test]

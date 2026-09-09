@@ -21,8 +21,9 @@ use iroh::{Endpoint, RelayMode};
 pub use iroh::{EndpointAddr, RelayUrl, SecretKey, TransportAddr};
 use rift_core::DeviceId;
 use rift_protocol::{
-    ControlChannel, ControlError, ControlMessage, FrameError, HandshakeError, Hello, HelloMetadata,
-    MessageKind, PROTOCOL_VERSION, PairingMessage, exchange_hello_with_timeout,
+    ConnectionPurpose, ControlChannel, ControlError, ControlMessage, FrameError, HandshakeError,
+    Hello, HelloMetadata, MessageKind, PROTOCOL_VERSION, PairingMessage,
+    exchange_hello_with_timeout,
 };
 use thiserror::Error;
 use tokio::time;
@@ -136,6 +137,21 @@ impl EndpointConfig {
 /// Errors from endpoint, connection, stream, and production bootstrap operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// The peer rejected the requested purpose without disclosing trust state.
+    #[error("remote connection purpose rejected")]
+    IntentRejected,
+    /// Purpose framing failed.
+    #[error("connection intent framing failed: {0}")]
+    IntentFrame(#[source] FrameError),
+    /// A message is not legal during purpose negotiation.
+    #[error("expected {expected} during connection intent, received {received}")]
+    UnexpectedIntentMessage {
+        expected: MessageKind,
+        received: MessageKind,
+    },
+    /// An intent operation was repeated or invoked out of sequence.
+    #[error("connection intent operation is out of sequence")]
+    IntentSequence,
     /// The public bytes cannot represent an Iroh endpoint identity.
     #[error("invalid peer device identity")]
     InvalidDeviceId,
@@ -519,6 +535,7 @@ impl RiftEndpoint {
             local_device_id: self.device_id,
             peer_hello,
             control_timeout: self.config.handshake_timeout,
+            intent_phase: IntentPhase::Fresh,
         })
     }
 }
@@ -615,6 +632,13 @@ impl DisposableConnectionHandle {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IntentPhase {
+    Fresh,
+    AwaitingDecision,
+    Finished,
+}
+
 /// A successfully Hello-bootstrapped, still-disposable Rift connection.
 pub struct BootstrappedConnection {
     connection: Connection,
@@ -622,6 +646,13 @@ pub struct BootstrappedConnection {
     local_device_id: DeviceId,
     peer_hello: Hello,
     control_timeout: Duration,
+    intent_phase: IntentPhase,
+}
+
+impl Drop for BootstrappedConnection {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl fmt::Debug for BootstrappedConnection {
@@ -659,6 +690,119 @@ impl BootstrappedConnection {
     /// Waits until this disposable connection terminates.
     pub async fn closed(&self) {
         let _closed_reason = self.connection.closed().await;
+    }
+
+    /// Dialer gate: sends exactly one purpose and requires the matching coarse result.
+    pub async fn request_intent(
+        &mut self,
+        purpose: ConnectionPurpose,
+    ) -> Result<(), TransportError> {
+        self.require_intent_phase(IntentPhase::Fresh)?;
+        self.intent_phase = IntentPhase::Finished;
+        self.write_intent(ControlMessage::ConnectionIntent { purpose })
+            .await?;
+        match self.read_intent().await? {
+            ControlMessage::ConnectionIntentResult { accepted: true } => Ok(()),
+            ControlMessage::ConnectionIntentResult { accepted: false } => {
+                self.poison();
+                Err(TransportError::IntentRejected)
+            }
+            message => {
+                self.poison();
+                Err(TransportError::UnexpectedIntentMessage {
+                    expected: MessageKind::ConnectionIntentResult,
+                    received: message.kind(),
+                })
+            }
+        }
+    }
+
+    /// Acceptor gate: reads the purpose before the session layer applies trust policy.
+    pub async fn receive_intent(&mut self) -> Result<ConnectionPurpose, TransportError> {
+        self.require_intent_phase(IntentPhase::Fresh)?;
+        self.intent_phase = IntentPhase::AwaitingDecision;
+        match self.read_intent().await? {
+            ControlMessage::ConnectionIntent { purpose } => Ok(purpose),
+            message => {
+                self.poison();
+                Err(TransportError::UnexpectedIntentMessage {
+                    expected: MessageKind::ConnectionIntent,
+                    received: message.kind(),
+                })
+            }
+        }
+    }
+
+    /// Sends a coarse result. Rejection closes after bounded delivery, not a retry.
+    pub async fn send_intent_result(&mut self, accepted: bool) -> Result<(), TransportError> {
+        self.require_intent_phase(IntentPhase::AwaitingDecision)?;
+        self.intent_phase = IntentPhase::Finished;
+        self.write_intent(ControlMessage::ConnectionIntentResult { accepted })
+            .await?;
+        if !accepted {
+            // Immediate QUIC close could discard the result and disguise policy rejection
+            // as a retryable network failure. The rejected dialer closes on receipt.
+            let _closed = time::timeout(self.control_timeout, self.connection.closed()).await;
+            self.poison();
+        }
+        Ok(())
+    }
+
+    fn require_intent_phase(&mut self, phase: IntentPhase) -> Result<(), TransportError> {
+        if self.control.is_none() {
+            return Err(TransportError::ControlConnectionPoisoned);
+        }
+        if self.intent_phase != phase {
+            self.poison();
+            return Err(TransportError::IntentSequence);
+        }
+        Ok(())
+    }
+
+    async fn write_intent(&mut self, message: ControlMessage) -> Result<(), TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        match time::timeout(
+            self.control_timeout,
+            rift_protocol::write_message(&mut control.send, &message),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::IntentFrame(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    async fn read_intent(&mut self) -> Result<ControlMessage, TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        match time::timeout(
+            self.control_timeout,
+            rift_protocol::read_message(&mut control.recv),
+        )
+        .await
+        {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::IntentFrame(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
     }
 
     /// Sends a Ping and waits for the matching Pong before the control deadline.

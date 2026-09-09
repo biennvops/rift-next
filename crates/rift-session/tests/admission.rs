@@ -6,8 +6,9 @@ use rift_protocol::{
     PairingCommitmentRole, PairingMessage,
 };
 use rift_session::{
-    InitiatorPairingMaterial, PairingError, PairingPhase, ResponderPairingMaterial,
-    SessionAdmission, SessionConfig, SessionError, SessionManager, pairing_metadata,
+    ConnectionPurpose, InitiatorPairingMaterial, PairingError, PairingPhase,
+    ResponderPairingMaterial, SessionAdmission, SessionConfig, SessionError, SessionManager,
+    pairing_metadata,
 };
 use rift_transport_iroh::{BootstrappedConnection, EndpointConfig, RiftEndpoint, SecretKey};
 use rift_trust::{TrustStore, TrustStoreError};
@@ -89,6 +90,12 @@ async fn bootstrap_pair_with_metadata(
     Ok((connection_a, connection_b))
 }
 
+async fn accept_raw_intent(connection: &mut BootstrappedConnection) -> TestResult {
+    let _purpose = connection.receive_intent().await?;
+    connection.send_intent_result(true).await?;
+    Ok(())
+}
+
 async fn pairable_pair(
     manager_a: &SessionManager,
     manager_b: &SessionManager,
@@ -99,10 +106,14 @@ async fn pairable_pair(
     rift_session::PairableConnection,
 )> {
     let (connection_a, connection_b) = bootstrap_pair(endpoint_a, endpoint_b).await?;
-    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+    let (admission_a, admission_b) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing),
+        manager_b.accept_inbound(connection_b),
+    );
+    let SessionAdmission::Pairable(pairable_a) = admission_a? else {
         return Err("peer A unexpectedly authorized before pairing".into());
     };
-    let SessionAdmission::Pairable(pairable_b) = manager_b.admit(connection_b).await? else {
+    let SessionAdmission::Pairable(pairable_b) = admission_b? else {
         return Err("peer B unexpectedly authorized before pairing".into());
     };
     Ok((pairable_a, pairable_b))
@@ -321,7 +332,12 @@ async fn wrong_pairing_id_is_rejected_without_trust() -> TestResult {
     let manager_a = manager(store_a.clone())?;
     let (endpoint_a, endpoint_b) = bind_pair().await?;
     let (connection_a, mut connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
-    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+    let (admission, intent) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing),
+        accept_raw_intent(&mut connection_b),
+    );
+    intent?;
+    let SessionAdmission::Pairable(pairable_a) = admission? else {
         return Err("unknown peer bypassed authorization".into());
     };
     let wrong_id = [9; PAIRING_ID_LEN];
@@ -366,7 +382,12 @@ async fn responder_cannot_change_its_nonce_after_learning_initiator_nonce() -> T
     let manager_a = manager(store_a.clone())?;
     let (endpoint_a, endpoint_b) = bind_pair().await?;
     let (connection_a, mut connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
-    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+    let (admission, intent) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing),
+        accept_raw_intent(&mut connection_b),
+    );
+    intent?;
+    let SessionAdmission::Pairable(pairable_a) = admission? else {
         return Err("unknown peer bypassed authorization".into());
     };
 
@@ -441,10 +462,14 @@ async fn pairing_requires_advertised_capability() -> TestResult {
         HelloMetadata::new("device-b", "test", Vec::new())?,
     )
     .await?;
-    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
+    let (admission_a, admission_b) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing),
+        manager_b.accept_inbound(connection_b),
+    );
+    let SessionAdmission::Pairable(pairable_a) = admission_a? else {
         return Err("unknown peer bypassed authorization".into());
     };
-    let SessionAdmission::Pairable(pairable_b) = manager_b.admit(connection_b).await? else {
+    let SessionAdmission::Pairable(pairable_b) = admission_b? else {
         return Err("unknown peer bypassed authorization".into());
     };
 
@@ -499,10 +524,14 @@ async fn durable_reconnect_authorizes_without_repairing() -> TestResult {
     assert_eq!(endpoint_a.device_id(), id_a);
     assert_eq!(endpoint_b.device_id(), id_b);
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
-    let SessionAdmission::Authorized(authorized_a) = manager_a.admit(connection_a).await? else {
+    let (admission_a, admission_b) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::AuthorizedSession),
+        manager_b.accept_inbound(connection_b),
+    );
+    let SessionAdmission::Authorized(authorized_a) = admission_a? else {
         return Err("durably trusted peer A was not authorized".into());
     };
-    let SessionAdmission::Authorized(authorized_b) = manager_b.admit(connection_b).await? else {
+    let SessionAdmission::Authorized(authorized_b) = admission_b? else {
         return Err("durably trusted peer B was not authorized".into());
     };
     authorized_a.close();
@@ -583,26 +612,46 @@ async fn paired_peer_revocation_and_forget_apply_to_fresh_admission() -> TestRes
 
     store_a.revoke(endpoint_b.device_id()).await?;
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
+    let (inbound, outbound) = tokio::join!(
+        manager_a.accept_inbound(connection_a),
+        manager_b.prepare_outbound(connection_b, ConnectionPurpose::AuthorizedSession),
+    );
+    assert!(matches!(inbound, Err(SessionError::PeerRevoked(id)) if id == endpoint_b.device_id()));
     assert!(matches!(
-        manager_a.admit(connection_a).await,
-        Err(SessionError::PeerRevoked(device_id)) if device_id == endpoint_b.device_id()
+        outbound,
+        Err(SessionError::Intent(
+            rift_transport_iroh::TransportError::IntentRejected
+        ))
     ));
-    let SessionAdmission::Authorized(authorized_b) = manager_b.admit(connection_b).await? else {
-        return Err("B's independent trust decision unexpectedly changed".into());
-    };
-    authorized_b.close();
+    assert_eq!(
+        store_b.state(endpoint_a.device_id()).await,
+        Some(TrustState::Trusted)
+    );
 
     store_a.forget(endpoint_b.device_id()).await?;
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
-    let SessionAdmission::Pairable(pairable_a) = manager_a.admit(connection_a).await? else {
-        return Err("forgotten peer was not pairing-only".into());
-    };
-    let SessionAdmission::Authorized(authorized_b) = manager_b.admit(connection_b).await? else {
-        return Err("B's independent trust decision unexpectedly changed".into());
-    };
+    let (inbound, outbound) = tokio::join!(
+        manager_a.accept_inbound(connection_a),
+        manager_b.prepare_outbound(connection_b, ConnectionPurpose::AuthorizedSession),
+    );
+    assert!(matches!(
+        inbound,
+        Err(SessionError::PurposeNotAllowed {
+            purpose: ConnectionPurpose::AuthorizedSession,
+            ..
+        })
+    ));
+    assert!(matches!(
+        outbound,
+        Err(SessionError::Intent(
+            rift_transport_iroh::TransportError::IntentRejected
+        ))
+    ));
     assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
-    pairable_a.close();
-    authorized_b.close();
+    assert_eq!(
+        store_b.state(endpoint_a.device_id()).await,
+        Some(TrustState::Trusted)
+    );
     close_endpoints(&endpoint_a, &endpoint_b).await;
     Ok(())
 }
@@ -637,7 +686,13 @@ async fn trusted_peer_is_authorized_from_device_id_record() -> TestResult {
     let manager_a = manager(store_a)?;
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
 
-    let SessionAdmission::Authorized(authorized) = manager_a.admit(connection_a).await? else {
+    let mut connection_b = connection_b;
+    let (admission, intent) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::AuthorizedSession),
+        accept_raw_intent(&mut connection_b),
+    );
+    intent?;
+    let SessionAdmission::Authorized(authorized) = admission? else {
         return Err("trusted peer was not authorized".into());
     };
     assert_eq!(authorized.remote_device_id(), endpoint_b.device_id());
@@ -660,7 +715,7 @@ async fn revoked_peer_is_rejected_and_forget_returns_it_to_pairable() -> TestRes
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
 
     assert!(matches!(
-        manager_a.admit(connection_a).await,
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing).await,
         Err(SessionError::PeerRevoked(device_id)) if device_id == endpoint_b.device_id()
     ));
     assert_eq!(
@@ -671,12 +726,133 @@ async fn revoked_peer_is_rejected_and_forget_returns_it_to_pairable() -> TestRes
 
     store_a.forget(endpoint_b.device_id()).await?;
     let (connection_a, connection_b) = bootstrap_pair(&endpoint_a, &endpoint_b).await?;
-    let SessionAdmission::Pairable(pairable) = manager_a.admit(connection_a).await? else {
+    let mut connection_b = connection_b;
+    let (admission, intent) = tokio::join!(
+        manager_a.prepare_outbound(connection_a, ConnectionPurpose::Pairing),
+        accept_raw_intent(&mut connection_b),
+    );
+    intent?;
+    let SessionAdmission::Pairable(pairable) = admission? else {
         return Err("forgotten peer did not return to unknown/pairable".into());
     };
     assert_eq!(store_a.state(endpoint_b.device_id()).await, None);
     pairable.close();
     connection_b.close();
     close_endpoints(&endpoint_a, &endpoint_b).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_inbound_purpose_table_never_infers_pairing() -> TestResult {
+    for state in [None, Some(TrustState::Trusted), Some(TrustState::Revoked)] {
+        for purpose in [
+            ConnectionPurpose::AuthorizedSession,
+            ConnectionPurpose::Pairing,
+        ] {
+            let directory = TempDir::new()?;
+            let trust = store(&directory, "table.trust").await?;
+            let (client, server) = bind_pair().await?;
+            match state {
+                Some(TrustState::Trusted) => {
+                    trust
+                        .trust(TrustedPeer {
+                            device_id: client.device_id(),
+                            device_name: "stored".into(),
+                            platform: "test".into(),
+                        })
+                        .await?
+                }
+                Some(TrustState::Revoked) => trust.revoke(client.device_id()).await?,
+                None => {}
+            }
+            let manager = manager(trust.clone())?;
+            let (mut outgoing, incoming) = bootstrap_pair(&client, &server).await?;
+            let (remote, local) = tokio::join!(
+                outgoing.request_intent(purpose),
+                manager.accept_inbound(incoming)
+            );
+            let allowed = matches!(
+                (state, purpose),
+                (
+                    Some(TrustState::Trusted),
+                    ConnectionPurpose::AuthorizedSession
+                ) | (None, ConnectionPurpose::Pairing)
+            );
+            assert_eq!(remote.is_ok(), allowed);
+            assert_eq!(local.is_ok(), allowed);
+            if let Ok(admission) = local {
+                match (admission, purpose) {
+                    (
+                        SessionAdmission::Authorized(connection),
+                        ConnectionPurpose::AuthorizedSession,
+                    ) => connection.close(),
+                    (SessionAdmission::Pairable(connection), ConnectionPurpose::Pairing) => {
+                        connection.close()
+                    }
+                    _ => return Err("purpose gate returned wrong wrapper".into()),
+                }
+            } else {
+                assert!(matches!(
+                    remote,
+                    Err(rift_transport_iroh::TransportError::IntentRejected)
+                ));
+            }
+            assert_eq!(trust.state(client.device_id()).await, state);
+            outgoing.close();
+            close_endpoints(&client, &server).await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_outbound_purpose_table_checks_local_trust_before_sending() -> TestResult {
+    for state in [None, Some(TrustState::Trusted), Some(TrustState::Revoked)] {
+        for purpose in [
+            ConnectionPurpose::AuthorizedSession,
+            ConnectionPurpose::Pairing,
+        ] {
+            let directory = TempDir::new()?;
+            let trust = store(&directory, "table.trust").await?;
+            let (client, server) = bind_pair().await?;
+            match state {
+                Some(TrustState::Trusted) => {
+                    trust
+                        .trust(TrustedPeer {
+                            device_id: server.device_id(),
+                            device_name: "stored".into(),
+                            platform: "test".into(),
+                        })
+                        .await?
+                }
+                Some(TrustState::Revoked) => trust.revoke(server.device_id()).await?,
+                None => {}
+            }
+            let manager = manager(trust.clone())?;
+            let (outgoing, mut incoming) = bootstrap_pair(&client, &server).await?;
+            let (local, remote) = tokio::join!(
+                manager.prepare_outbound(outgoing, purpose),
+                accept_raw_intent(&mut incoming)
+            );
+            let allowed = matches!(
+                (state, purpose),
+                (
+                    Some(TrustState::Trusted),
+                    ConnectionPurpose::AuthorizedSession
+                ) | (None, ConnectionPurpose::Pairing)
+            );
+            assert_eq!(local.is_ok(), allowed);
+            assert_eq!(remote.is_ok(), allowed);
+            if let Ok(admission) = local {
+                match admission {
+                    SessionAdmission::Authorized(connection) => connection.close(),
+                    SessionAdmission::Pairable(connection) => connection.close(),
+                }
+            }
+            assert_eq!(trust.state(server.device_id()).await, state);
+            incoming.close();
+            close_endpoints(&client, &server).await;
+        }
+    }
     Ok(())
 }
