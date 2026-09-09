@@ -2783,6 +2783,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "rift-core",
+ "rift-identity",
+ "rift-ipc",
+ "rift-session",
+ "rift-transport-iroh",
+ "rift-trust",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rift-identity"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "iroh",
+ "rift-core",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rift-ipc"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rift-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "rift-protocol"
 version = "0.1.0"
 dependencies = [

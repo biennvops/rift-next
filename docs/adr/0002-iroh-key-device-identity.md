@@ -16,4 +16,6 @@ Secret key material remains on the owning device and must not be logged. Storage
 
 ## Deferred
 
-Platform key storage, backup/recovery, pairing UX, trust records, revocation, and device replacement remain future decisions.
+ADR 0010 establishes the Foundation M4 private-filesystem storage baseline. OS keychains,
+hardware-backed/encrypted storage, backup/recovery, identity rotation/replacement, and
+migration remain future decisions. Pairing and trust are governed by ADRs 0007–0009.

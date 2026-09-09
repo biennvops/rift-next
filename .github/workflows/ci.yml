@@ -64,6 +64,9 @@ jobs:
           -p rift-transport-iroh
           -p rift-trust
           -p rift-session
+          -p rift-identity
+          -p rift-ipc
+          -p rift-daemon
 
   windows-smoke:
     name: Production crates (Windows, advisory)
@@ -82,6 +85,9 @@ jobs:
           -p rift-transport-iroh
           -p rift-trust
           -p rift-session
+          -p rift-identity
+          -p rift-ipc
+          -p rift-daemon
 
   benchmark-smoke:
     name: Benchmark smoke

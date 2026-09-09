@@ -1,75 +1,133 @@
 # Rift vNext architecture
 
-Foundation Milestone 3 establishes the first application authorization boundary above
-authenticated Iroh transport. Prototype 0 remains architectural evidence and independent
-regression coverage.
+Foundation Milestone 4 turns the M1–M3 libraries into one resident process. Prototype 0
+remains architectural evidence and independent regression coverage.
 
 ## Workspace ownership
 
 ```text
-future application/daemon crates
-        |
-        +--> rift-session ---------> rift-trust ---------> rift-core
-        |       |
-        |       +--> rift-transport-iroh --> rift-protocol --> rift-core
-        |       |              |                 |
-        |       |              +---------------->+
-        |       +---------------------> rift-protocol
-        |       +---------------------> rift-core
-        |
-        +--> production feature crates (future, authorized connections only)
-
-rift-core             platform-independent identity and trust domain types
-rift-protocol         production v1 wire representation and pairing transcript
-rift-transport-iroh   concrete authenticated Iroh endpoint integration
-rift-trust            durable identity-keyed trust/revocation journal
-rift-session          admission, pairing state machine, authorized boundary
-rift-spike            non-production Prototype 0 evidence
-xtask                 repository validation and developer automation
+Native UI / CLI / future platform client
+                    |
+          authenticated local IPC
+                    v
+              rift-daemon
+        (sole mutable-state owner)
+          /      |       |       \
+         v       v       v        v
+rift-identity rift-ipc rift-session rift-transport-iroh
+     |                    |          |       |
+     v                    v          v       v
+rift-core           rift-trust   rift-protocol
+                         |             |
+                         +----> rift-core
 ```
 
-The permitted production dependency direction is:
+Crate responsibilities are:
+
+```text
+rift-core             platform-independent identity and trust domain types
+rift-protocol         bounded production network v1 and pairing transcript
+rift-transport-iroh   authenticated Iroh endpoint/control integration
+rift-trust            durable identity-keyed trust/revocation journal
+rift-session          pairing state machine and authorization boundary
+rift-identity         persistent production Iroh SecretKey envelope
+rift-ipc              bounded transport-independent local JSON contract
+rift-daemon           resident composition, registries, tasks, IPC transport, riftd
+rift-spike            non-production Prototype 0 evidence
+xtask                 validation, architecture policy, and benchmarks
+```
+
+The permitted internal production dependency direction is:
 
 ```text
 rift-protocol       -> rift-core
 rift-transport-iroh -> rift-core, rift-protocol
 rift-trust          -> rift-core
 rift-session        -> rift-core, rift-protocol, rift-transport-iroh, rift-trust
+rift-identity       -> rift-core
+rift-ipc            -> rift-core
+rift-daemon         -> rift-core, rift-identity, rift-ipc, rift-session,
+                       rift-transport-iroh, rift-trust
 ```
 
-`rift-core` has no transport, filesystem, OS, UI/FFI, or daemon dependency.
-`rift-protocol` owns bounded framing, fixed pairing messages, canonical transcript/SAS
-derivation, and capability identifiers; it has no Iroh, filesystem, or trust-policy
-dependency. `rift-transport-iroh` owns authenticated endpoint/stream operations and
-poison-on-error behavior but no trust lookup or pairing sequence policy. `rift-trust` owns
-only durable local trust/revocation decisions and has no protocol, transport, address, or
-daemon dependency. `rift-session` is the composition layer where authenticated Hello,
-local trust, and pairing policy meet.
+`rift-identity` and `rift-transport-iroh` are the only production crates with a direct Iroh
+dependency, exactly pinned to `=1.0.3`. `rift-identity` owns storage only; endpoint creation
+stays in transport. `rift-ipc` has no Iroh, network protocol, transport, trust store,
+session, identity-store, or daemon dependency. No lower crate reaches upward into
+`rift-daemon`, and daemon behavior never enters `rift-core`.
 
-The admission boundary is:
+`cargo xtask architecture` evaluates Cargo's resolved package-ID graph, requires every
+owned direct edge, rejects forbidden reverse/cross-layer reachability, rejects direct
+production `iroh-relay`, and independently validates exact Iroh manifest requirements.
+
+## Process and durable-state boundary
+
+Exactly one `riftd` process owns one explicit data directory:
 
 ```text
-BootstrappedConnection (authenticated)
+runtime.lock (OS-held exclusive lock)
+identity.key (persistent Iroh SecretKey)
+trust.journal (durable authorization)
+runtime.json / local IPC endpoint
+```
+
+Local clients own presentation and communicate through authenticated IPC. They do not open
+or mutate identity/trust/runtime files. The singleton daemon is the cross-process
+coordination mechanism; `TrustStore` remains a one-process journal.
+
+Persistent state is deliberately small:
+
+- the exact local Iroh key/`DeviceId`; and
+- peer trust/revocation mutations.
+
+Active connections/sessions, pending pairings, runtime/session/attempt IDs, bearer token,
+Iroh endpoint addresses, socket/pipe, and task state are recreated every launch.
+
+## Network admission and live ownership
+
+The M3 admission boundary remains unchanged:
+
+```text
+BootstrappedConnection (Iroh + identity-bound Hello authenticated)
         |
-        +-- Trusted --> AuthorizedConnection
-        +-- Unknown --> PairableConnection (pairing operations only)
+        +-- Trusted --> AuthorizedConnection --> bounded session task/registry
+        +-- Unknown --> PairableConnection --> bounded pairing task/registry
         +-- Revoked --> close and reject
 ```
 
-Application features become reachable only through `AuthorizedConnection`. A display
-name, platform string, network address, or remote acceptance message never creates
-application authorization. Only `DeviceId` keys durable trust, and unknown-to-trusted
-requires explicit local confirmation followed by durable persistence.
+Application functionality is reachable only through `AuthorizedConnection`. Display name,
+platform, address, remote acceptance, and IPC fields never identify or authorize a peer.
+Only `DeviceId` keys durable trust. Unknown-to-trusted requires attended M3 commit/reveal
+pairing, both positive decisions, authenticated local confirmation, and durable persistence.
+There is no direct `TrustPeer` operation.
 
-The production crates remain narrow and concrete. No generic transport trait, daemon,
-connection registry, address book, feature ACL matrix, or persistent secret-key store is
-introduced. APIs enter them only with a production caller and tests.
+A minimal opaque connection handle propagates close/liveness from Iroh through bootstrap
+and session wrappers; raw Iroh connection objects are not exposed. The daemon tracks every
+active session and pending confirmation. Durable revoke/forget closes matching live
+sessions and pairings before returning. Natural disconnect removes only runtime session
+state and does not revoke trust.
 
-`cargo xtask architecture` evaluates Cargo's resolved package-ID graph, requires every
-permitted direct edge above, rejects forbidden reverse/cross-layer reachability, rejects
-production `iroh-relay`, and keeps Iroh exactly pinned to `1.0.3`. Manifest requirements
-and resolved graph edges are checked independently; inactive optional dependencies do not
-silently become acceptable under all-feature validation.
+M4 advertises `PAIRING_V1`, not `BLOB_TRANSFER_V1`. It persists no address and performs no
+automatic reconnect.
+
+## Local control boundary
+
+IPC protocol v1 is separate from Rift network protocol v1:
+
+```text
+Unix socket (Linux/macOS) or named pipe (Windows)
+4-byte big-endian bounded length + UTF-8 JSON
+fresh 32-byte per-launch bearer token
+client request IDs + bounded async events
+```
+
+Frames are capped at 256 KiB before allocation; peer pages are capped at 128; clients,
+outstanding requests, request work, and outgoing queues are bounded. The private atomic
+runtime descriptor is local discovery only. IPC never binds TCP or any network interface
+and never carries raw Iroh addresses, connections, secret keys, pairing nonces/commitments,
+or network protocol frames.
+
+See [daemon runtime](../daemon/runtime.md), [IPC v1](../ipc/v1.md), and ADRs 0009–0011.
 
 ## Engineering policy
 
@@ -80,10 +138,13 @@ silently become acceptable under all-feature validation.
 - Results are not silently ignored.
 - Externally influenced frames, lengths, counts, allocations, queues, and concurrency are
   bounded before resource acquisition.
-- Asynchronous work has an owner, deadline, shutdown path, and cleanup behavior.
+- Asynchronous work has an owner, deadline, shutdown path, cleanup behavior, and joined
+  task result.
 - Pairing and control errors poison/close disposable connections; retries never hide
   sequencing failures.
 - Durable trust is synced before it becomes visible or authorizes a connection.
+- Corrupt/missing persistent identity never triggers silent replacement.
+- Local control never bypasses the pairing-only trust transition.
 
-See [security invariants](security.md), [deferred decisions](deferred.md), and the accepted
-decisions in `docs/adr/`.
+See [security invariants](security.md), [deferred decisions](deferred.md), and accepted
+[architecture decisions](../adr/).

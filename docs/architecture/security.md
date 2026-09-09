@@ -34,6 +34,28 @@ them.
     recoverable, through the last fully validated record.
 19. Trust storage contains no secret identity key, endpoint address, relay URL, or
     transient pairing state.
+20. Exactly one daemon holds the OS lock and exclusively owns one Rift data directory;
+    lock-file existence alone never proves ownership.
+21. Missing or corrupt persistent identity fails startup and never silently creates a
+    replacement identity for existing trust state.
+22. Foundation M4 identity confidentiality relies on the private OS user/filesystem
+    boundary; the Iroh secret key is checksummed but not encrypted at rest.
+23. Local applications mutate trust/session state only through authenticated IPC; they do
+    not directly open daemon-owned identity, trust, lock, or runtime files.
+24. Every IPC connection proves possession of a fresh per-launch 32-byte capability before
+    receiving commands, status, responses, or events; token comparisons reveal no prefix.
+25. IPC has no operation that directly creates trusted state. Only confirmation of a live
+    M3 `PendingPairing` can cause Unknown → Trusted.
+26. IPC uses only Unix sockets or Windows named pipes, never a TCP/network fallback. Frames,
+    clients, requests, peer pages, and outgoing queues are bounded.
+27. Verification codes leave the daemon only through authenticated local IPC. Secret key
+    bytes, pairing nonces/commitments, network pairing IDs, and raw Iroh objects do not.
+28. Durable revoke/forget completes before the daemon invalidates matching pending pairings
+    and active sessions or reports success. A pending pairing captures a per-peer in-memory
+    generation; a successful forget advances it under the trust-store mutation lock, so an
+    older pairing cannot subsequently commit Trusted.
+29. The resident supervisor owns, cancels, and joins every network, pairing, session, and
+    IPC task under a bounded shutdown deadline.
 
 A change affecting an invariant needs targeted failure-path coverage. Aggregate coverage
 and green CI do not by themselves prove that an invariant holds.

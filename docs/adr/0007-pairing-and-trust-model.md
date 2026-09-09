@@ -68,9 +68,10 @@ Revocation affects every new admission immediately. Foundation M3 has no residen
 or global live-connection registry, so it does not retroactively close already-authorized
 connections.
 
-## Deferred
+## Foundation M4 follow-up
 
-Pairing UI and QR presentation, active-session revocation, per-feature authorization,
-device replacement UX, reconciliation UX for asymmetric final commits, persistent local
-secret-key storage, discovery/address persistence, reconnect policy, and simultaneous
-pairing resolution remain deferred.
+ADRs 0009–0011 add the resident owner, persistent local secret-key baseline, authenticated
+local pairing presentation/confirmation, and active-session revocation. Still deferred are
+native pairing UI and QR presentation, per-feature authorization, device replacement and
+asymmetric-final-commit reconciliation UX, keychain/hardware storage, discovery/address
+persistence, reconnect/session replay, and simultaneous-pairing resolution.

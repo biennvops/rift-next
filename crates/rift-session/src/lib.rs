@@ -12,7 +12,7 @@ use rift_protocol::{
     Capability, Hello, HelloMetadata, MessageKind, PAIRING_ID_LEN, PAIRING_NONCE_LEN, PairingCode,
     PairingCommitment, PairingCommitmentRole, PairingMessage, PairingTranscript,
 };
-use rift_transport_iroh::{BootstrappedConnection, TransportError};
+use rift_transport_iroh::{BootstrappedConnection, DisposableConnectionHandle, TransportError};
 use rift_trust::{TrustEntry, TrustStore, TrustStoreError};
 use thiserror::Error;
 use tokio::time::Instant;
@@ -235,6 +235,16 @@ impl AuthorizedConnection {
         self.connection.peer_hello()
     }
 
+    /// Returns a minimal cloneable handle for runtime liveness and cancellation.
+    pub fn disposable_handle(&self) -> DisposableConnectionHandle {
+        self.connection.disposable_handle()
+    }
+
+    /// Waits until this authorized disposable connection terminates.
+    pub async fn closed(&self) {
+        self.connection.closed().await;
+    }
+
     /// Closes this disposable authorized connection.
     pub fn close(&self) {
         self.connection.close();
@@ -355,14 +365,18 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
+        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
             peer,
-            material.pairing_id,
-            code,
-            machine,
-            self.pairing_timeout,
+            PendingPairingContext {
+                pairing_id: material.pairing_id,
+                code,
+                machine,
+                pairing_timeout: self.pairing_timeout,
+                trust_generation,
+            },
         ))
     }
 
@@ -455,14 +469,18 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
+        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
             peer,
-            pairing_id,
-            code,
-            machine,
-            self.pairing_timeout,
+            PendingPairingContext {
+                pairing_id,
+                code,
+                machine,
+                pairing_timeout: self.pairing_timeout,
+                trust_generation,
+            },
         ))
     }
 
@@ -481,6 +499,15 @@ impl PairableConnection {
     }
 }
 
+/// Ephemeral pairing state carried into local confirmation.
+struct PendingPairingContext {
+    pairing_id: [u8; PAIRING_ID_LEN],
+    code: PairingCode,
+    machine: PairingStateMachine,
+    pairing_timeout: Duration,
+    trust_generation: u64,
+}
+
 /// A pairing transcript ready for explicit local human confirmation.
 ///
 /// Obtaining this value never mutates durable trust. Only [`confirm`](Self::confirm)
@@ -494,6 +521,7 @@ pub struct PendingPairing {
     machine: PairingStateMachine,
     pairing_timeout: Duration,
     local_confirmation_deadline: Instant,
+    trust_generation: u64,
 }
 
 impl PendingPairing {
@@ -501,20 +529,18 @@ impl PendingPairing {
         connection: BootstrappedConnection,
         trust_store: Arc<TrustStore>,
         peer: TrustedPeer,
-        pairing_id: [u8; PAIRING_ID_LEN],
-        code: PairingCode,
-        machine: PairingStateMachine,
-        pairing_timeout: Duration,
+        context: PendingPairingContext,
     ) -> Self {
         Self {
             connection: Some(connection),
             trust_store,
             peer,
-            pairing_id,
-            code,
-            machine,
-            pairing_timeout,
-            local_confirmation_deadline: Instant::now() + pairing_timeout,
+            pairing_id: context.pairing_id,
+            code: context.code,
+            machine: context.machine,
+            pairing_timeout: context.pairing_timeout,
+            local_confirmation_deadline: Instant::now() + context.pairing_timeout,
+            trust_generation: context.trust_generation,
         }
     }
 
@@ -541,6 +567,20 @@ impl PendingPairing {
     /// Returns the current explicit state-machine phase.
     pub const fn phase(&self) -> PairingPhase {
         self.machine.phase()
+    }
+
+    /// Returns a minimal cloneable handle while this attempt still owns its connection.
+    pub fn disposable_handle(&self) -> Option<DisposableConnectionHandle> {
+        self.connection
+            .as_ref()
+            .map(BootstrappedConnection::disposable_handle)
+    }
+
+    /// Waits until the pairing connection terminates.
+    pub async fn closed(&self) {
+        if let Some(connection) = &self.connection {
+            connection.closed().await;
+        }
     }
 
     /// Supplies the explicit local human decision and completes the protocol.
@@ -600,7 +640,11 @@ impl PendingPairing {
             });
         }
 
-        if let Err(error) = self.trust_store.trust(self.peer.clone()).await {
+        if let Err(error) = self
+            .trust_store
+            .trust_if_generation(self.peer.clone(), self.trust_generation)
+            .await
+        {
             self.machine.fail();
             connection.close();
             warn!(

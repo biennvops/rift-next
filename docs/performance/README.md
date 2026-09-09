@@ -21,10 +21,12 @@ These tests run in `cargo xtask verify` and may fail a pull request.
 The production protocol benchmark measures v1 Hello encode/decode throughput, Ping/Pong
 encode/decode throughput, pairing transcript/code derivation, and encoded Hello frame
 size. The production trust benchmark measures bounded journal open/replay, lookup
-throughput, and journal size for mixed trusted/revoked records. Prototype 0's benchmark
-separately measures its Postcard control encode/decode throughput, localhost Iroh
-transfer throughput/latency, and application streaming-buffer size. Build and run all
-small smoke scenarios with:
+throughput, and journal size for mixed trusted/revoked records. Foundation M4 adds
+persistent identity create/load, local IPC JSON encode/decode and frame size, cold/warm
+daemon startup, IPC `GetStatus` round trip, and startup with a populated trust journal.
+Prototype 0's benchmark separately measures its Postcard control encode/decode throughput,
+localhost Iroh transfer throughput/latency, and application streaming-buffer size. Build
+and run all small direct-only smoke scenarios with:
 
 ```bash
 cargo xtask benchmark-smoke
@@ -42,6 +44,21 @@ Capture the 1,000-record trust-journal measurement with explicit lookup count:
 cargo run --locked --release -p rift-trust \
   --example trust-benchmark -- 1000 100000
 ```
+
+Capture M4 identity, IPC, and resident-runtime measurements with explicit parameters:
+
+```bash
+cargo run --locked --release -p rift-identity \
+  --example identity-benchmark -- 100000
+cargo run --locked --release -p rift-ipc \
+  --example ipc-benchmark -- 100000
+cargo run --locked --release -p rift-daemon \
+  --example daemon-benchmark -- 1000 1000
+```
+
+The daemon benchmark uses direct-only local endpoints and measures first startup, warm
+restart, Rust control-plane `GetStatus`, and startup after the requested number of trust
+mutations. It starts no public relay infrastructure.
 
 Capture the Prototype 0 baseline with explicit parameters, for example:
 
