@@ -518,3 +518,98 @@ async fn pairing_receive_timeout_poisoned_connection() -> TestResult {
 fn test_device_id_helper_uses_exactly_32_public_bytes() {
     assert_eq!(device_id(7).as_bytes(), &[7_u8; DEVICE_ID_LEN]);
 }
+
+#[tokio::test]
+async fn memory_hint_supports_identity_only_authenticated_hello_and_removal() -> TestResult {
+    let (client, server) = bind_pair().await?;
+    assert!(!client.has_route_source(server.device_id())?);
+    assert!(matches!(client.connect_device(server.device_id()).await,
+        Err(TransportError::Unresolved(id)) if id == server.device_id()));
+    assert_eq!(
+        client.remember_peer_addr(server.local_addr())?,
+        server.device_id()
+    );
+    assert!(client.clone().has_route_source(server.device_id())?);
+    let (outbound, inbound) = tokio::join!(
+        client.connect_device_and_bootstrap(server.device_id(), metadata("client", "test")),
+        server.accept_and_bootstrap(metadata("server", "test")),
+    );
+    let outbound = outbound?;
+    let inbound = inbound?;
+    assert_eq!(outbound.remote_device_id(), server.device_id());
+    assert_eq!(inbound.remote_device_id(), client.device_id());
+    outbound.close();
+    inbound.close();
+    client.forget_peer_addr(server.device_id())?;
+    assert!(!client.has_route_source(server.device_id())?);
+    assert!(matches!(
+        client.connect_device(server.device_id()).await,
+        Err(TransportError::Unresolved(_))
+    ));
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_dial_populates_hint_but_restart_does_not() -> TestResult {
+    let key = SecretKey::generate();
+    let client = RiftEndpoint::bind(key.clone(), test_config()).await?;
+    let server = RiftEndpoint::bind(SecretKey::generate(), test_config()).await?;
+    let (outbound, inbound) = tokio::join!(
+        client.connect_and_bootstrap(server.local_addr(), metadata("client", "test")),
+        server.accept_and_bootstrap(metadata("server", "test")),
+    );
+    outbound?.close();
+    inbound?.close();
+    assert!(client.has_route_source(server.device_id())?);
+    client.close().await;
+    let restarted = RiftEndpoint::bind(key, test_config()).await?;
+    assert_eq!(restarted.device_id(), client.device_id());
+    assert!(!restarted.has_route_source(server.device_id())?);
+    close_pair(&restarted, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lookup_cannot_substitute_the_identity_at_a_valid_address() -> TestResult {
+    let (client, server) = bind_pair().await?;
+    let impostor = SecretKey::generate().public();
+    let wrong = rift_transport_iroh::EndpointAddr::from_parts(impostor, server.local_addr().addrs);
+    let target = client.remember_peer_addr(wrong)?;
+    let (outbound, inbound) = tokio::join!(client.connect_device(target), server.accept());
+    assert!(matches!(
+        outbound,
+        Err(TransportError::Connect(_) | TransportError::ConnectTimeout)
+    ));
+    if let Ok(inbound) = inbound {
+        inbound.close();
+    }
+    close_pair(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hint_path_capacity_and_self_dial_fail_before_network_work() -> TestResult {
+    use rift_transport_iroh::{EndpointAddr, MAX_HINT_PATHS, TransportAddr};
+    let (client, server) = bind_pair().await?;
+    assert!(matches!(
+        client.connect_device(client.device_id()).await,
+        Err(TransportError::SelfConnect)
+    ));
+    assert!(matches!(
+        client.remember_peer_addr(client.local_addr()),
+        Err(TransportError::SelfConnect)
+    ));
+    let addresses = (0..=MAX_HINT_PATHS).map(|index| {
+        let port = u16::try_from(10000 + index).unwrap_or_default();
+        TransportAddr::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    });
+    let oversized = EndpointAddr::from_parts(server.local_addr().id, addresses);
+    assert!(matches!(
+        client.remember_peer_addr(oversized),
+        Err(TransportError::HintCapacityExceeded)
+    ));
+    assert!(!client.has_route_source(server.device_id())?);
+    close_pair(&client, &server).await;
+    Ok(())
+}

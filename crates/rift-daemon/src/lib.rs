@@ -28,8 +28,9 @@ use rift_session::{
     SessionError, SessionManager, pairing_metadata,
 };
 use rift_transport_iroh::{
-    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT, DisposableConnectionHandle,
-    EndpointAddr, EndpointConfig, RelayConfiguration, RiftEndpoint, TransportError,
+    AddressLookupConfiguration, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT,
+    DisposableConnectionHandle, EndpointAddr, EndpointConfig, RelayConfiguration, RiftEndpoint,
+    TransportError,
 };
 use rift_trust::{TrustEntry, TrustStore, TrustStoreError};
 use thiserror::Error;
@@ -72,6 +73,8 @@ pub struct DaemonConfig {
     pub platform: String,
     /// Production relay behavior.
     pub relay: RelayConfiguration,
+    /// External known-peer lookup, independent from relay routing.
+    pub address_lookup: AddressLookupConfiguration,
     /// Optional explicit Iroh bind address, primarily for deterministic local tests.
     pub bind_addr: Option<SocketAddr>,
     /// Iroh connect/accept deadline.
@@ -102,6 +105,7 @@ impl DaemonConfig {
             device_name: device_name.into(),
             platform: std::env::consts::OS.to_owned(),
             relay: RelayConfiguration::Disabled,
+            address_lookup: AddressLookupConfiguration::Disabled,
             bind_addr: None,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -399,6 +403,7 @@ impl Daemon {
                 identity.into_secret_key(),
                 EndpointConfig {
                     relay: config.relay.clone(),
+                    address_lookup: config.address_lookup,
                     bind_addr: config.bind_addr,
                     connection_timeout: config.connection_timeout,
                     handshake_timeout: config.handshake_timeout,

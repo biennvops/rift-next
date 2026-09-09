@@ -180,3 +180,17 @@ cargo run -p rift-daemon --bin riftd -- \
 `--relay` accepts `disabled`, `default`, or `staging`. Use `--log` or `RUST_LOG` for tracing.
 There is no daemonize/fork mode, config-file framework, platform default data path, service
 installer, discovery, reconnect, or feature/synchronization command in M4.
+
+## M5 known-peer reachability configuration
+
+`riftd --address-lookup disabled` is the default. `--address-lookup n0` explicitly
+opts into Number 0's reachability publication and DNS/Pkarr resolution. This is
+independent from `--relay`; enabling lookup does not enable relays. Daemon readiness
+never waits for DNS, Pkarr publication, or relay availability. Public infrastructure
+behavior is not a required test dependency.
+
+The concrete transport accepts DeviceId-only dials and bounded transient address
+hints through Iroh MemoryLookup. Hints are not trust and disappear at endpoint
+restart. With lookup disabled and no hint, identity-only dialing returns Unresolved
+without retrying. No address journal or raw-address IPC operation is added. See
+[ADR 0012](../adr/0012-known-peer-reachability.md).

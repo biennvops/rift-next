@@ -6,11 +6,14 @@
 //! reconnect loop, or insecure relay TLS mode.
 
 use std::{
+    collections::BTreeSet,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver, memory::MemoryLookup};
 use iroh::endpoint::{
     ConnectingError, Connection, ConnectionError, RecvStream, SendStream, presets,
 };
@@ -63,9 +66,26 @@ impl RelayConfiguration {
     }
 }
 
+/// External known-identity reachability, independent from relay routing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AddressLookupConfiguration {
+    /// Do not publish or resolve through external infrastructure.
+    #[default]
+    Disabled,
+    /// Publish and resolve through Number 0's DNS/Pkarr infrastructure.
+    N0,
+}
+
+/// Maximum ephemeral peer hints retained by one endpoint.
+pub const MAX_PEER_HINTS: usize = 4096;
+/// Maximum paths in one ephemeral peer hint.
+pub const MAX_HINT_PATHS: usize = 32;
+
 /// Small production endpoint configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointConfig {
+    /// Explicit external lookup selection; memory hints are always available.
+    pub address_lookup: AddressLookupConfiguration,
     /// Relay behavior for the endpoint.
     pub relay: RelayConfiguration,
     /// Optional explicit IP bind address. `None` uses Iroh's normal IP transports.
@@ -79,6 +99,7 @@ pub struct EndpointConfig {
 impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
+            address_lookup: AddressLookupConfiguration::Disabled,
             relay: RelayConfiguration::Disabled,
             bind_addr: None,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
@@ -115,6 +136,21 @@ impl EndpointConfig {
 /// Errors from endpoint, connection, stream, and production bootstrap operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// The public bytes cannot represent an Iroh endpoint identity.
+    #[error("invalid peer device identity")]
+    InvalidDeviceId,
+    /// No configured route source exists for this identity.
+    #[error("no reachability source for peer {0}")]
+    Unresolved(DeviceId),
+    /// The local endpoint cannot dial itself.
+    #[error("cannot connect to the local device")]
+    SelfConnect,
+    /// Ephemeral hint input exceeded a hard resource bound.
+    #[error("peer address hint capacity exceeded")]
+    HintCapacityExceeded,
+    /// An earlier panic invalidated the hint registry.
+    #[error("peer address hint registry is poisoned")]
+    HintRegistryPoisoned,
     /// The caller supplied an unusable endpoint configuration.
     #[error("invalid endpoint configuration: {0}")]
     InvalidConfiguration(&'static str),
@@ -177,6 +213,8 @@ pub struct RiftEndpoint {
     endpoint: Endpoint,
     device_id: DeviceId,
     config: EndpointConfig,
+    memory_lookup: MemoryLookup,
+    hint_ids: Arc<Mutex<BTreeSet<DeviceId>>>,
 }
 
 impl fmt::Debug for RiftEndpoint {
@@ -199,10 +237,18 @@ impl RiftEndpoint {
         config: EndpointConfig,
     ) -> Result<Self, TransportError> {
         config.validate()?;
+        let memory_lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::Minimal)
+            .address_lookup(memory_lookup.clone())
             .secret_key(secret_key)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(config.relay.as_iroh_mode());
+        if config.address_lookup == AddressLookupConfiguration::N0 {
+            builder = builder
+                .address_lookup(PkarrPublisher::n0_dns())
+                .address_lookup(PkarrResolver::n0_dns())
+                .address_lookup(DnsAddressLookup::n0_dns());
+        }
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.clear_ip_transports();
             builder = builder
@@ -220,6 +266,8 @@ impl RiftEndpoint {
             endpoint,
             device_id,
             config,
+            memory_lookup,
+            hint_ids: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -260,11 +308,92 @@ impl RiftEndpoint {
         self.endpoint.is_closed()
     }
 
+    /// Updates an ephemeral route hint, keyed by its embedded authenticated identity.
+    /// This is not trust. The latest snapshot replaces old paths to bound stale state.
+    pub fn remember_peer_addr(&self, peer: EndpointAddr) -> Result<DeviceId, TransportError> {
+        let device_id = device_id_from_endpoint_id(peer.id);
+        if device_id == self.device_id {
+            return Err(TransportError::SelfConnect);
+        }
+        if peer.addrs.len() > MAX_HINT_PATHS {
+            return Err(TransportError::HintCapacityExceeded);
+        }
+        if peer.addrs.is_empty() {
+            return Ok(device_id);
+        }
+        let mut ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        if !ids.contains(&device_id) && ids.len() >= MAX_PEER_HINTS {
+            return Err(TransportError::HintCapacityExceeded);
+        }
+        ids.insert(device_id);
+        let _previous = self.memory_lookup.set_endpoint_info(peer);
+        Ok(device_id)
+    }
+
+    /// Removes an application hint, not trust or an existing Iroh connection/path cache.
+    pub fn forget_peer_addr(&self, device_id: DeviceId) -> Result<(), TransportError> {
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
+        let mut ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        ids.remove(&device_id);
+        let _previous = self.memory_lookup.remove_endpoint_info(endpoint_id);
+        Ok(())
+    }
+
+    /// Whether a fresh identity-only dial has an external lookup or ephemeral hint source.
+    pub fn has_route_source(&self, device_id: DeviceId) -> Result<bool, TransportError> {
+        endpoint_id_from_device_id(device_id)?;
+        let ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        Ok(
+            self.config.address_lookup != AddressLookupConfiguration::Disabled
+                || ids.contains(&device_id),
+        )
+    }
+
+    /// Resolves current reachability and authenticates a peer using only its identity.
+    pub async fn connect_device(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<AuthenticatedConnection, TransportError> {
+        if device_id == self.device_id {
+            return Err(TransportError::SelfConnect);
+        }
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
+        if !self.has_route_source(device_id)? {
+            return Err(TransportError::Unresolved(device_id));
+        }
+        self.dial(EndpointAddr::new(endpoint_id)).await
+    }
+
+    /// Identity-only dial followed by the mandatory authenticated Hello exchange.
+    pub async fn connect_device_and_bootstrap(
+        &self,
+        device_id: DeviceId,
+        metadata: HelloMetadata,
+    ) -> Result<BootstrappedConnection, TransportError> {
+        let connection = self.connect_device(device_id).await?;
+        self.bootstrap(connection, metadata, ControlDirection::Open)
+            .await
+    }
+
     /// Connects to an authenticated Iroh peer using the production ALPN.
     pub async fn connect(
         &self,
         peer: EndpointAddr,
     ) -> Result<AuthenticatedConnection, TransportError> {
+        let device_id = self.remember_peer_addr(peer)?;
+        self.connect_device(device_id).await
+    }
+
+    async fn dial(&self, peer: EndpointAddr) -> Result<AuthenticatedConnection, TransportError> {
         debug!(
             local_device_id = %self.device_id,
             remote_device_id = %device_id_from_endpoint_id(peer.id),
@@ -654,6 +783,10 @@ impl BootstrappedConnection {
     }
 }
 
+fn endpoint_id_from_device_id(device_id: DeviceId) -> Result<iroh::EndpointId, TransportError> {
+    iroh::EndpointId::from_bytes(device_id.as_bytes()).map_err(|_| TransportError::InvalidDeviceId)
+}
+
 fn device_id_from_endpoint_id(endpoint_id: iroh::EndpointId) -> DeviceId {
     DeviceId::from_bytes(*endpoint_id.as_bytes())
 }
@@ -694,9 +827,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_identity_conversion_validates_public_key_bytes() -> Result<(), TransportError> {
+        let public = SecretKey::from_bytes(&[7; 32]).public();
+        assert_eq!(
+            endpoint_id_from_device_id(device_id_from_endpoint_id(public))?,
+            public
+        );
+        let invalid = (0..=255)
+            .map(|byte| DeviceId::from_bytes([byte; 32]))
+            .find(|id| {
+                matches!(
+                    endpoint_id_from_device_id(*id),
+                    Err(TransportError::InvalidDeviceId)
+                )
+            });
+        assert!(invalid.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hint_peer_capacity_rejects_without_eviction_and_updates_at_capacity()
+    -> Result<(), TransportError> {
+        let endpoint = RiftEndpoint::bind(SecretKey::generate(), EndpointConfig::direct()).await?;
+        {
+            let mut ids = endpoint
+                .hint_ids
+                .lock()
+                .map_err(|_| TransportError::HintRegistryPoisoned)?;
+            for index in 0..MAX_PEER_HINTS {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                ids.insert(DeviceId::from_bytes(bytes));
+            }
+        }
+        let other = SecretKey::generate().public();
+        let addr = EndpointAddr::from_parts(
+            other,
+            [TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 1234)))],
+        );
+        assert!(matches!(
+            endpoint.remember_peer_addr(addr.clone()),
+            Err(TransportError::HintCapacityExceeded)
+        ));
+        endpoint.forget_peer_addr(device_id_from_endpoint_id(other))?;
+        {
+            let mut ids = endpoint
+                .hint_ids
+                .lock()
+                .map_err(|_| TransportError::HintRegistryPoisoned)?;
+            ids.pop_first();
+        }
+        endpoint.remember_peer_addr(addr.clone())?;
+        endpoint.remember_peer_addr(addr)?;
+        assert!(endpoint.has_route_source(device_id_from_endpoint_id(other))?);
+        endpoint.close().await;
+        Ok(())
+    }
+
+    #[test]
     fn direct_configuration_has_no_relay_or_insecure_tls_setting() {
         let config = EndpointConfig::direct();
         assert_eq!(config.relay, RelayConfiguration::Disabled);
+        assert_eq!(config.address_lookup, AddressLookupConfiguration::Disabled);
         assert_eq!(
             config.bind_addr,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))

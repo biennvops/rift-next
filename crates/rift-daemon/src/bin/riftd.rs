@@ -3,7 +3,7 @@ use std::{io, path::PathBuf};
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use rift_daemon::{Daemon, DaemonConfig};
-use rift_transport_iroh::RelayConfiguration;
+use rift_transport_iroh::{AddressLookupConfiguration, RelayConfiguration};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,9 @@ struct Arguments {
     /// Production relay selection.
     #[arg(long, value_enum, default_value_t = RelayArgument::Disabled)]
     relay: RelayArgument,
+    /// Explicit reachability publication/lookup through Number 0 infrastructure.
+    #[arg(long, value_enum, default_value_t = LookupArgument::Disabled)]
+    address_lookup: LookupArgument,
     /// Tracing filter directive; RUST_LOG is used when omitted.
     #[arg(long)]
     log: Option<String>,
@@ -43,6 +46,21 @@ impl From<RelayArgument> for RelayConfiguration {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LookupArgument {
+    Disabled,
+    N0,
+}
+
+impl From<LookupArgument> for AddressLookupConfiguration {
+    fn from(value: LookupArgument) -> Self {
+        match value {
+            LookupArgument::Disabled => Self::Disabled,
+            LookupArgument::N0 => Self::N0,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
@@ -57,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = DaemonConfig::new(arguments.data_dir, arguments.device_name);
     config.relay = arguments.relay.into();
+    config.address_lookup = arguments.address_lookup.into();
     let daemon = Daemon::start(config)
         .await
         .context("daemon startup failed")?;
