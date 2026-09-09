@@ -1,6 +1,6 @@
 # Rift daemon runtime
 
-Foundation M4's `riftd` is a foreground resident process. Exactly one process owns one
+Foundation M5's `riftd` is a foreground resident process. Exactly one process owns one
 explicit data directory; it composes persistent identity, durable trust, the production
 Iroh endpoint, pairing/admission, active sessions, pending confirmations, and authenticated
 local control. It implements no synchronization or feature data plane.
@@ -50,14 +50,16 @@ rest; see ADR 0010.
 4. remove stale `runtime.json` and Unix socket while lock ownership is proven;
 5. enforce the identity/trust presence policy and load/create `identity.key`;
 6. open and fully recover/validate `trust.journal`;
-7. create the M3 `SessionManager`;
+7. load trusted connectivity candidates in bounded pages (hard cap 4,096), and create the
+   purpose-aware `SessionManager`;
 8. bind `RiftEndpoint` with the persisted key and pairing-only Hello capability;
 9. generate fresh runtime ID and 32-byte IPC token;
 10. bind Unix socket or Windows named pipe;
 11. atomically publish private `runtime.json`;
 12. return a ready `Daemon` and cloneable `DaemonHandle`.
 
-`run_until_shutdown` then seeds the bounded incoming bootstrap workers and serves IPC. The
+`run_until_shutdown` then seeds bounded incoming workers, runs the earliest-deadline
+reconnect scheduler, and serves IPC. The
 listener and Iroh endpoint are already bound before readiness is published, so queued local
 or network work cannot observe partially initialized policy state.
 
@@ -100,7 +102,10 @@ Default limits are:
 | --- | ---: | ---: |
 | Incoming bootstrap/setup tasks | 32 | 256 |
 | Active authorized sessions | 64 | 128 |
-| Active sessions per `DeviceId` | 4 | 16 |
+| Canonical sessions per `DeviceId` | 1 | 1 (not configurable) |
+| Shared outbound setup tasks | 8 | 64 |
+| Managed trusted peers | 4096 | 4096 |
+| Coalesced waiters per outbound peer | 16 | 16 |
 | Pending pairing confirmations | 8 | 64 |
 | Local IPC clients | 8 | 64 |
 
@@ -194,3 +199,53 @@ hints through Iroh MemoryLookup. Hints are not trust and disappear at endpoint
 restart. With lookup disabled and no hint, identity-only dialing returns Unresolved
 without retrying. No address journal or raw-address IPC operation is added. See
 [ADR 0012](../adr/0012-known-peer-reachability.md).
+
+
+## M5 canonical sessions and reconnect supervision
+
+The session layer first exchanges explicit intent: Trusted + AuthorizedSession and
+Unknown + Pairing are the only admitted combinations. Intent rejection cannot open a
+pairing prompt. Final registry insertion rechecks trust and the forget generation
+captured before the gate. See [ADR 0013](../adr/0013-managed-peer-connectivity.md).
+
+The lower DeviceId prefers outbound; the higher prefers inbound. Either direction is
+accepted when alone. A preferred candidate replaces nonpreferred, while same-direction
+or nonpreferred duplicates keep the older healthy canonical session. Replacements emit
+SessionClosed/Superseded followed by SessionOpened. Joined results for displaced IDs
+cannot remove the replacement or schedule retries. Already-closed candidates never
+replace healthy sessions.
+
+One bounded BTreeMap holds trusted connectivity state, with at most one deadline per
+peer. The supervisor uses one earliest-deadline timer; no permanent task/channel/timer
+is created per peer. Connecting includes Iroh lookup as well as connection establishment.
+Each manual/automatic outbound setup consumes the shared bound until its result is
+joined, including cancelled tasks. Concurrent Session requests coalesce with at most
+16 waiting replies. Excess manual requests fail CapacityExceeded, not queued retries.
+
+Automatic starts are spaced by at least 100 ms. Equal-jitter backoff is 50–100% of a
+1-second initial exponential ceiling, doubling to 60 seconds. A connected interval of
+at least 30 seconds resets history on loss; short flaps retain it. Canonical replacement
+preserves the stability clock. RNG failure uses the upper jitter bound. Pure injected-
+time/sample tests cover these decisions without wall-clock sleeps.
+
+Network/lookup failure and capacity pressure retry. Invalid identity, protocol or
+invariant failure, lost trust, and coarse remote purpose rejection do not. Disabled
+lookup without a hint settles Unresolved with no timer. A new explicit runtime hint
+wakes Unresolved state. Successful pairing registers Connected; startup with durable
+trust and available lookup schedules fresh authorization without pairing.
+
+DisconnectSession suspends local automatic outbound until ConnectPeer, leaves trust
+unchanged, and does not reject inbound trusted connections. Inbound sessions preserve
+that suspension for their next loss. ConnectPeer bypasses backoff but not capacity and
+returns an existing healthy canonical session when available.
+
+Revoke/forget persist before cancelling work and removing connectivity. Shutdown closes
+the command receiver, clears timers, cancels outbound work, closes the endpoint and
+registries, and joins every task. Connection loss alone never changes durable trust.
+A Rust-only capability-minimal session handle supports forced-loss tests; IPC cannot
+access it. Iroh path migration is not a session loss or reconnect trigger.
+
+Connectivity transitions emit deduplicated events and structured debug logs containing
+DeviceId, state, attempt, retry delay, and stable failure category. Countdown changes
+alone do not generate ticks. Raw transport errors and addresses are not connectivity
+DTO fields. The Status schema remains unchanged.

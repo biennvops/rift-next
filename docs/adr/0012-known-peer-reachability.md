@@ -15,7 +15,9 @@ time. No lower domain, protocol, trust, or IPC crate acquires an Iroh dependency
 
 External lookup defaults to Disabled. Explicit N0 configuration composes Iroh 1.0.3's
 PkarrPublisher, PkarrResolver, and DnsAddressLookup with the existing Minimal builder.
-It does not change the independently selected relay mode or wait for WAN readiness.
+It does not change the independently selected relay mode or wait for WAN readiness. A native MemoryLookup may also be injected
+through the Rust configuration for hermetic by-ID resolution, including daemon restart
+tests. That local fixture owns its contents/lifetime; the CLI exposes only Disabled/N0.
 Enabling N0 publishes/resolves reachability through Number 0 infrastructure; it is
 not browsable device discovery and never implies trust.
 

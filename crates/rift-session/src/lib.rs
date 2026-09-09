@@ -225,11 +225,17 @@ pub enum SessionAdmission {
 
 /// A Hello-bootstrapped connection admitted by a durable local trust decision.
 pub struct AuthorizedConnection {
+    trust_generation: u64,
     connection: BootstrappedConnection,
     peer: TrustedPeer,
 }
 
 impl AuthorizedConnection {
+    /// In-memory forget fence captured at purpose admission, never persisted.
+    pub const fn trust_generation(&self) -> u64 {
+        self.trust_generation
+    }
+
     /// Returns the authorized cryptographic peer identity.
     pub const fn remote_device_id(&self) -> DeviceId {
         self.peer.device_id
@@ -255,6 +261,11 @@ impl AuthorizedConnection {
         self.connection.closed().await;
     }
 
+    /// Owns the admitted control stream until loss or a protocol failure.
+    pub async fn serve_control(&mut self) -> Result<(), TransportError> {
+        self.connection.serve_authorized_control().await
+    }
+
     /// Closes this disposable authorized connection.
     pub fn close(&self) {
         self.connection.close();
@@ -263,6 +274,7 @@ impl AuthorizedConnection {
 
 /// An authenticated unknown peer isolated to pairing behavior.
 pub struct PairableConnection {
+    trust_generation: u64,
     connection: BootstrappedConnection,
     trust_store: Arc<TrustStore>,
     pairing_timeout: Duration,
@@ -375,7 +387,7 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
-        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
+        let trust_generation = self.trust_generation;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
@@ -479,7 +491,7 @@ impl PairableConnection {
         )
         .code();
         info!(remote_device_id = %peer.device_id, "pairing_code_ready");
-        let trust_generation = self.trust_store.current_generation(peer.device_id).await;
+        let trust_generation = self.trust_generation;
         Ok(PendingPairing::new(
             self.connection,
             self.trust_store,
@@ -535,6 +547,11 @@ pub struct PendingPairing {
 }
 
 impl PendingPairing {
+    /// In-memory forget fence captured before purpose admission and pairing setup.
+    pub const fn trust_generation(&self) -> u64 {
+        self.trust_generation
+    }
+
     fn new(
         connection: BootstrappedConnection,
         trust_store: Arc<TrustStore>,
@@ -685,6 +702,7 @@ impl PendingPairing {
         }
         info!(remote_device_id = %self.peer.device_id, "pairing_completed");
         Ok(AuthorizedConnection {
+            trust_generation: self.trust_generation,
             connection,
             peer: self.peer.clone(),
         })
@@ -734,6 +752,10 @@ impl SessionManager {
         mut bootstrapped: BootstrappedConnection,
         purpose: ConnectionPurpose,
     ) -> Result<SessionAdmission, SessionError> {
+        let generation = self
+            .trust_store
+            .current_generation(bootstrapped.remote_device_id())
+            .await;
         let entry = self
             .trust_store
             .entry(bootstrapped.remote_device_id())
@@ -747,7 +769,7 @@ impl SessionManager {
             ));
         }
         bootstrapped.request_intent(purpose).await?;
-        self.admit(bootstrapped, purpose).await
+        self.admit(bootstrapped, purpose, generation).await
     }
 
     /// Inbound admission reads the explicit purpose before consulting local trust.
@@ -755,6 +777,10 @@ impl SessionManager {
         &self,
         mut bootstrapped: BootstrappedConnection,
     ) -> Result<SessionAdmission, SessionError> {
+        let generation = self
+            .trust_store
+            .current_generation(bootstrapped.remote_device_id())
+            .await;
         let purpose = bootstrapped.receive_intent().await?;
         let entry = self
             .trust_store
@@ -769,26 +795,33 @@ impl SessionManager {
                 purpose,
             ));
         }
-        self.admit(bootstrapped, purpose).await
+        self.admit(bootstrapped, purpose, generation).await
     }
 
     async fn admit(
         &self,
         bootstrapped: BootstrappedConnection,
         purpose: ConnectionPurpose,
+        generation: u64,
     ) -> Result<SessionAdmission, SessionError> {
         let device_id = bootstrapped.remote_device_id();
+        if self.trust_store.current_generation(device_id).await != generation {
+            bootstrapped.close();
+            return Err(SessionError::PurposeNotAllowed { device_id, purpose });
+        }
         let entry = self.trust_store.entry(device_id).await;
         match (entry, purpose) {
             (Some(TrustEntry::Trusted(peer)), ConnectionPurpose::AuthorizedSession) => {
                 info!(remote_device_id = %device_id, "peer_authorized");
                 Ok(SessionAdmission::Authorized(AuthorizedConnection {
+                    trust_generation: generation,
                     connection: bootstrapped,
                     peer,
                 }))
             }
             (None, ConnectionPurpose::Pairing) => {
                 Ok(SessionAdmission::Pairable(PairableConnection {
+                    trust_generation: generation,
                     connection: bootstrapped,
                     trust_store: Arc::clone(&self.trust_store),
                     pairing_timeout: self.config.pairing_timeout,

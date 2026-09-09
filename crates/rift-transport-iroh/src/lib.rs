@@ -13,7 +13,8 @@ use std::{
     time::Duration,
 };
 
-use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver, memory::MemoryLookup};
+pub use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{
     ConnectingError, Connection, ConnectionError, RecvStream, SendStream, presets,
 };
@@ -68,13 +69,16 @@ impl RelayConfiguration {
 }
 
 /// External known-identity reachability, independent from relay routing.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub enum AddressLookupConfiguration {
     /// Do not publish or resolve through external infrastructure.
     #[default]
     Disabled,
     /// Publish and resolve through Number 0's DNS/Pkarr infrastructure.
     N0,
+    /// Injected native in-memory resolver for hermetic known-identity lookup.
+    /// Its lifetime/contents are owned by the local caller, not persisted by Rift.
+    Memory(MemoryLookup),
 }
 
 /// Maximum ephemeral peer hints retained by one endpoint.
@@ -83,7 +87,7 @@ pub const MAX_PEER_HINTS: usize = 4096;
 pub const MAX_HINT_PATHS: usize = 32;
 
 /// Small production endpoint configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct EndpointConfig {
     /// Explicit external lookup selection; memory hints are always available.
     pub address_lookup: AddressLookupConfiguration,
@@ -223,6 +227,52 @@ pub enum TransportError {
     ControlTimeout,
 }
 
+impl TransportError {
+    /// Classification only; transport never retries a failed disposable connection.
+    pub fn is_retryable(&self) -> bool {
+        use iroh::endpoint::{ConnectError, ConnectWithOptsError};
+        match self {
+            Self::ConnectTimeout
+            | Self::AcceptTimeout
+            | Self::ControlStreamOpenTimeout
+            | Self::ControlStreamAcceptTimeout
+            | Self::ControlTimeout => true,
+            Self::Connect(ConnectError::Connect {
+                source: ConnectWithOptsError::NoAddress { .. },
+                ..
+            }) => true,
+            Self::Connect(ConnectError::Connecting {
+                source: ConnectingError::ConnectionError { source, .. },
+                ..
+            })
+            | Self::Connect(ConnectError::Connection { source, .. })
+            | Self::ControlStream(source)
+            | Self::AcceptStart(source)
+            | Self::Accept(ConnectingError::ConnectionError { source, .. }) => {
+                retryable_connection_error(source)
+            }
+            Self::Handshake(HandshakeError::HandshakeTimeout) => true,
+            Self::Handshake(HandshakeError::Frame(error))
+            | Self::IntentFrame(error)
+            | Self::PairingFrame(error)
+            | Self::Control(ControlError::Frame(error)) => matches!(
+                error,
+                FrameError::TruncatedLengthPrefix(_)
+                    | FrameError::TruncatedPayload(_)
+                    | FrameError::Write(_)
+            ),
+            _ => false,
+        }
+    }
+}
+
+fn retryable_connection_error(error: &ConnectionError) -> bool {
+    matches!(
+        error,
+        ConnectionError::Reset | ConnectionError::TimedOut | ConnectionError::ApplicationClosed(_)
+    )
+}
+
 /// An Iroh endpoint configured for the production Rift ALPN.
 #[derive(Clone)]
 pub struct RiftEndpoint {
@@ -259,11 +309,14 @@ impl RiftEndpoint {
             .secret_key(secret_key)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(config.relay.as_iroh_mode());
-        if config.address_lookup == AddressLookupConfiguration::N0 {
+        if matches!(config.address_lookup, AddressLookupConfiguration::N0) {
             builder = builder
                 .address_lookup(PkarrPublisher::n0_dns())
                 .address_lookup(PkarrResolver::n0_dns())
                 .address_lookup(DnsAddressLookup::n0_dns());
+        }
+        if let AddressLookupConfiguration::Memory(lookup) = &config.address_lookup {
+            builder = builder.address_lookup(lookup.clone());
         }
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.clear_ip_transports();
@@ -363,15 +416,19 @@ impl RiftEndpoint {
 
     /// Whether a fresh identity-only dial has an external lookup or ephemeral hint source.
     pub fn has_route_source(&self, device_id: DeviceId) -> Result<bool, TransportError> {
-        endpoint_id_from_device_id(device_id)?;
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
         let ids = self
             .hint_ids
             .lock()
             .map_err(|_| TransportError::HintRegistryPoisoned)?;
-        Ok(
-            self.config.address_lookup != AddressLookupConfiguration::Disabled
-                || ids.contains(&device_id),
-        )
+        let external = match &self.config.address_lookup {
+            AddressLookupConfiguration::Disabled => false,
+            AddressLookupConfiguration::N0 => true,
+            AddressLookupConfiguration::Memory(lookup) => lookup
+                .get_endpoint_info(endpoint_id)
+                .is_some_and(|info| !info.to_endpoint_addr().addrs.is_empty()),
+        };
+        Ok(external || ids.contains(&device_id))
     }
 
     /// Resolves current reachability and authenticates a peer using only its identity.
@@ -488,6 +545,7 @@ impl RiftEndpoint {
         metadata: HelloMetadata,
         direction: ControlDirection,
     ) -> Result<BootstrappedConnection, TransportError> {
+        let mut close_guard = BootstrapCloseGuard(Some(connection.connection.clone()));
         let remote_device_id = connection.remote_device_id();
         let control_result = match direction {
             ControlDirection::Open => connection.open_control().await,
@@ -529,6 +587,7 @@ impl RiftEndpoint {
             handshake_outcome = "success",
             "Rift production bootstrap complete"
         );
+        close_guard.0 = None;
         Ok(BootstrappedConnection {
             connection: connection.connection,
             control: Some(control),
@@ -537,6 +596,16 @@ impl RiftEndpoint {
             control_timeout: self.config.handshake_timeout,
             intent_phase: IntentPhase::Fresh,
         })
+    }
+}
+
+struct BootstrapCloseGuard(Option<Connection>);
+
+impl Drop for BootstrapCloseGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.0 {
+            connection.close(0_u32.into(), b"Rift bootstrap cancelled");
+        }
     }
 }
 
@@ -624,6 +693,11 @@ impl DisposableConnectionHandle {
     pub fn close(&self) {
         self.connection
             .close(0_u32.into(), b"Rift connection closed by runtime owner");
+    }
+
+    /// Whether the underlying connection has already terminated.
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
     }
 
     /// Waits until the underlying disposable connection has terminated.
@@ -801,6 +875,55 @@ impl BootstrappedConnection {
             Err(_) => {
                 self.poison();
                 Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    /// Monitors the admitted control stream, allowing only Ping/Pong service.
+    /// Idle sessions have no application idle timeout, but every started frame does.
+    pub async fn serve_authorized_control(&mut self) -> Result<(), TransportError> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            let control = self
+                .control
+                .as_mut()
+                .ok_or(TransportError::ControlConnectionPoisoned)?;
+            let mut first = [0; 1];
+            if let Err(error) = AsyncReadExt::read_exact(&mut control.recv, &mut first).await {
+                self.poison();
+                return Err(TransportError::Control(ControlError::Frame(
+                    FrameError::TruncatedLengthPrefix(error),
+                )));
+            }
+            let mut frame = first.as_slice().chain(&mut control.recv);
+            let received = time::timeout(
+                self.control_timeout,
+                rift_protocol::read_message(&mut frame),
+            )
+            .await;
+            let result = match received {
+                Ok(Ok(ControlMessage::Ping { nonce })) => time::timeout(
+                    self.control_timeout,
+                    rift_protocol::write_message(
+                        &mut control.send,
+                        &ControlMessage::Pong { nonce },
+                    ),
+                )
+                .await
+                .map_err(|_| TransportError::ControlTimeout)
+                .and_then(|result| {
+                    result.map_err(|error| TransportError::Control(ControlError::Frame(error)))
+                }),
+                Ok(Ok(message)) => Err(TransportError::Control(ControlError::UnexpectedMessage {
+                    expected: MessageKind::Ping,
+                    received: message.kind(),
+                })),
+                Ok(Err(error)) => Err(TransportError::Control(ControlError::Frame(error))),
+                Err(_) => Err(TransportError::ControlTimeout),
+            };
+            if let Err(error) = result {
+                self.poison();
+                return Err(error);
             }
         }
     }
@@ -1032,7 +1155,10 @@ mod tests {
     fn direct_configuration_has_no_relay_or_insecure_tls_setting() {
         let config = EndpointConfig::direct();
         assert_eq!(config.relay, RelayConfiguration::Disabled);
-        assert_eq!(config.address_lookup, AddressLookupConfiguration::Disabled);
+        assert!(matches!(
+            config.address_lookup,
+            AddressLookupConfiguration::Disabled
+        ));
         assert_eq!(
             config.bind_addr,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))

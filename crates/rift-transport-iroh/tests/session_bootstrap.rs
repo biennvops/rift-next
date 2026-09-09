@@ -693,3 +693,65 @@ async fn intent_result_timeout_and_duplicate_local_gate_operations_poison() -> T
     close_pair(&client, &server).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn duplicate_intent_after_acceptance_is_rejected_by_authorized_control_owner() -> TestResult {
+    use rift_protocol::ConnectionPurpose;
+    let (client, server) = bind_pair().await?;
+    let incoming = async {
+        let mut connection = server
+            .accept_and_bootstrap(metadata("server", "test"))
+            .await?;
+        assert_eq!(
+            connection.receive_intent().await?,
+            ConnectionPurpose::AuthorizedSession
+        );
+        connection.send_intent_result(true).await?;
+        assert!(matches!(
+            connection.serve_authorized_control().await,
+            Err(TransportError::Control(
+                rift_protocol::ControlError::UnexpectedMessage {
+                    received: MessageKind::ConnectionIntent,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            connection.receive_intent().await,
+            Err(TransportError::ControlConnectionPoisoned)
+        ));
+        Ok::<_, TransportError>(())
+    };
+    let outgoing = async {
+        let connection = client.connect(server.local_addr()).await?;
+        let mut control = connection.open_control().await?;
+        exchange_hello_with_timeout(
+            &mut control,
+            client.device_id(),
+            &metadata("client", "test"),
+            server.device_id(),
+            TEST_HANDSHAKE_TIMEOUT,
+        )
+        .await?;
+        let intent = ControlMessage::ConnectionIntent {
+            purpose: ConnectionPurpose::AuthorizedSession,
+        };
+        write_message(&mut control.send, &intent).await?;
+        assert_eq!(
+            read_message(&mut control.recv).await?,
+            ControlMessage::ConnectionIntentResult { accepted: true }
+        );
+        write_message(&mut control.send, &ControlMessage::Ping { nonce: 42 }).await?;
+        assert_eq!(
+            read_message(&mut control.recv).await?,
+            ControlMessage::Pong { nonce: 42 }
+        );
+        write_message(&mut control.send, &intent).await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(connection)
+    };
+    let (incoming, outgoing) = tokio::join!(incoming, outgoing);
+    incoming?;
+    outgoing?.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}

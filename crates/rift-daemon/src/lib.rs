@@ -4,7 +4,9 @@
 //! journal, endpoint, pending pairing registry, authorized session registry, local IPC
 //! listener, and every asynchronous child task.
 
+mod connectivity;
 mod ipc_server;
+pub use connectivity::retry_delay;
 mod local;
 
 use std::{
@@ -16,12 +18,14 @@ use std::{
     time::Duration,
 };
 
+use connectivity::Scheduler;
 use rift_core::{DeviceId, TrustState};
 use rift_identity::{IdentityError, IdentityStore};
 use rift_ipc::{
-    ErrorCode, ErrorResponse, Event, MAX_PEER_PAGE_SIZE, PairingAttemptId, PairingOutcome,
-    PeerInfo, PeerPage, PendingPairingInfo, RUNTIME_DESCRIPTOR_VERSION, Request, Response,
-    RuntimeDescriptor, RuntimeState, SessionCloseReason, SessionId, SessionInfo, Status,
+    ConnectivityFailure, ConnectivityState, ErrorCode, ErrorResponse, Event, MAX_PEER_PAGE_SIZE,
+    PairingAttemptId, PairingOutcome, PeerConnectivityPage, PeerInfo, PeerPage, PendingPairingInfo,
+    RUNTIME_DESCRIPTOR_VERSION, Request, Response, RuntimeDescriptor, RuntimeState,
+    SessionCloseReason, SessionId, SessionInfo, Status,
 };
 use rift_session::{
     AuthorizedConnection, ConnectionPurpose, PairingError, PendingPairing, SessionAdmission,
@@ -35,6 +39,7 @@ use rift_transport_iroh::{
 use rift_trust::{TrustEntry, TrustStore, TrustStoreError};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use local::{IDENTITY_FILE_NAME, LocalListener, RuntimeArtifacts, RuntimeLock, TRUST_FILE_NAME};
@@ -43,8 +48,6 @@ use local::{IDENTITY_FILE_NAME, LocalListener, RuntimeArtifacts, RuntimeLock, TR
 pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 32;
 /// Default active authorized-session bound.
 pub const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 64;
-/// Default per-peer active-session bound.
-pub const DEFAULT_MAX_SESSIONS_PER_PEER: usize = 4;
 /// Default pending pairing-confirmation bound.
 pub const DEFAULT_MAX_PENDING_PAIRINGS: usize = 8;
 /// Default authenticated local IPC client bound.
@@ -54,7 +57,10 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HARD_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 const HARD_MAX_ACTIVE_SESSIONS: usize = 128;
-const HARD_MAX_SESSIONS_PER_PEER: usize = 16;
+/// Default shared bound on manual and automatic outbound connection setup tasks.
+pub const DEFAULT_MAX_OUTBOUND_CONNECTS: usize = 8;
+const HARD_MAX_OUTBOUND_CONNECTS: usize = 64;
+const MAX_DIAL_WAITERS: usize = 16;
 const HARD_MAX_PENDING_PAIRINGS: usize = 64;
 const HARD_MAX_IPC_CLIENTS: usize = 64;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -87,8 +93,8 @@ pub struct DaemonConfig {
     pub max_inflight_connections: usize,
     /// Maximum active authorized sessions.
     pub max_active_sessions: usize,
-    /// Maximum active authorized sessions for one peer identity.
-    pub max_sessions_per_peer: usize,
+    /// Shared concurrent outbound setup bound, hard capped at 64.
+    pub max_outbound_connects: usize,
     /// Maximum pending local pairing confirmations.
     pub max_pending_pairings: usize,
     /// Maximum concurrent local IPC clients.
@@ -112,7 +118,7 @@ impl DaemonConfig {
             pairing_timeout: rift_session::DEFAULT_PAIRING_TIMEOUT,
             max_inflight_connections: DEFAULT_MAX_INFLIGHT_CONNECTIONS,
             max_active_sessions: DEFAULT_MAX_ACTIVE_SESSIONS,
-            max_sessions_per_peer: DEFAULT_MAX_SESSIONS_PER_PEER,
+            max_outbound_connects: DEFAULT_MAX_OUTBOUND_CONNECTS,
             max_pending_pairings: DEFAULT_MAX_PENDING_PAIRINGS,
             max_ipc_clients: DEFAULT_MAX_IPC_CLIENTS,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
@@ -130,14 +136,14 @@ impl DaemonConfig {
             "max_inflight_connections",
         )?;
         validate_count(
+            self.max_outbound_connects,
+            HARD_MAX_OUTBOUND_CONNECTS,
+            "max_outbound_connects",
+        )?;
+        validate_count(
             self.max_active_sessions,
             HARD_MAX_ACTIVE_SESSIONS,
             "max_active_sessions",
-        )?;
-        validate_count(
-            self.max_sessions_per_peer,
-            HARD_MAX_SESSIONS_PER_PEER,
-            "max_sessions_per_peer",
         )?;
         validate_count(
             self.max_pending_pairings,
@@ -149,11 +155,6 @@ impl DaemonConfig {
             HARD_MAX_IPC_CLIENTS,
             "max_ipc_clients",
         )?;
-        if self.max_sessions_per_peer > self.max_active_sessions {
-            return Err(DaemonError::InvalidConfiguration(
-                "max_sessions_per_peer must not exceed max_active_sessions",
-            ));
-        }
         Ok(())
     }
 }
@@ -290,6 +291,22 @@ impl DaemonHandle {
             .map_err(DaemonHandleError::Operation)
     }
 
+    /// Supplies a bounded runtime-only reachability hint; never changes trust.
+    pub async fn remember_peer_addr(
+        &self,
+        peer: EndpointAddr,
+    ) -> Result<DeviceId, DaemonHandleError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::RememberPeer { peer, reply })
+            .await
+            .map_err(|_| DaemonHandleError::Stopped)?;
+        response
+            .await
+            .map_err(|_| DaemonHandleError::Stopped)?
+            .map_err(DaemonHandleError::Operation)
+    }
+
     /// Starts attended pairing to a transient Rust-level endpoint address.
     pub async fn begin_pairing(
         &self,
@@ -314,6 +331,24 @@ impl DaemonHandle {
             .await
             .map_err(|_| DaemonHandleError::Stopped)?;
         response.await.map_err(|_| DaemonHandleError::Stopped)?
+    }
+
+    /// Returns a capability-minimal handle for whole-connection loss tests.
+    /// This Rust-only seam is deliberately absent from authenticated IPC.
+    #[doc(hidden)]
+    pub async fn session_handle_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> Result<DisposableConnectionHandle, DaemonHandleError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::SessionHandle { session_id, reply })
+            .await
+            .map_err(|_| DaemonHandleError::Stopped)?;
+        response
+            .await
+            .map_err(|_| DaemonHandleError::Stopped)?
+            .map_err(DaemonHandleError::Operation)
     }
 
     /// Requests graceful shutdown and waits through cleanup and task joins.
@@ -358,6 +393,9 @@ pub struct Daemon {
     next_session_id: u64,
     ipc_clients: usize,
     state: RuntimeState,
+    connectivity: Scheduler,
+    outbound: BTreeMap<DeviceId, OutboundRecord>,
+    next_dial_id: u64,
 }
 
 impl Daemon {
@@ -392,6 +430,27 @@ impl Daemon {
         }
         let device_id = identity.device_id();
         let trust_store = Arc::new(TrustStore::open(&trust_path).await?);
+        let mut connectivity = Scheduler::new(Instant::now());
+        let mut after = None;
+        loop {
+            let page = trust_store
+                .list_page(after, usize::from(MAX_PEER_PAGE_SIZE))
+                .await?;
+            for entry in page.entries {
+                if let TrustEntry::Trusted(peer) = entry
+                    && peer.device_id != device_id
+                    && !connectivity.insert(peer.device_id, Instant::now())
+                {
+                    return Err(DaemonError::InvalidConfiguration(
+                        "trusted peer connectivity capacity exceeded",
+                    ));
+                }
+            }
+            after = page.next_cursor;
+            if after.is_none() {
+                break;
+            }
+        }
         let session_manager = Arc::new(SessionManager::with_config(
             Arc::clone(&trust_store),
             SessionConfig {
@@ -403,7 +462,7 @@ impl Daemon {
                 identity.into_secret_key(),
                 EndpointConfig {
                     relay: config.relay.clone(),
-                    address_lookup: config.address_lookup,
+                    address_lookup: config.address_lookup.clone(),
                     bind_addr: config.bind_addr,
                     connection_timeout: config.connection_timeout,
                     handshake_timeout: config.handshake_timeout,
@@ -457,6 +516,9 @@ impl Daemon {
             next_session_id: 1,
             ipc_clients: 0,
             state: RuntimeState::Running,
+            connectivity,
+            outbound: BTreeMap::new(),
+            next_dial_id: 1,
         })
     }
 
@@ -479,7 +541,17 @@ impl Daemon {
         let mut shutdown_reply = None;
         let mut fatal_error = None;
         loop {
+            let deadline = if self.outbound.len() < self.config.max_outbound_connects {
+                self.connectivity.deadline()
+            } else {
+                None
+            };
             tokio::select! {
+                _ = wait_deadline(deadline) => {
+                    if let Some(device_id) = self.connectivity.take_due(Instant::now()) {
+                        self.spawn_outbound(device_id, false, None).await;
+                    }
+                }
                 accepted = self.listener.accept(), if self.ipc_clients < self.config.max_ipc_clients => {
                     match accepted {
                         Ok(stream) => self.spawn_ipc_client(stream),
@@ -564,23 +636,62 @@ impl Daemon {
 
     async fn handle_command(&mut self, command: RuntimeCommand) {
         match command {
-            RuntimeCommand::Request { request, reply } => {
-                if let Request::ConfirmPairing {
+            RuntimeCommand::Request { request, reply } => match request {
+                Request::ConfirmPairing {
                     attempt_id,
                     accepted,
-                } = request
-                {
-                    self.confirm_pairing(attempt_id, accepted, reply).await;
-                } else {
+                } => self.confirm_pairing(attempt_id, accepted, reply).await,
+                Request::BeginPairing { device_id } => {
+                    self.spawn_outbound(device_id, true, Some(OutboundReply::Ipc(reply)))
+                        .await
+                }
+                Request::ConnectPeer { device_id } => {
+                    self.spawn_outbound(device_id, false, Some(OutboundReply::Ipc(reply)))
+                        .await
+                }
+                request => {
                     let response = self.execute_request(request).await;
                     send_oneshot(reply, response);
                 }
-            }
+            },
             RuntimeCommand::BeginPairing { peer, reply } => {
-                self.spawn_outbound(peer, OutboundReply::Pairing(reply));
+                let reply = OutboundReply::Pairing(reply);
+                match self.endpoint.remember_peer_addr(peer) {
+                    Ok(device_id) => self.spawn_outbound(device_id, true, Some(reply)).await,
+                    Err(error) => reply.send(Err(connection_error(error))),
+                }
             }
             RuntimeCommand::ConnectAuthenticated { peer, reply } => {
-                self.spawn_outbound(peer, OutboundReply::Session(reply));
+                let reply = OutboundReply::Session(reply);
+                match self.endpoint.remember_peer_addr(peer) {
+                    Ok(device_id) => self.spawn_outbound(device_id, false, Some(reply)).await,
+                    Err(error) => reply.send(Err(connection_error(error))),
+                }
+            }
+            RuntimeCommand::SessionHandle { session_id, reply } => {
+                let result = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|record| record.closer.clone())
+                    .ok_or_else(|| {
+                        operation_error(ErrorCode::SessionNotFound, "active session was not found")
+                    });
+                send_oneshot(reply, result);
+            }
+            RuntimeCommand::RememberPeer { peer, reply } => {
+                let result = self
+                    .endpoint
+                    .remember_peer_addr(peer)
+                    .map_err(connection_error);
+                if let Ok(id) = result
+                    && let Some(peer) = self.connectivity.peers.get_mut(&id)
+                    && peer.state == ConnectivityState::Unresolved
+                    && !peer.suspended
+                {
+                    peer.resume(Instant::now());
+                    self.emit_connectivity(id);
+                }
+                send_oneshot(reply, result);
             }
             RuntimeCommand::Shutdown { reply } => {
                 send_oneshot(
@@ -594,17 +705,230 @@ impl Daemon {
         }
     }
 
-    fn spawn_outbound(&mut self, peer: EndpointAddr, reply: OutboundReply) {
+    async fn spawn_outbound(
+        &mut self,
+        device_id: DeviceId,
+        pairing: bool,
+        reply: Option<OutboundReply>,
+    ) {
+        let manual = reply.is_some();
+        let result = self.start_outbound(device_id, pairing, manual).await;
+        match result {
+            Ok(Some(session_id)) => {
+                if let Some(reply) = reply {
+                    reply.send(Ok(DialResult::Session(device_id, session_id)));
+                }
+            }
+            Ok(None) => {
+                if let Some(reply) = reply {
+                    if let Some(record) = self.outbound.get_mut(&device_id) {
+                        record.replies.push(reply);
+                    } else {
+                        reply.send(Err(operation_error(
+                            ErrorCode::Internal,
+                            "outbound registry invariant failed",
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                if !pairing
+                    && self.canonical_session(device_id).is_none()
+                    && !self.outbound.contains_key(&device_id)
+                {
+                    self.connectivity_failed(device_id, failure_category(error.code));
+                }
+                if let Some(reply) = reply {
+                    reply.send(Err(error));
+                }
+            }
+        }
+    }
+
+    async fn start_outbound(
+        &mut self,
+        device_id: DeviceId,
+        pairing: bool,
+        manual: bool,
+    ) -> OperationResult<Option<SessionId>> {
+        if self.state != RuntimeState::Running {
+            return Err(operation_error(
+                ErrorCode::ShuttingDown,
+                "daemon is shutting down",
+            ));
+        }
+        if device_id == self.device_id {
+            return Err(operation_error(
+                ErrorCode::InvalidRequest,
+                "cannot dial the local device",
+            ));
+        }
+        let state = self.trust_store.state(device_id).await;
+        match (state, pairing) {
+            (None, true) | (Some(TrustState::Trusted), false) => {}
+            (Some(TrustState::Trusted), true) => {
+                return Err(operation_error(
+                    ErrorCode::PeerAlreadyTrusted,
+                    "peer is already trusted",
+                ));
+            }
+            _ => {
+                return Err(operation_error(
+                    ErrorCode::PeerNotTrusted,
+                    "peer is not eligible for requested purpose",
+                ));
+            }
+        }
+        if self
+            .outbound
+            .get(&device_id)
+            .is_some_and(|record| record.cancelled)
+            && self.canonical_session(device_id).is_none()
+        {
+            return Err(operation_error(
+                ErrorCode::CapacityExceeded,
+                "cancelled outbound task is still being joined",
+            ));
+        }
+        if !pairing {
+            if !self.connectivity.insert(device_id, Instant::now()) {
+                return Err(operation_error(
+                    ErrorCode::CapacityExceeded,
+                    "connectivity peer capacity reached",
+                ));
+            }
+            if manual && let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                peer.resume(Instant::now());
+            }
+            if let Some(id) = self.canonical_session(device_id) {
+                return Ok(Some(id));
+            }
+        }
+        if let Some(record) = self.outbound.get(&device_id) {
+            if record.cancelled
+                || pairing
+                || record.pairing
+                || record.replies.len() >= MAX_DIAL_WAITERS
+            {
+                return Err(operation_error(
+                    ErrorCode::CapacityExceeded,
+                    "peer already has bounded outbound work",
+                ));
+            }
+            if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                peer.state = ConnectivityState::Connecting;
+                peer.due = None;
+            }
+            return Ok(None);
+        }
+        if self.outbound.len() >= self.config.max_outbound_connects {
+            return Err(operation_error(
+                ErrorCode::CapacityExceeded,
+                "outbound setup capacity reached",
+            ));
+        }
+        if pairing
+            && (self.pending_slots.available_permits() == 0
+                || self
+                    .pending_pairings
+                    .values()
+                    .any(|record| record.info.device_id == device_id))
+        {
+            return Err(operation_error(
+                ErrorCode::CapacityExceeded,
+                "pending pairing capacity reached",
+            ));
+        }
+        if !self
+            .endpoint
+            .has_route_source(device_id)
+            .map_err(connection_error)?
+        {
+            return Err(operation_error(
+                ErrorCode::PeerUnresolved,
+                "no reachability source for peer",
+            ));
+        }
+        let token = self.next_dial_id;
+        self.next_dial_id = self
+            .next_dial_id
+            .checked_add(1)
+            .ok_or_else(|| operation_error(ErrorCode::Internal, "outbound generation exhausted"))?;
+        let (cancel, mut cancelled) = watch::channel(false);
+        self.outbound.insert(
+            device_id,
+            OutboundRecord {
+                token,
+                pairing,
+                replies: Vec::new(),
+                cancel,
+                cancelled: false,
+            },
+        );
+        if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+            peer.state = ConnectivityState::Connecting;
+            peer.due = None;
+        }
+        self.emit_connectivity(device_id);
         let endpoint = Arc::clone(&self.endpoint);
         let manager = Arc::clone(&self.session_manager);
         let metadata = self.metadata.clone();
         let pending_slots = Arc::clone(&self.pending_slots);
-        let pairing = matches!(reply, OutboundReply::Pairing(_));
+        let mut shutdown = self.shutdown.subscribe();
         self.tasks.spawn(async move {
-            let result =
-                prepare_outbound(endpoint, manager, metadata, pending_slots, peer, pairing).await;
-            TaskOutput::Outbound { result, reply }
+            let result = tokio::select! {
+                result = prepare_outbound(endpoint, manager, metadata, pending_slots, device_id, pairing) => result,
+                _ = cancelled.changed() => Err(operation_error(ErrorCode::PeerNotTrusted, "outbound work invalidated")),
+                _ = shutdown.changed() => Err(operation_error(ErrorCode::ShuttingDown, "daemon is shutting down")),
+            };
+            TaskOutput::Outbound { device_id, token, result }
         });
+        Ok(None)
+    }
+
+    fn canonical_session(&self, device_id: DeviceId) -> Option<SessionId> {
+        self.sessions.iter().find_map(|(id, record)| {
+            (record.info.device_id == device_id && !record.closer.is_closed()).then_some(*id)
+        })
+    }
+
+    fn emit_connectivity(&mut self, device_id: DeviceId) {
+        if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+            let info = peer.info(device_id, Instant::now());
+            let mut signature = info.clone();
+            signature.retry_in_ms = None;
+            if peer.last_emitted.as_ref() == Some(&signature) {
+                return;
+            }
+            peer.last_emitted = Some(signature);
+            debug!(local_device_id = %self.device_id, remote_device_id = %device_id,
+                state = ?info.state, retry_attempt = info.retry_attempt,
+                retry_in_ms = ?info.retry_in_ms, failure_category = ?info.last_failure,
+                "peer connectivity changed");
+            self.emit(Event::PeerConnectivityChanged { connectivity: info });
+        }
+    }
+
+    fn connectivity_failed(&mut self, device_id: DeviceId, failure: ConnectivityFailure) {
+        if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+            // Randomness failure uses the upper equal-jitter bound, never an immediate retry.
+            peer.failed(
+                failure,
+                Instant::now(),
+                getrandom::u32().unwrap_or(u32::MAX),
+            );
+            self.emit_connectivity(device_id);
+        }
+    }
+
+    fn cancel_outbound(&mut self, device_id: DeviceId, result: OperationResult<DialResult>) {
+        if let Some(record) = self.outbound.get_mut(&device_id) {
+            record.cancelled = true;
+            record.cancel.send_replace(true);
+            for reply in std::mem::take(&mut record.replies) {
+                reply.send(result.clone());
+            }
+        }
     }
 
     async fn execute_request(&mut self, request: Request) -> OperationResult<Response> {
@@ -628,6 +952,35 @@ impl Daemon {
                     page: PeerPage {
                         entries: page.entries.into_iter().map(peer_info).collect(),
                         next_cursor: page.next_cursor,
+                    },
+                })
+            }
+            Request::ListPeerConnectivity { after, limit } => {
+                if limit == 0 {
+                    return Err(operation_error(
+                        ErrorCode::InvalidRequest,
+                        "peer page limit must be greater than zero",
+                    ));
+                }
+                let now = Instant::now();
+                let mut entries = self
+                    .connectivity
+                    .peers
+                    .iter()
+                    .filter(|(id, _)| after.is_none_or(|after| **id > after))
+                    .take(usize::from(limit.min(MAX_PEER_PAGE_SIZE)) + 1)
+                    .map(|(id, peer)| peer.info(*id, now))
+                    .collect::<Vec<_>>();
+                let next_cursor = if entries.len() > usize::from(limit.min(MAX_PEER_PAGE_SIZE)) {
+                    entries.pop();
+                    entries.last().map(|entry| entry.device_id)
+                } else {
+                    None
+                };
+                Ok(Response::PeerConnectivity {
+                    page: PeerConnectivityPage {
+                        entries,
+                        next_cursor,
                     },
                 })
             }
@@ -678,6 +1031,19 @@ impl Daemon {
                         "active session was not found",
                     ));
                 };
+                let device_id = record.info.device_id;
+                if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                    peer.suspend();
+                    peer.lost(Instant::now(), 0);
+                }
+                self.cancel_outbound(
+                    device_id,
+                    Err(operation_error(
+                        ErrorCode::ConnectionFailed,
+                        "local outbound reconnect suspended",
+                    )),
+                );
+                self.emit_connectivity(device_id);
                 record.closer.close();
                 self.emit(Event::SessionClosed {
                     session_id,
@@ -686,7 +1052,9 @@ impl Daemon {
                 });
                 Ok(Response::SessionDisconnected { session_id })
             }
-            Request::ConfirmPairing { .. } => Err(operation_error(
+            Request::ConfirmPairing { .. }
+            | Request::BeginPairing { .. }
+            | Request::ConnectPeer { .. } => Err(operation_error(
                 ErrorCode::Internal,
                 "pairing confirmation dispatch invariant failed",
             )),
@@ -731,6 +1099,20 @@ impl Daemon {
     }
 
     async fn invalidate_peer(&mut self, device_id: DeviceId, reason: SessionCloseReason) {
+        if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+            peer.session_id = None;
+            peer.failed(ConnectivityFailure::NotTrusted, Instant::now(), 0);
+            self.emit_connectivity(device_id);
+        }
+        self.connectivity.peers.remove(&device_id);
+        self.cancel_outbound(
+            device_id,
+            Err(operation_error(
+                ErrorCode::PeerNotTrusted,
+                "durable trust invalidated outbound work",
+            )),
+        );
+
         let pairing_ids = self
             .pending_pairings
             .iter()
@@ -782,60 +1164,54 @@ impl Daemon {
                 }
                 true
             }
-            TaskOutput::Outbound { result, reply } => {
-                match (result, reply) {
-                    (
-                        Ok(ConnectionCandidate::Pending(pending, permit)),
-                        OutboundReply::Pairing(reply),
-                    ) => {
-                        let result = self
-                            .register_pending(pending, permit)
-                            .map_err(DaemonHandleError::Operation);
-                        send_oneshot(reply, result);
+            TaskOutput::Outbound {
+                device_id,
+                token,
+                result,
+            } => {
+                let matching = self
+                    .outbound
+                    .get(&device_id)
+                    .is_some_and(|record| record.token == token);
+                if !matching {
+                    return false;
+                }
+                if let Some(record) = self.outbound.remove(&device_id) {
+                    if record.cancelled {
+                        return false;
                     }
-                    (
-                        Ok(ConnectionCandidate::Authorized(connection)),
-                        OutboundReply::Session(reply),
-                    ) => {
-                        let result = self
-                            .register_session(connection)
+                    let result = match result {
+                        Ok(ConnectionCandidate::Pending(pending, permit)) if record.pairing => self
+                            .register_pending(pending, permit, SessionOrigin::Outbound)
                             .await
-                            .map_err(DaemonHandleError::Operation);
-                        send_oneshot(reply, result);
+                            .map(DialResult::Pairing),
+                        Ok(ConnectionCandidate::Authorized(connection)) if !record.pairing => self
+                            .register_session(connection, SessionOrigin::Outbound)
+                            .await
+                            .map(|id| DialResult::Session(device_id, id)),
+                        Ok(_) => Err(operation_error(
+                            ErrorCode::Internal,
+                            "outbound purpose invariant failed",
+                        )),
+                        Err(error) => Err(error),
+                    };
+                    if !record.pairing
+                        && self.canonical_session(device_id).is_none()
+                        && let Err(error) = &result
+                    {
+                        self.connectivity_failed(device_id, failure_category(error.code));
                     }
-                    (
-                        Ok(ConnectionCandidate::Authorized(connection)),
-                        OutboundReply::Pairing(reply),
-                    ) => {
-                        connection.close();
-                        send_oneshot(
-                            reply,
-                            Err(DaemonHandleError::Operation(operation_error(
-                                ErrorCode::PeerAlreadyTrusted,
-                                "peer is already trusted",
-                            ))),
-                        );
-                    }
-                    (
-                        Ok(ConnectionCandidate::Pending(pending, _permit)),
-                        OutboundReply::Session(reply),
-                    ) => {
-                        if let Some(handle) = pending.disposable_handle() {
-                            handle.close();
-                        }
-                        send_oneshot(
-                            reply,
-                            Err(DaemonHandleError::Operation(operation_error(
-                                ErrorCode::PeerNotTrusted,
-                                "peer requires pairing before authenticated connection",
-                            ))),
-                        );
-                    }
-                    (Err(error), OutboundReply::Pairing(reply)) => {
-                        send_oneshot(reply, Err(DaemonHandleError::Operation(error)));
-                    }
-                    (Err(error), OutboundReply::Session(reply)) => {
-                        send_oneshot(reply, Err(DaemonHandleError::Operation(error)));
+                    // A simultaneous inbound canonical session satisfies coalesced callers even
+                    // if their losing outbound connection closed during convergence.
+                    let result = if !record.pairing {
+                        self.canonical_session(device_id)
+                            .map(|id| Ok(DialResult::Session(device_id, id)))
+                            .unwrap_or(result)
+                    } else {
+                        result
+                    };
+                    for reply in record.replies {
+                        reply.send(result.clone());
                     }
                 }
                 false
@@ -854,8 +1230,16 @@ impl Daemon {
                 session_id,
                 device_id,
                 reason,
+                failure,
             } => {
                 if self.sessions.remove(&session_id).is_some() {
+                    if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                        peer.lost(Instant::now(), getrandom::u32().unwrap_or(u32::MAX));
+                        if failure != ConnectivityFailure::Network && !peer.suspended {
+                            peer.failed(failure, Instant::now(), 0);
+                        }
+                        self.emit_connectivity(device_id);
+                    }
                     self.emit(Event::SessionClosed {
                         session_id,
                         device_id,
@@ -876,20 +1260,39 @@ impl Daemon {
 
     async fn register_candidate(&mut self, candidate: ConnectionCandidate) -> OperationResult<()> {
         match candidate {
-            ConnectionCandidate::Authorized(connection) => {
-                self.register_session(connection).await.map(|_| ())
-            }
-            ConnectionCandidate::Pending(pending, permit) => {
-                self.register_pending(pending, permit).map(|_| ())
-            }
+            ConnectionCandidate::Authorized(connection) => self
+                .register_session(connection, SessionOrigin::Inbound)
+                .await
+                .map(|_| ()),
+            ConnectionCandidate::Pending(pending, permit) => self
+                .register_pending(pending, permit, SessionOrigin::Inbound)
+                .await
+                .map(|_| ()),
         }
     }
 
-    fn register_pending(
+    async fn register_pending(
         &mut self,
         pending: PendingPairing,
         permit: OwnedSemaphorePermit,
+        origin: SessionOrigin,
     ) -> OperationResult<PairingAttemptId> {
+        if self
+            .trust_store
+            .state(pending.remote_device_id())
+            .await
+            .is_some()
+            || self
+                .trust_store
+                .current_generation(pending.remote_device_id())
+                .await
+                != pending.trust_generation()
+        {
+            return Err(operation_error(
+                ErrorCode::PeerNotTrusted,
+                "pairing setup was invalidated before registration",
+            ));
+        }
         if self.pending_pairings.len() >= self.config.max_pending_pairings {
             if let Some(handle) = pending.disposable_handle() {
                 handle.close();
@@ -925,6 +1328,7 @@ impl Daemon {
                 closer,
                 commands,
                 resolving: false,
+                origin,
             },
         );
         let shutdown = self.shutdown.subscribe();
@@ -942,35 +1346,70 @@ impl Daemon {
     async fn register_session(
         &mut self,
         connection: AuthorizedConnection,
+        origin: SessionOrigin,
     ) -> OperationResult<SessionId> {
         let device_id = connection.remote_device_id();
-        if self.trust_store.state(device_id).await != Some(TrustState::Trusted) {
+        if self.trust_store.state(device_id).await != Some(TrustState::Trusted)
+            || self.trust_store.current_generation(device_id).await != connection.trust_generation()
+        {
             connection.close();
             return Err(operation_error(
                 ErrorCode::PeerNotTrusted,
                 "durable trust no longer authorizes this peer",
             ));
         }
-        if self.sessions.len() >= self.config.max_active_sessions {
+        if connection.disposable_handle().is_closed() {
+            return self.canonical_session(device_id).ok_or_else(|| {
+                operation_error(
+                    ErrorCode::ConnectionFailed,
+                    "candidate connection already closed",
+                )
+            });
+        }
+        if !self.connectivity.insert(device_id, Instant::now()) {
+            connection.close();
+            return Err(operation_error(
+                ErrorCode::CapacityExceeded,
+                "connectivity peer capacity reached",
+            ));
+        }
+        let existing = self.sessions.iter().find_map(|(id, record)| {
+            (record.info.device_id == device_id).then_some((
+                *id,
+                record.origin,
+                record.closer.is_closed(),
+            ))
+        });
+        if let Some((session_id, existing_origin, closed)) = existing {
+            if !closed && !origin.replaces(existing_origin, self.device_id, device_id) {
+                connection.close();
+                return Ok(session_id);
+            }
+        } else if self.sessions.len() >= self.config.max_active_sessions {
             connection.close();
             return Err(operation_error(
                 ErrorCode::CapacityExceeded,
                 "active session capacity reached",
             ));
         }
-        let peer_count = self
-            .sessions
-            .values()
-            .filter(|record| record.info.device_id == device_id)
-            .count();
-        if peer_count >= self.config.max_sessions_per_peer {
-            connection.close();
-            return Err(operation_error(
-                ErrorCode::CapacityExceeded,
-                "per-peer session capacity reached",
-            ));
-        }
         let session_id = SessionId(self.allocate_session_id()?);
+        if let Some((old_id, _, closed)) = existing
+            && let Some(old) = self.sessions.remove(&old_id)
+        {
+            if closed && let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                peer.lost(Instant::now(), getrandom::u32().unwrap_or(u32::MAX));
+            }
+            old.closer.close();
+            self.emit(Event::SessionClosed {
+                session_id: old_id,
+                device_id,
+                reason: if closed {
+                    SessionCloseReason::ConnectionClosed
+                } else {
+                    SessionCloseReason::Superseded
+                },
+            });
+        }
         let trusted = connection.trusted_peer().clone();
         let closer = connection.disposable_handle();
         let info = SessionInfo {
@@ -984,11 +1423,19 @@ impl Daemon {
             SessionRecord {
                 info: info.clone(),
                 closer,
+                origin,
             },
         );
         let shutdown = self.shutdown.subscribe();
         self.tasks
             .spawn(run_session(session_id, connection, shutdown));
+        if let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+            peer.connected(session_id, Instant::now());
+        }
+        self.emit_connectivity(device_id);
+        if origin == SessionOrigin::Inbound && self.device_id > device_id {
+            self.cancel_outbound(device_id, Ok(DialResult::Session(device_id, session_id)));
+        }
         self.emit(Event::SessionOpened { session: info });
         Ok(session_id)
     }
@@ -1000,10 +1447,14 @@ impl Daemon {
         result: PairingTaskResult,
         reply: Option<OperationReply<Response>>,
     ) {
-        let registered = self.pending_pairings.remove(&attempt_id).is_some();
+        let record = self.pending_pairings.remove(&attempt_id);
+        let registered = record.is_some();
+        let origin = record
+            .map(|record| record.origin)
+            .unwrap_or(SessionOrigin::Inbound);
         let (outcome, response) = match result {
             PairingTaskResult::Authorized(connection) if registered => {
-                match self.register_session(*connection).await {
+                match self.register_session(*connection, origin).await {
                     Ok(session_id) => (
                         PairingOutcome::Accepted,
                         Ok(Response::PairingResolved {
@@ -1099,6 +1550,19 @@ impl Daemon {
 
     async fn shutdown_runtime(&mut self) -> Result<(), DaemonError> {
         self.state = RuntimeState::ShuttingDown;
+        self.commands.close();
+        self.connectivity.peers.clear();
+        for record in self.outbound.values_mut() {
+            record.cancelled = true;
+            record.cancel.send_replace(true);
+            for reply in std::mem::take(&mut record.replies) {
+                reply.send(Err(operation_error(
+                    ErrorCode::ShuttingDown,
+                    "daemon is shutting down",
+                )));
+            }
+        }
+
         let descriptor_result = self.artifacts.unpublish_descriptor();
         self.emit(Event::DaemonShuttingDown);
         self.endpoint.close().await;
@@ -1207,6 +1671,14 @@ type OperationResult<T> = Result<T, ErrorResponse>;
 type OperationReply<T> = oneshot::Sender<OperationResult<T>>;
 
 enum RuntimeCommand {
+    SessionHandle {
+        session_id: SessionId,
+        reply: OperationReply<DisposableConnectionHandle>,
+    },
+    RememberPeer {
+        peer: EndpointAddr,
+        reply: OperationReply<DeviceId>,
+    },
     Request {
         request: Request,
         reply: OperationReply<Response>,
@@ -1225,15 +1697,72 @@ enum RuntimeCommand {
 }
 
 enum OutboundReply {
+    Ipc(OperationReply<Response>),
     Pairing(oneshot::Sender<Result<PairingAttemptId, DaemonHandleError>>),
     Session(oneshot::Sender<Result<SessionId, DaemonHandleError>>),
+}
+
+#[derive(Clone)]
+enum DialResult {
+    Pairing(PairingAttemptId),
+    Session(DeviceId, SessionId),
+}
+
+impl OutboundReply {
+    fn send(self, result: OperationResult<DialResult>) {
+        match self {
+            Self::Ipc(reply) => send_oneshot(
+                reply,
+                result.map(|value| match value {
+                    DialResult::Pairing(attempt_id) => Response::PairingStarted { attempt_id },
+                    DialResult::Session(device_id, session_id) => Response::PeerConnected {
+                        device_id,
+                        session_id,
+                    },
+                }),
+            ),
+            Self::Pairing(reply) => send_oneshot(
+                reply,
+                result
+                    .and_then(|value| match value {
+                        DialResult::Pairing(id) => Ok(id),
+                        _ => Err(operation_error(
+                            ErrorCode::Internal,
+                            "pairing result invariant failed",
+                        )),
+                    })
+                    .map_err(DaemonHandleError::Operation),
+            ),
+            Self::Session(reply) => send_oneshot(
+                reply,
+                result
+                    .and_then(|value| match value {
+                        DialResult::Session(_, id) => Ok(id),
+                        _ => Err(operation_error(
+                            ErrorCode::Internal,
+                            "session result invariant failed",
+                        )),
+                    })
+                    .map_err(DaemonHandleError::Operation),
+            ),
+        }
+    }
+}
+
+struct OutboundRecord {
+    token: u64,
+    pairing: bool,
+    replies: Vec<OutboundReply>,
+    cancel: watch::Sender<bool>,
+    cancelled: bool,
 }
 
 enum TaskOutput {
     Incoming(OperationResult<ConnectionCandidate>),
     Outbound {
+        device_id: DeviceId,
+        token: u64,
         result: OperationResult<ConnectionCandidate>,
-        reply: OutboundReply,
     },
     PairingEnded {
         attempt_id: PairingAttemptId,
@@ -1245,6 +1774,7 @@ enum TaskOutput {
         session_id: SessionId,
         device_id: DeviceId,
         reason: SessionCloseReason,
+        failure: ConnectivityFailure,
     },
     IpcClient(Result<(), ipc_server::ClientError>),
 }
@@ -1276,6 +1806,7 @@ struct PendingRecord {
     closer: DisposableConnectionHandle,
     commands: mpsc::Sender<PairingCommand>,
     resolving: bool,
+    origin: SessionOrigin,
 }
 
 impl PendingRecord {
@@ -1286,7 +1817,25 @@ impl PendingRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionOrigin {
+    Inbound,
+    Outbound,
+}
+
+impl SessionOrigin {
+    fn replaces(self, existing: Self, local: DeviceId, remote: DeviceId) -> bool {
+        let preferred = if local < remote {
+            Self::Outbound
+        } else {
+            Self::Inbound
+        };
+        self == preferred && existing != preferred
+    }
+}
+
 struct SessionRecord {
+    origin: SessionOrigin,
     info: SessionInfo,
     closer: DisposableConnectionHandle,
 }
@@ -1332,7 +1881,7 @@ async fn prepare_outbound(
     manager: Arc<SessionManager>,
     metadata: LocalHelloMetadata,
     pending_slots: Arc<Semaphore>,
-    peer: EndpointAddr,
+    device_id: DeviceId,
     pairing: bool,
 ) -> OperationResult<ConnectionCandidate> {
     let metadata = pairing_metadata(metadata.device_name, metadata.platform).map_err(|_| {
@@ -1342,7 +1891,7 @@ async fn prepare_outbound(
         )
     })?;
     let bootstrapped = endpoint
-        .connect_and_bootstrap(peer, metadata)
+        .connect_device_and_bootstrap(device_id, metadata)
         .await
         .map_err(connection_error)?;
     match manager
@@ -1474,22 +2023,29 @@ async fn resolve_pending_pairing(
 
 async fn run_session(
     session_id: SessionId,
-    connection: AuthorizedConnection,
+    mut connection: AuthorizedConnection,
     mut shutdown: watch::Receiver<bool>,
 ) -> TaskOutput {
     let device_id = connection.remote_device_id();
-    let reason = tokio::select! {
-        _ = connection.closed() => SessionCloseReason::ConnectionClosed,
+    let (reason, failure) = tokio::select! {
+        result = connection.serve_control() => {
+            let failure = match result {
+                Ok(()) => ConnectivityFailure::Network,
+                Err(error) => failure_category(connection_error(error).code),
+            };
+            (SessionCloseReason::ConnectionClosed, failure)
+        },
         changed = shutdown.changed() => {
             let _shutdown_changed = changed;
             connection.close();
-            SessionCloseReason::Shutdown
+            (SessionCloseReason::Shutdown, ConnectivityFailure::Cancelled)
         }
     };
     TaskOutput::SessionEnded {
         session_id,
         device_id,
         reason,
+        failure,
     }
 }
 
@@ -1562,7 +2118,48 @@ fn session_error(error: SessionError) -> ErrorResponse {
 }
 
 fn connection_error(error: TransportError) -> ErrorResponse {
-    operation_error(ErrorCode::ConnectionFailed, error.to_string())
+    let (code, message) = match error {
+        TransportError::Unresolved(_) => {
+            (ErrorCode::PeerUnresolved, "no reachability source for peer")
+        }
+        TransportError::IntentRejected => (
+            ErrorCode::PurposeRejected,
+            "remote connection purpose rejected",
+        ),
+        TransportError::InvalidDeviceId | TransportError::SelfConnect => {
+            (ErrorCode::InvalidRequest, "invalid peer identity")
+        }
+        TransportError::HintCapacityExceeded => {
+            (ErrorCode::CapacityExceeded, "peer hint capacity exceeded")
+        }
+        error if error.is_retryable() => (ErrorCode::ConnectionFailed, "peer connection failed"),
+        _ => (
+            ErrorCode::ProtocolRejected,
+            "connection protocol or invariant failed",
+        ),
+    };
+    operation_error(code, message)
+}
+
+fn failure_category(code: ErrorCode) -> ConnectivityFailure {
+    match code {
+        ErrorCode::PeerUnresolved => ConnectivityFailure::Unresolved,
+        ErrorCode::ConnectionFailed => ConnectivityFailure::Network,
+        ErrorCode::CapacityExceeded => ConnectivityFailure::Capacity,
+        ErrorCode::PurposeRejected => ConnectivityFailure::PurposeRejected,
+        ErrorCode::PeerNotTrusted | ErrorCode::PeerAlreadyTrusted => {
+            ConnectivityFailure::NotTrusted
+        }
+        ErrorCode::ShuttingDown => ConnectivityFailure::Cancelled,
+        _ => ConnectivityFailure::Protocol,
+    }
+}
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn pairing_error(error: PairingError) -> ErrorResponse {
@@ -1602,10 +2199,439 @@ fn send_oneshot<T>(sender: oneshot::Sender<T>, value: T) {
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn test_daemon(directory: &tempfile::TempDir) -> TestResult<Daemon> {
+        let mut config = DaemonConfig::new(directory.path(), "test");
+        config.bind_addr = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+        config.connection_timeout = Duration::from_secs(2);
+        config.handshake_timeout = Duration::from_secs(2);
+        config.max_inflight_connections = 1;
+        Ok(Daemon::start(config).await?)
+    }
+
+    async fn trust_test_peer(daemon: &Daemon, device_id: DeviceId) -> TestResult {
+        daemon
+            .trust_store
+            .trust(rift_core::TrustedPeer {
+                device_id,
+                device_name: "test".into(),
+                platform: "test".into(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn test_candidate_pair(
+        first: &Daemon,
+        second: &Daemon,
+    ) -> TestResult<(ConnectionCandidate, ConnectionCandidate)> {
+        first
+            .endpoint
+            .remember_peer_addr(second.endpoint.local_addr())?;
+        let (a, b) = tokio::join!(
+            prepare_outbound(
+                Arc::clone(&first.endpoint),
+                Arc::clone(&first.session_manager),
+                first.metadata.clone(),
+                Arc::clone(&first.pending_slots),
+                second.device_id,
+                false
+            ),
+            accept_incoming(
+                Arc::clone(&second.endpoint),
+                Arc::clone(&second.session_manager),
+                second.metadata.clone(),
+                Arc::clone(&second.pending_slots)
+            ),
+        );
+        Ok((
+            a.map_err(|e| io::Error::other(format!("{e:?}")))?,
+            b.map_err(|e| io::Error::other(format!("{e:?}")))?,
+        ))
+    }
+
+    async fn register_test_candidate(
+        daemon: &mut Daemon,
+        candidate: ConnectionCandidate,
+        origin: SessionOrigin,
+    ) -> TestResult<SessionId> {
+        let ConnectionCandidate::Authorized(connection) = candidate else {
+            return Err("unexpected pairing candidate".into());
+        };
+        daemon
+            .register_session(connection, origin)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")).into())
+    }
+
+    #[tokio::test]
+    async fn repeated_cross_dials_converge_on_same_preferred_physical_direction() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&b, a.device_id).await?;
+        let (low, high) = if a.device_id < b.device_id {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        for iteration in 0..8 {
+            let (forward, reverse) = tokio::join!(
+                test_candidate_pair(low, high),
+                test_candidate_pair(high, low)
+            );
+            let (low_out, high_in) = forward?;
+            let (high_out, low_in) = reverse?;
+            // Nonpreferred alone must be usable, not discarded while waiting for preference.
+            let old_low = register_test_candidate(low, low_in, SessionOrigin::Inbound).await?;
+            let old_high = register_test_candidate(high, high_out, SessionOrigin::Outbound).await?;
+            assert_eq!(low.sessions.len(), 1);
+            assert_eq!(high.sessions.len(), 1);
+            let (new_low, new_high) = if iteration % 2 == 0 {
+                let low_id = register_test_candidate(low, low_out, SessionOrigin::Outbound).await?;
+                let high_id =
+                    register_test_candidate(high, high_in, SessionOrigin::Inbound).await?;
+                (low_id, high_id)
+            } else {
+                let high_id =
+                    register_test_candidate(high, high_in, SessionOrigin::Inbound).await?;
+                let low_id = register_test_candidate(low, low_out, SessionOrigin::Outbound).await?;
+                (low_id, high_id)
+            };
+            assert_ne!(new_low, old_low);
+            assert_ne!(new_high, old_high);
+            assert_eq!(low.sessions[&new_low].origin, SessionOrigin::Outbound);
+            assert_eq!(high.sessions[&new_high].origin, SessionOrigin::Inbound);
+            assert_eq!(low.connectivity.peers[&high.device_id].due, None);
+            assert_eq!(high.connectivity.peers[&low.device_id].due, None);
+            // Same-direction and nonpreferred duplicates cannot evict the canonical session.
+            let (duplicate_low, duplicate_high) = test_candidate_pair(low, high).await?;
+            assert_eq!(
+                register_test_candidate(low, duplicate_low, SessionOrigin::Outbound).await?,
+                new_low
+            );
+            assert_eq!(
+                register_test_candidate(high, duplicate_high, SessionOrigin::Inbound).await?,
+                new_high
+            );
+            let (duplicate_high, duplicate_low) = test_candidate_pair(high, low).await?;
+            assert_eq!(
+                register_test_candidate(low, duplicate_low, SessionOrigin::Inbound).await?,
+                new_low
+            );
+            assert_eq!(
+                register_test_candidate(high, duplicate_high, SessionOrigin::Outbound).await?,
+                new_high
+            );
+            // Join superseded tasks; their result must not arm another retry timer.
+            for daemon in [&mut *low, &mut *high] {
+                let output = daemon
+                    .tasks
+                    .join_next()
+                    .await
+                    .ok_or("missing superseded task")??;
+                assert!(!daemon.handle_task_output(output).await);
+                assert_eq!(daemon.sessions.len(), 1);
+                assert_eq!(
+                    daemon
+                        .connectivity
+                        .peers
+                        .values()
+                        .next()
+                        .ok_or("missing connectivity")?
+                        .due,
+                    None
+                );
+                for record in daemon.sessions.values() {
+                    record.closer.close();
+                }
+            }
+            for daemon in [&mut *low, &mut *high] {
+                while let Some(output) = daemon.tasks.join_next().await {
+                    daemon.handle_task_output(output?).await;
+                }
+                assert!(daemon.sessions.is_empty());
+            }
+        }
+        low.shutdown_runtime().await?;
+        high.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_registration_rechecks_forget_generation_and_global_capacity() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let c_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        let mut c = test_daemon(&c_dir).await?;
+        a.config.max_active_sessions = 1;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&b, a.device_id).await?;
+        trust_test_peer(&a, c.device_id).await?;
+        trust_test_peer(&c, a.device_id).await?;
+        let (stale, remote) = test_candidate_pair(&a, &b).await?;
+        a.trust_store.forget(b.device_id).await?;
+        trust_test_peer(&a, b.device_id).await?;
+        let ConnectionCandidate::Authorized(stale) = stale else {
+            return Err("not authorized".into());
+        };
+        assert!(
+            matches!(a.register_session(stale, SessionOrigin::Outbound).await, Err(error) if error.code == ErrorCode::PeerNotTrusted)
+        );
+        drop(remote);
+        let (first, remote) = test_candidate_pair(&a, &b).await?;
+        let session_id = register_test_candidate(&mut a, first, SessionOrigin::Outbound).await?;
+        register_test_candidate(&mut b, remote, SessionOrigin::Inbound).await?;
+        let (excess, remote) = test_candidate_pair(&a, &c).await?;
+        let ConnectionCandidate::Authorized(excess) = excess else {
+            return Err("not authorized".into());
+        };
+        assert!(
+            matches!(a.register_session(excess, SessionOrigin::Outbound).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        assert_eq!(a.canonical_session(b.device_id), Some(session_id));
+        assert_eq!(a.sessions.len(), 1);
+        drop(remote);
+        a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        c.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbound_bound_coalescing_and_invalidation_hold_until_task_join() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let c_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        let mut c = test_daemon(&c_dir).await?;
+        a.config.max_outbound_connects = 1;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&a, c.device_id).await?;
+        a.endpoint.remember_peer_addr(b.endpoint.local_addr())?;
+        a.endpoint.remember_peer_addr(c.endpoint.local_addr())?;
+        // B binds but never accepts Hello. The worker is held without sleeps or retries.
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_DIAL_WAITERS {
+            let (reply, receive) = oneshot::channel();
+            a.spawn_outbound(b.device_id, false, Some(OutboundReply::Ipc(reply)))
+                .await;
+            receivers.push(receive);
+        }
+        assert_eq!(a.tasks.len(), 1);
+        assert_eq!(a.outbound.len(), 1);
+        assert_eq!(a.outbound[&b.device_id].replies.len(), MAX_DIAL_WAITERS);
+        assert!(
+            matches!(a.start_outbound(b.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        assert!(
+            matches!(a.start_outbound(c.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        a.trust_store.forget(b.device_id).await?;
+        a.invalidate_peer(b.device_id, SessionCloseReason::Forgotten)
+            .await;
+        for receiver in receivers {
+            assert!(
+                matches!(receiver.await?, Err(error) if error.code == ErrorCode::PeerNotTrusted)
+            );
+        }
+        assert_eq!(
+            a.outbound.len(),
+            1,
+            "cancelled work must still occupy capacity until joined"
+        );
+        assert!(
+            matches!(a.start_outbound(c.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
+        );
+        let output = a
+            .tasks
+            .join_next()
+            .await
+            .ok_or("missing cancelled task")??;
+        a.handle_task_output(output).await;
+        assert!(a.outbound.is_empty());
+        assert!(a.sessions.is_empty());
+        assert!(!a.connectivity.peers.contains_key(&b.device_id));
+        a.start_outbound(c.device_id, false, true)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        a.shutdown_runtime().await?;
+        assert!(a.tasks.is_empty());
+        b.shutdown_runtime().await?;
+        c.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_outbound_authorization_is_discarded_after_revoke_forget_or_shutdown()
+    -> TestResult {
+        for reason in [
+            SessionCloseReason::Revoked,
+            SessionCloseReason::Forgotten,
+            SessionCloseReason::Shutdown,
+        ] {
+            let a_dir = tempfile::tempdir()?;
+            let b_dir = tempfile::tempdir()?;
+            let mut a = test_daemon(&a_dir).await?;
+            let mut b = test_daemon(&b_dir).await?;
+            trust_test_peer(&a, b.device_id).await?;
+            trust_test_peer(&b, a.device_id).await?;
+            let (candidate, remote) = test_candidate_pair(&a, &b).await?;
+            let (cancel, _cancelled) = watch::channel(false);
+            let (reply, receive) = oneshot::channel();
+            a.outbound.insert(
+                b.device_id,
+                OutboundRecord {
+                    token: 42,
+                    pairing: false,
+                    replies: vec![OutboundReply::Ipc(reply)],
+                    cancel,
+                    cancelled: false,
+                },
+            );
+            match reason {
+                SessionCloseReason::Revoked => {
+                    a.trust_store.revoke(b.device_id).await?;
+                    a.invalidate_peer(b.device_id, reason).await;
+                }
+                SessionCloseReason::Forgotten => {
+                    a.trust_store.forget(b.device_id).await?;
+                    a.invalidate_peer(b.device_id, reason).await;
+                    // Re-trust cannot make the old completed generation current again.
+                    trust_test_peer(&a, b.device_id).await?;
+                }
+                _ => a.shutdown_runtime().await?,
+            }
+            assert!(receive.await?.is_err());
+            a.handle_task_output(TaskOutput::Outbound {
+                device_id: b.device_id,
+                token: 42,
+                result: Ok(candidate),
+            })
+            .await;
+            assert!(a.sessions.is_empty());
+            assert!(a.outbound.is_empty());
+            assert!(!a.connectivity.peers.contains_key(&b.device_id));
+            drop(remote);
+            if reason != SessionCloseReason::Shutdown {
+                a.shutdown_runtime().await?;
+            }
+            b.shutdown_runtime().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incoming_session_is_allowed_while_outbound_remains_suspended() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&b, a.device_id).await?;
+        assert!(a.connectivity.insert(b.device_id, Instant::now()));
+        a.connectivity
+            .peers
+            .get_mut(&b.device_id)
+            .ok_or("missing peer")?
+            .suspend();
+        let (outbound, incoming) = test_candidate_pair(&b, &a).await?;
+        let session_id = register_test_candidate(&mut a, incoming, SessionOrigin::Inbound).await?;
+        register_test_candidate(&mut b, outbound, SessionOrigin::Outbound).await?;
+        assert!(a.connectivity.peers[&b.device_id].suspended);
+        assert_eq!(
+            a.connectivity.peers[&b.device_id].state,
+            ConnectivityState::Connected
+        );
+        a.sessions[&session_id].closer.close();
+        let ended = a.tasks.join_next().await.ok_or("missing session task")??;
+        a.handle_task_output(ended).await;
+        assert_eq!(
+            a.connectivity.peers[&b.device_id].state,
+            ConnectivityState::Suspended
+        );
+        assert_eq!(a.connectivity.deadline(), None);
+        a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connectivity_pages_are_capped_ordered_and_events_are_deduplicated() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut daemon = test_daemon(&directory).await?;
+        let mut events = daemon.events.subscribe();
+        let now = Instant::now();
+        for byte in 0..=200 {
+            assert!(
+                daemon
+                    .connectivity
+                    .insert(DeviceId::from_bytes([byte; 32]), now)
+            );
+        }
+        let id = DeviceId::from_bytes([1; 32]);
+        daemon.emit_connectivity(id);
+        daemon.emit_connectivity(id);
+        assert!(matches!(
+            events.try_recv()?,
+            Event::PeerConnectivityChanged { .. }
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let Response::PeerConnectivity { page } = daemon
+            .execute_request(Request::ListPeerConnectivity {
+                after: None,
+                limit: u16::MAX,
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?
+        else {
+            return Err("wrong response".into());
+        };
+        assert_eq!(page.entries.len(), 128);
+        let Response::PeerConnectivity { page: next } = daemon
+            .execute_request(Request::ListPeerConnectivity {
+                after: page.next_cursor,
+                limit: 128,
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?
+        else {
+            return Err("wrong response".into());
+        };
+        assert_eq!(next.entries.len(), 73);
+        assert!(next.next_cursor.is_none());
+        assert!(page.entries.last().ok_or("empty page")?.device_id < next.entries[0].device_id);
+        assert!(
+            matches!(daemon.execute_request(Request::ListPeerConnectivity { after: None, limit: 0 }).await, Err(error) if error.code == ErrorCode::InvalidRequest)
+        );
+        daemon.shutdown_runtime().await?;
+        Ok(())
+    }
+
     #[test]
     fn configuration_counts_are_nonzero_and_hard_bounded() {
         let mut config = DaemonConfig::new("unused", "test");
         assert!(config.validate().is_ok());
+        config.max_outbound_connects = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(DaemonError::InvalidConfiguration("max_outbound_connects"))
+        ));
+        config.max_outbound_connects = HARD_MAX_OUTBOUND_CONNECTS + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(DaemonError::InvalidConfiguration("max_outbound_connects"))
+        ));
+        config.max_outbound_connects = DEFAULT_MAX_OUTBOUND_CONNECTS;
         config.max_pending_pairings = 0;
         assert!(matches!(
             config.validate(),
