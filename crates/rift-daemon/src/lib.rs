@@ -2194,6 +2194,7 @@ async fn wait_deadline(deadline: Option<Instant>) {
 
 fn pairing_error(error: PairingError) -> ErrorResponse {
     match error {
+        PairingError::Transport { source, .. } => connection_error(source),
         PairingError::Trust(error) => persistence_error(error),
         error => operation_error(ErrorCode::ConnectionFailed, error.to_string()),
     }
@@ -2825,6 +2826,16 @@ mod tests {
             assert!(frame.len() - size_of::<u32>() <= rift_ipc::MAX_IPC_FRAME_LEN);
         }
         Ok(())
+    }
+
+    #[test]
+    fn pairing_setup_diagnostics_do_not_expose_raw_transport_errors() {
+        let error = pairing_error(PairingError::Transport {
+            phase: rift_session::PairingPhase::AwaitingResponse,
+            source: TransportError::InvalidConfiguration("raw transport address 127.0.0.1:1234"),
+        });
+        assert_eq!(error.code, ErrorCode::ProtocolRejected);
+        assert_eq!(error.message, "connection protocol or invariant failed");
     }
 
     #[test]
