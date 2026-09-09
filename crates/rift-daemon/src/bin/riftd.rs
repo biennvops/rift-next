@@ -115,3 +115,46 @@ async fn shutdown_signal() -> io::Result<()> {
 async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_lookup_is_explicit_and_independent_from_relay_arguments() -> anyhow::Result<()> {
+        let defaults =
+            Arguments::try_parse_from(["riftd", "--data-dir", "unused", "--device-name", "test"])?;
+        assert!(matches!(defaults.address_lookup, LookupArgument::Disabled));
+        assert!(matches!(defaults.relay, RelayArgument::Disabled));
+        let n0 = Arguments::try_parse_from([
+            "riftd",
+            "--data-dir",
+            "unused",
+            "--device-name",
+            "test",
+            "--address-lookup",
+            "n0",
+        ])?;
+        assert!(matches!(
+            AddressLookupConfiguration::from(n0.address_lookup),
+            AddressLookupConfiguration::N0
+        ));
+        assert!(matches!(
+            RelayConfiguration::from(n0.relay),
+            RelayConfiguration::Disabled
+        ));
+        assert!(
+            Arguments::try_parse_from([
+                "riftd",
+                "--data-dir",
+                "unused",
+                "--device-name",
+                "test",
+                "--address-lookup",
+                "implicit"
+            ])
+            .is_err()
+        );
+        Ok(())
+    }
+}

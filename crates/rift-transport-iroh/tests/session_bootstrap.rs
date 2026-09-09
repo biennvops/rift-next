@@ -755,3 +755,59 @@ async fn duplicate_intent_after_acceptance_is_rejected_by_authorized_control_own
     close_pair(&client, &server).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn outbound_intent_rejects_wrong_result_and_never_reuses_connection() -> TestResult {
+    use rift_protocol::ConnectionPurpose;
+    let (client, server) = bind_pair().await?;
+    let outgoing = async {
+        let mut connection = client
+            .connect_and_bootstrap(server.local_addr(), metadata("client", "test"))
+            .await?;
+        assert!(matches!(
+            connection
+                .request_intent(ConnectionPurpose::AuthorizedSession)
+                .await,
+            Err(TransportError::UnexpectedIntentMessage {
+                expected: MessageKind::ConnectionIntentResult,
+                received: MessageKind::ConnectionIntent
+            })
+        ));
+        assert!(matches!(
+            connection.request_intent(ConnectionPurpose::Pairing).await,
+            Err(TransportError::ControlConnectionPoisoned)
+        ));
+        Ok::<_, TransportError>(())
+    };
+    let incoming = async {
+        let connection = server.accept().await?;
+        let mut control = connection.accept_control().await?;
+        exchange_hello_with_timeout(
+            &mut control,
+            server.device_id(),
+            &metadata("server", "test"),
+            client.device_id(),
+            TEST_HANDSHAKE_TIMEOUT,
+        )
+        .await?;
+        assert_eq!(
+            read_message(&mut control.recv).await?,
+            ControlMessage::ConnectionIntent {
+                purpose: ConnectionPurpose::AuthorizedSession
+            }
+        );
+        write_message(
+            &mut control.send,
+            &ControlMessage::ConnectionIntent {
+                purpose: ConnectionPurpose::Pairing,
+            },
+        )
+        .await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(connection)
+    };
+    let (outgoing, incoming) = tokio::join!(outgoing, incoming);
+    outgoing?;
+    incoming?.close();
+    close_pair(&client, &server).await;
+    Ok(())
+}

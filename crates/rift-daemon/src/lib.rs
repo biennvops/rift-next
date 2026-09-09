@@ -6,7 +6,6 @@
 
 mod connectivity;
 mod ipc_server;
-pub use connectivity::retry_delay;
 mod local;
 
 use std::{
@@ -1067,6 +1066,24 @@ impl Daemon {
         accepted: bool,
         reply: OperationReply<Response>,
     ) {
+        if accepted
+            && self.connectivity.peers.len()
+                + self
+                    .pending_pairings
+                    .values()
+                    .filter(|record| record.resolving)
+                    .count()
+                >= connectivity::MAX_MANAGED_PEERS
+        {
+            send_oneshot(
+                reply,
+                Err(operation_error(
+                    ErrorCode::CapacityExceeded,
+                    "managed peer capacity reached before trust confirmation",
+                )),
+            );
+            return;
+        }
         let Some(record) = self.pending_pairings.get_mut(&attempt_id) else {
             send_oneshot(
                 reply,
@@ -2557,6 +2574,57 @@ mod tests {
             ConnectivityState::Suspended
         );
         assert_eq!(a.connectivity.deadline(), None);
+        a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_peer_capacity_rejects_confirmation_before_any_trust_commit() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        a.endpoint.remember_peer_addr(b.endpoint.local_addr())?;
+        let (outgoing, incoming) = tokio::join!(
+            prepare_outbound(
+                Arc::clone(&a.endpoint),
+                Arc::clone(&a.session_manager),
+                a.metadata.clone(),
+                Arc::clone(&a.pending_slots),
+                b.device_id,
+                true
+            ),
+            accept_incoming(
+                Arc::clone(&b.endpoint),
+                Arc::clone(&b.session_manager),
+                b.metadata.clone(),
+                Arc::clone(&b.pending_slots)
+            ),
+        );
+        let ConnectionCandidate::Pending(pending, permit) =
+            outgoing.map_err(|e| io::Error::other(format!("{e:?}")))?
+        else {
+            return Err("pairing bypassed".into());
+        };
+        let id = a
+            .register_pending(pending, permit, SessionOrigin::Outbound)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        for index in 0..connectivity::MAX_MANAGED_PEERS {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert!(
+                a.connectivity
+                    .insert(DeviceId::from_bytes(bytes), Instant::now())
+            );
+        }
+        let (reply, response) = oneshot::channel();
+        a.confirm_pairing(id, true, reply).await;
+        assert!(matches!(response.await?, Err(error) if error.code == ErrorCode::CapacityExceeded));
+        assert!(!a.pending_pairings[&id].resolving);
+        assert_eq!(a.trust_store.state(b.device_id).await, None);
+        drop(incoming);
         a.shutdown_runtime().await?;
         b.shutdown_runtime().await?;
         Ok(())
