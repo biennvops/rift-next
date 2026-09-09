@@ -11,8 +11,8 @@ pub(crate) const START_SPACING: Duration = Duration::from_millis(100);
 const STABLE_RESET: Duration = Duration::from_secs(30);
 
 /// Equal-jitter exponential backoff from an injected sample, capped at 60 seconds.
-/// Exported for deterministic performance measurement; no I/O or runtime allocation.
-pub fn retry_delay(attempt: u32, sample: u32) -> Duration {
+/// No I/O or runtime allocation.
+pub(crate) fn retry_delay(attempt: u32, sample: u32) -> Duration {
     let cap_ms = 1000_u64
         .saturating_mul(1_u64 << attempt.saturating_sub(1).min(6))
         .min(60_000);
@@ -170,6 +170,47 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "measurement executed by cargo xtask benchmark-smoke"]
+    fn connectivity_benchmark() {
+        use std::hint::black_box;
+        let ids = (0..1000_u64)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&index.to_be_bytes());
+                DeviceId::from_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let start = std::time::Instant::now();
+        let mut scheduler = Scheduler::new(now);
+        for id in ids {
+            assert!(scheduler.insert(black_box(id), now));
+        }
+        let elapsed = start.elapsed();
+        black_box(&scheduler);
+        assert_eq!(scheduler.peers.len(), 1000);
+        let start = std::time::Instant::now();
+        let iterations = 100_000_u32;
+        for index in 0..iterations {
+            black_box(retry_delay(
+                black_box(index % 100),
+                black_box(index.wrapping_mul(2654435761)),
+            ));
+        }
+        let backoff_elapsed = start.elapsed();
+        println!("production.connectivity.scheduler_peers=1000");
+        println!(
+            "production.connectivity.scheduler_init_seconds={:.6}",
+            elapsed.as_secs_f64()
+        );
+        println!("production.connectivity.backoff_iterations={iterations}");
+        println!(
+            "production.connectivity.backoff.ops_per_second={:.2}",
+            f64::from(iterations) / backoff_elapsed.as_secs_f64()
+        );
+    }
 
     #[test]
     fn backoff_jitter_cap_stability_and_short_flaps_are_deterministic() {

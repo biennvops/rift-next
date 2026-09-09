@@ -1094,6 +1094,57 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "measurement executed by cargo xtask benchmark-smoke"]
+    fn device_id_conversion_benchmark() -> Result<(), TransportError> {
+        use std::hint::black_box;
+        let id = device_id_from_endpoint_id(SecretKey::from_bytes(&[7; 32]).public());
+        let iterations = 10_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            black_box(endpoint_id_from_device_id(black_box(id))?);
+        }
+        let elapsed = start.elapsed();
+        println!("production.transport.device_id_conversion_iterations={iterations}");
+        println!(
+            "production.transport.device_id_conversion.ops_per_second={:.2}",
+            f64::from(iterations) / elapsed.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_classification_rejects_policy_protocol_and_invariant_failures() {
+        for error in [
+            TransportError::IntentRejected,
+            TransportError::IntentSequence,
+            TransportError::InvalidDeviceId,
+            TransportError::SelfConnect,
+            TransportError::EndpointClosed,
+            TransportError::Handshake(HandshakeError::UnsupportedProtocolVersion(2)),
+            TransportError::Handshake(HandshakeError::IdentityMismatch {
+                authenticated: DeviceId::from_bytes([1; 32]),
+                hello: DeviceId::from_bytes([2; 32]),
+            }),
+            TransportError::IntentFrame(FrameError::FrameTooLarge {
+                actual: 999999,
+                maximum: 1000,
+            }),
+            TransportError::ControlStream(ConnectionError::VersionMismatch),
+        ] {
+            assert!(!error.is_retryable());
+        }
+        for error in [
+            TransportError::ConnectTimeout,
+            TransportError::ControlTimeout,
+            TransportError::ControlStream(ConnectionError::Reset),
+            TransportError::ControlStream(ConnectionError::TimedOut),
+            TransportError::Handshake(HandshakeError::HandshakeTimeout),
+        ] {
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
     fn device_identity_conversion_validates_public_key_bytes() -> Result<(), TransportError> {
         let public = SecretKey::from_bytes(&[7; 32]).public();
         assert_eq!(

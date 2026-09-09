@@ -83,3 +83,26 @@ Each saved benchmark record must include:
 - relevant power, load, and network conditions.
 
 Store milestone baselines in the milestone report. Performance-sensitive pull requests should include before/after records using the same command and environment. For memory work, add an OS-level RSS measurement and retain assertions about fixed buffers and bounded allocation.
+
+## M5 connectivity measurements
+
+`cargo xtask benchmark-smoke` also runs two explicitly ignored measurement tests:
+
+```bash
+cargo test --locked -p rift-daemon --lib connectivity_benchmark -- --ignored --nocapture
+cargo test --locked -p rift-transport-iroh --lib device_id_conversion_benchmark -- --ignored --nocapture
+```
+
+These exercise the actual private production scheduler and DeviceId conversion without
+exposing benchmark-only production APIs or duplicating the implementation in an example.
+Scheduler initialization inserts 1,000 prebuilt synthetic DeviceIds into the bounded
+policy map; it excludes key generation, disk replay, and network startup. Backoff uses
+100,000 deterministic injected samples, including saturated attempts. DeviceId conversion
+validates a fixed valid public key 10,000 times. These are measurements, not throughput
+thresholds; the normal tests separately assert policy/resource properties.
+
+The existing IPC benchmark now also measures a bounded PeerConnectivityChanged event
+encode/decode round trip and its frame size. It uses the same iteration argument as the
+M4 ListPeers JSON baseline. Report old/new metrics separately: M5-only paths have no M4
+implementation against which to claim a speedup. Keep power/load/compiler/profile and
+all benchmark parameters with the result. No new benchmark dependency is required.
