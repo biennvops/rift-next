@@ -117,10 +117,10 @@ close handle, and daemon-local ID. Expiry, connection loss, cancellation, reject
 protocol/persistence failure, or success removes the record and releases the permit.
 
 Each authorized connection is owned by one tracked session task. The registry stores its
-trusted metadata and opaque close handle. Global and per-peer bounds reject and close a new
-connection without evicting unrelated sessions. Natural connection loss removes the
-session and emits an event; durable trust remains unchanged. M4 has no reconnect loop and
-persists no `EndpointAddr`.
+trusted metadata, direction, and opaque close handle. The global bound rejects new
+unrelated sessions; same-peer candidates follow the canonical direction rule below.
+Natural loss removes the session and schedules reconnect unless suspended or blocked;
+durable trust remains unchanged. No `EndpointAddr` is persisted.
 
 All daemon tasks are in an owned `JoinSet`; the IPC client task owns its nested writer
 `JoinSet`. No production `tokio::spawn` handle is dropped. A watch channel supplies shared
@@ -128,13 +128,14 @@ shutdown state.
 
 ## Pairing, revoke, and forget
 
-The daemon advertises `PAIRING_V1`, never `BLOB_TRANSFER_V1`. Unknown connections can only
-enter the M3 commit/reveal pairing state machine. Authenticated IPC exposes the six-digit
+The daemon advertises `PAIRING_V1`, never `BLOB_TRANSFER_V1`. Only Unknown connections
+with an accepted explicit Pairing intent enter the M3 commit/reveal pairing state machine. Authenticated IPC exposes the six-digit
 SAS and a daemon-local attempt ID, never network pairing ID, nonce, or commitment.
 
 `ConfirmPairing` consumes the live M3 `PendingPairing`. It is the only local request capable
 of Unknown → Trusted and still requires both peers' positive decisions plus durable trust
-commit before a session opens.
+commit before a session opens. Managed-peer capacity is checked before accepting a
+positive confirmation, including resolving pairings that reserve upcoming peer slots.
 
 Revoke ordering is:
 
@@ -147,11 +148,12 @@ durably append/sync Revoked
 ```
 
 Forget uses the same live invalidation after durably removing the decision. A pending pairing
-captures a per-peer in-memory trust generation before it waits for confirmation. Forget advances
+captures a per-peer in-memory trust generation before purpose admission. Forget advances
 that generation while holding the trust-store mutation lock, so a pre-existing pairing can either
 commit before the forget (and then be durably removed) or fail its stale-generation check; it
 cannot recreate Trusted after ForgetPeer returns. Fresh admission then treats the peer as
-unknown/pairable. The trust journal remains authoritative in a confirm/revoke race:
+unknown: Pairing intent is eligible, while Session intent is rejected without a prompt.
+The trust journal remains authoritative in a confirm/revoke race:
 revoke-before-trust makes `TrustStore::trust` fail, while trust-before-revoke is overwritten by the
 later durable revoke; session registration rechecks durable trust before accepting the result.
 

@@ -73,6 +73,8 @@ and deduplicated connectivity events without changing Status or old exact vector
 Diagnostics contain stable categories, not raw transport addresses/errors. Reachability
 and connectivity remain runtime-only. More than 4,096 trusted peers fails startup
 explicitly rather than silently omitting candidates or allocating unbounded policy.
+Positive pairing confirmation checks managed-peer capacity before trust commit, including
+resolving confirmations that reserve upcoming peer slots.
 
 Security and cancellation tests must cover asymmetric forget, stale completions,
 simultaneous cross-dial convergence, manual suspension, and bounded scheduling.
