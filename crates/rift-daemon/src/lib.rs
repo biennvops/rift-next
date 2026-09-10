@@ -797,6 +797,19 @@ impl Daemon {
                     "connectivity peer capacity reached",
                 ));
             }
+            if self.canonical_session(device_id).is_none()
+                && self.outbound.get(&device_id).is_some_and(|record| {
+                    record.cancelled || record.pairing || record.replies.len() >= MAX_DIAL_WAITERS
+                })
+            {
+                return Err(operation_error(
+                    ErrorCode::CapacityExceeded,
+                    "peer already has bounded outbound work",
+                ));
+            }
+            if manual && let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
+                peer.resume(Instant::now());
+            }
             if let Some(id) = self.canonical_session(device_id) {
                 return Ok(Some(id));
             }
@@ -817,12 +830,6 @@ impl Daemon {
                 peer.due = None;
             }
             return Ok(None);
-        }
-        if !pairing
-            && manual
-            && let Some(peer) = self.connectivity.peers.get_mut(&device_id)
-        {
-            peer.resume(Instant::now());
         }
         if self.outbound.len() >= self.config.max_outbound_connects
             || self.tasks.len() >= HARD_MAX_OWNED_TASKS
