@@ -797,9 +797,6 @@ impl Daemon {
                     "connectivity peer capacity reached",
                 ));
             }
-            if manual && let Some(peer) = self.connectivity.peers.get_mut(&device_id) {
-                peer.resume(Instant::now());
-            }
             if let Some(id) = self.canonical_session(device_id) {
                 return Ok(Some(id));
             }
@@ -820,6 +817,12 @@ impl Daemon {
                 peer.due = None;
             }
             return Ok(None);
+        }
+        if !pairing
+            && manual
+            && let Some(peer) = self.connectivity.peers.get_mut(&device_id)
+        {
+            peer.resume(Instant::now());
         }
         if self.outbound.len() >= self.config.max_outbound_connects
             || self.tasks.len() >= HARD_MAX_OWNED_TASKS
@@ -2461,6 +2464,11 @@ mod tests {
         assert!(
             matches!(a.start_outbound(b.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
         );
+        assert_eq!(
+            a.connectivity.peers[&b.device_id].state,
+            ConnectivityState::Connecting
+        );
+        assert_eq!(a.connectivity.peers[&b.device_id].due, None);
         assert!(
             matches!(a.start_outbound(c.device_id, false, true).await, Err(error) if error.code == ErrorCode::CapacityExceeded)
         );
