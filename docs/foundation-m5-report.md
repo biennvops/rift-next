@@ -1,11 +1,13 @@
 # Foundation Milestone 5 report
 
-## Status: implemented and locally verified
+## Status: implemented and verified
 
 M5 implements known-peer reachability, explicit connection purpose, canonical sessions,
-managed reconnect, and additive identity-only IPC. The final code revision is `9d6e314`;
-this report and the final documentation reconciliation follow it. Hosted CI and public
-N0 behavior have **not** been observed, and are not claimed as validated here.
+managed reconnect, and additive identity-only IPC. The final implementation revision is
+`68f1c7c`; follow-up test hardening is recorded in `8a12485`. This report reconciles the
+implementation and review-fix commits. Local verification of the final source and the five
+hosted CI jobs for `68f1c7c` are green. Public N0 behavior has **not** been observed, and is
+not claimed as validated here.
 
 Base: `f43cce58fa47a7b6202f6b0d205883bfc9947584`. Branch:
 `feat/foundation-m5-reachability-reconnect`. Logical implementation commits:
@@ -17,6 +19,10 @@ Base: `f43cce58fa47a7b6202f6b0d205883bfc9947584`. Branch:
 - `db6b178`: deterministic policy/conversion measurements and connectivity JSON benchmark.
 - `0a26f9e`: total owned-work ceiling, including unjoined task results.
 - `9d6e314`: stable transport failure categories during pairing setup.
+- `266cd5a`: rejected coalesced dial waiters preserve the active `Connecting` state.
+- `4f8ef46`: only accepted pairing confirmations reserve managed-peer capacity.
+- `68f1c7c`: `ConnectPeer` resumes a suspended peer with an existing healthy session.
+- `8a12485`: direct regression coverage for that `ConnectPeer` resumption path (test-only).
 
 No dependencies, manifests, Cargo.lock, Rust pin, CI infrastructure, or durable file
 formats changed. Iroh remains exactly `=1.0.3`. The supplied untracked `PLAN.md` is
@@ -110,9 +116,10 @@ Unique outbound tokens, cancellation watches, and the admission-time forget gene
 fence stale work. Cancelled setup occupies capacity until its result is joined. Durable
 revoke/forget happens before cancelling live work/removing connectivity. Final pending
 and session registration recheck eligibility and generation. Positive confirmation also
-checks managed-peer capacity, reserving slots for resolving confirmations before trust
-commit. Shutdown clears timers, rejects new commands, cancels work, closes resources,
-and joins every owned task under the existing deadline. ADR 0013 records these choices.
+checks managed-peer capacity, and only an in-flight positive confirmation reserves a
+slot for the upcoming managed peer, before trust commit. Shutdown clears timers, rejects
+new commands, cancels work, closes resources, and joins every owned task under the
+existing deadline. ADR 0013 records these choices.
 
 ### IPC and diagnostics
 
@@ -131,7 +138,7 @@ transition logs contain identity and bounded policy fields; retries do not spam 
 
 ## Regression and resource-bound evidence
 
-The canonical validation firewall executes **195 passing tests**, zero failures, and
+The canonical validation firewall executes **197 passing tests**, zero failures, and
 two intentionally ignored measurement tests; benchmark-smoke runs those measurements.
 Existing failure tests were retained and purpose-sensitive tests updated to exercise
 the new mandatory gate rather than preserving a bypass.
@@ -153,28 +160,31 @@ Key new checks include:
 - Eight injected-registration-order cross-dial rounds exercise nonpreferred alone,
   preferred replacement, both duplicate classes, and joined superseded-result handling.
 - Disconnect/suspension and identity-only ConnectPeer resume; inbound trusted session
-  permitted while local outbound remains suspended, including subsequent loss.
+  permitted while local outbound remains suspended, including ConnectPeer returning an
+  existing healthy inbound canonical session and subsequent loss.
 - Coalesced callers, shared outbound capacity, cancelled work retaining capacity until
   joined, buffered late authorization after revoke/forget/shutdown, forget→retrust
   generation fencing, and final global session-capacity rejection without eviction.
 - 4,096-peer synthetic policy bound, 1,000 deterministic spaced starts, exact injected
-  jitter/cap/backoff/stability/manual-bypass checks, and no stale timer queue after clear.
+  jitter/cap/backoff/stability/manual-bypass checks, rejected confirmations not reserving
+  capacity, and no stale timer queue after clear.
 - Total 1,024-owned-task bound, shutdown joins, confirmation rejected before trust at
   managed-peer capacity, bounded connectivity pagination/JSON, event deduplication, and
   explicit CLI lookup selection independent from relays.
 
 ## Final local validation and coverage
 
-At `9d6e314`, using pinned Rust 1.91.0 on the host recorded below:
+At `8a12485` (runtime implementation `68f1c7c` plus test hardening), using pinned Rust
+1.91.0 on the host recorded below:
 
 | Command/check | Result |
 | --- | --- |
 | `cargo xtask verify` | PASS: fmt, clippy all targets/features, tests, rustdoc warnings, architecture, dependency audit |
-| `cargo xtask coverage` | PASS: **81.66%** workspace lines; unchanged 60% floor |
+| `cargo xtask coverage` | PASS: **81.87%** workspace lines; unchanged 60% floor |
 | `cargo xtask benchmark-smoke` | PASS, including both ignored measurement tests |
 | `git diff --check` | PASS |
 | Old network and IPC vector objects compared against base | unchanged; only additions |
-| Hosted CI / cross-platform hosted execution | not observed |
+| Hosted CI / cross-platform hosted execution | PASS: GitHub Actions run `34506567974` for `68f1c7c`; all five jobs green, including advisory Windows |
 | Public N0 DNS/Pkarr/relay validation | not performed; not required by hermetic tests |
 
 | Package | Pinned M4 baseline | Final M5 line coverage |
@@ -186,19 +196,20 @@ At `9d6e314`, using pinned Rust 1.91.0 on the host recorded below:
 | rift-session | 90.80% | 90.38% |
 | rift-identity | 87.29% | 87.29% |
 | rift-ipc | 95.44% | 96.04% |
-| rift-daemon, aggregated | 77.82% | 83.59% |
+| rift-daemon, aggregated | 77.82% | 83.91% |
 
-Final workspace report: 10,397 total / 1,907 missed lines. Daemon aggregation: 2,877
-lines / 472 missed. Scheduler file coverage is 84.16% because its 35 measurement-test
+Final workspace report: 10,516 total / 1,907 missed lines. Daemon aggregation: 2,996
+lines / 482 missed. Scheduler file coverage is 84.16% because its 35 measurement-test
 lines are intentionally skipped by normal tests; its other 186 reported lines are
 covered. Coverage is evidence, not a substitute for failure-path assertions.
 
 Local logs: `/tmp/rift-m5-final-verify.log`, `/tmp/rift-m5-final-coverage.log`,
-`/tmp/rift-m5-final-benchmark.log`. LCOV: `target/llvm-cov/lcov.info`.
+`/tmp/rift-m5-final-benchmark.log`, and `/tmp/rift-m5-connectivity-memory.log`. LCOV:
+`target/llvm-cov/lcov.info`.
 
 ## Performance comparison and M5 measurements
 
-Final smoke run: `9d6e314`, Rust 1.91.0 / Iroh 1.0.3, macOS 26.6.2 (25G83), Apple M1
+Final smoke run: `8a12485` (runtime behavior unchanged from `68f1c7c`), Rust 1.91.0 / Iroh 1.0.3, macOS 26.6.2 (25G83), Apple M1
 arm64, dev/debug, local direct network only; power and competing load uncontrolled.
 Parameters match the pinned baseline below. New fixtures use 1,000 scheduler entries,
 100,000 backoff samples, 10,000 valid public-key conversions, and 100 connectivity JSON
@@ -206,50 +217,50 @@ round trips. Complete final metrics:
 
 ```text
 production.connectivity.scheduler_peers=1000
-production.connectivity.scheduler_init_seconds=0.001594
+production.connectivity.scheduler_init_seconds=0.002137
 production.connectivity.backoff_iterations=100000
-production.connectivity.backoff.ops_per_second=44824616.96
+production.connectivity.backoff.ops_per_second=33567365.00
 production.transport.device_id_conversion_iterations=10000
-production.transport.device_id_conversion.ops_per_second=66887.26
-production.protocol_v1.hello_encode_decode.ops_per_second=319957.00
-production.protocol_v1.ping_pong_encode_decode.ops_per_second=1781070.78
-production.protocol_v1.pairing_code.ops_per_second=113255.54
+production.transport.device_id_conversion.ops_per_second=46253.19
+production.protocol_v1.hello_encode_decode.ops_per_second=242620.10
+production.protocol_v1.ping_pong_encode_decode.ops_per_second=1378122.31
+production.protocol_v1.pairing_code.ops_per_second=95915.62
 production.protocol_v1.hello_frame_bytes=75
 production.protocol_v1.iterations=100
 production.protocol_v1.hello_bytes_processed=7500
 production.trust_journal.records=10
 production.trust_journal.file_bytes=835
-production.trust_journal.replay_seconds=0.000135
-production.trust_journal.lookup.ops_per_second=1193445.60
+production.trust_journal.replay_seconds=0.000171
+production.trust_journal.lookup.ops_per_second=1166752.23
 production.trust_journal.lookups=100
-production.identity.cold_create_seconds=0.012920
-production.identity.warm_load_seconds=0.000124
+production.identity.cold_create_seconds=0.011596
+production.identity.warm_load_seconds=0.000160
 production.identity.iterations=100
 production.identity.file_bytes=74
-production.ipc_json.encode_decode.ops_per_second=22592.70
+production.ipc_json.encode_decode.ops_per_second=22596.11
 production.ipc_json.frame_bytes=148
 production.ipc_json.payload_bytes=144
 production.ipc_json.iterations=100
-production.ipc_connectivity.encode_decode.ops_per_second=54569.01
+production.ipc_connectivity.encode_decode.ops_per_second=41230.74
 production.ipc_connectivity.frame_bytes=258
 production.ipc_connectivity.iterations=100
-production.daemon.cold_start_seconds=0.155251
-production.daemon.warm_restart_seconds=0.017319
-production.daemon.ipc_get_status_round_trip_seconds=0.000172
+production.daemon.cold_start_seconds=0.193657
+production.daemon.warm_restart_seconds=0.019615
+production.daemon.ipc_get_status_round_trip_seconds=0.000209
 production.daemon.ipc_get_status_iterations=10
 production.daemon.trust_replay_records=100
-production.daemon.trust_replay_start_seconds=0.052949
-protocol.encode_decode.ops_per_second=18841.12
-transfer.localhost.mib_per_second=15.27
-transfer.localhost.seconds=0.004092
+production.daemon.trust_replay_start_seconds=0.050634
+protocol.encode_decode.ops_per_second=14458.01
+transfer.localhost.mib_per_second=13.10
+transfer.localhost.seconds=0.004771
 transfer.localhost.bytes=65536
 transfer.streaming_buffer_bytes=65536
 ```
 
 Hello frame (75 bytes), IPC ListPeers frame (148), identity file (74), trust journal
 fixture (835), and transfer streaming buffer (65,536) remain unchanged. Small startup
-measurements moved from 0.138698→0.155251 s cold, 0.019378→0.017319 s warm, and
-0.042924→0.052949 s for 100-record replay. These are single dev/debug smoke observations,
+measurements moved from 0.138698→0.193657 s cold, 0.019378→0.019615 s warm, and
+0.042924→0.050634 s for 100-record replay. These are single dev/debug smoke observations,
 not performance guarantees or evidence sufficient to tune a regression threshold.
 
 The 100-iteration IPC observation was substantially below baseline, so it was investigated
@@ -273,8 +284,8 @@ no speedup is claimed for those paths.
 An isolated `/usr/bin/time -l` run of the built daemon test binary with
 `--ignored --nocapture connectivity_benchmark` at final code recorded:
 
-- scheduler initialization 0.006353 s; backoff 36,366,942.45 ops/s;
-- maximum process RSS **9,338,880 bytes**; peak memory footprint 3,048,512 bytes;
+- scheduler initialization 0.003142 s; backoff 17,169,468.84 ops/s;
+- maximum process RSS **9,437,184 bytes**; peak memory footprint 3,032,128 bytes;
 - one passing measurement test; no network tasks, Cargo build, or journal replay.
 
 This is whole test-process memory, not an allocator-level per-peer claim. The full
@@ -298,8 +309,9 @@ asserted independently. See `docs/performance/README.md` for reproduction.
 - No feature state replay, transfer resumption/idempotency, clipboard/file sync, browsing,
   mDNS UI, QR flow, custom resolver service, native UI/FFI, remote IPC, service install,
   keychain integration, protocol v2, or development-insecure TLS production API was added.
-- Hosted CI, Windows/Linux execution, release-profile performance, and public N0 service
-  observations remain unobserved here. Existing CI/toolchain configuration is unchanged.
+- Hosted CI is recorded above, including Linux, macOS, and advisory Windows execution. Release-profile
+  performance and public N0 service observations remain unobserved here. Existing CI/toolchain
+  configuration is unchanged.
 
 ## Historical baseline evidence
 
