@@ -1077,7 +1077,7 @@ impl Daemon {
                 + self
                     .pending_pairings
                     .values()
-                    .filter(|record| record.resolving)
+                    .filter(|record| record.resolving == Some(true))
                     .count()
                 >= connectivity::MAX_MANAGED_PEERS
         {
@@ -1100,7 +1100,7 @@ impl Daemon {
             );
             return;
         };
-        if record.resolving {
+        if record.resolving.is_some() {
             send_oneshot(
                 reply,
                 Err(operation_error(
@@ -1110,7 +1110,7 @@ impl Daemon {
             );
             return;
         }
-        record.resolving = true;
+        record.resolving = Some(accepted);
         let commands = record.commands.clone();
         if commands
             .send(PairingCommand::Confirm { accepted, reply })
@@ -1352,7 +1352,7 @@ impl Daemon {
                 deadline,
                 closer,
                 commands,
-                resolving: false,
+                resolving: None,
                 origin,
             },
         );
@@ -1838,7 +1838,7 @@ struct PendingRecord {
     deadline: tokio::time::Instant,
     closer: DisposableConnectionHandle,
     commands: mpsc::Sender<PairingCommand>,
-    resolving: bool,
+    resolving: Option<bool>,
     origin: SessionOrigin,
 }
 
@@ -2285,6 +2285,35 @@ mod tests {
         ))
     }
 
+    async fn test_pairing_candidate_pair(
+        first: &Daemon,
+        second: &Daemon,
+    ) -> TestResult<(ConnectionCandidate, ConnectionCandidate)> {
+        first
+            .endpoint
+            .remember_peer_addr(second.endpoint.local_addr())?;
+        let (outgoing, incoming) = tokio::join!(
+            prepare_outbound(
+                Arc::clone(&first.endpoint),
+                Arc::clone(&first.session_manager),
+                first.metadata.clone(),
+                Arc::clone(&first.pending_slots),
+                second.device_id,
+                true
+            ),
+            accept_incoming(
+                Arc::clone(&second.endpoint),
+                Arc::clone(&second.session_manager),
+                second.metadata.clone(),
+                Arc::clone(&second.pending_slots)
+            ),
+        );
+        Ok((
+            outgoing.map_err(|e| io::Error::other(format!("{e:?}")))?,
+            incoming.map_err(|e| io::Error::other(format!("{e:?}")))?,
+        ))
+    }
+
     async fn register_test_candidate(
         daemon: &mut Daemon,
         candidate: ConnectionCandidate,
@@ -2644,11 +2673,65 @@ mod tests {
         let (reply, response) = oneshot::channel();
         a.confirm_pairing(id, true, reply).await;
         assert!(matches!(response.await?, Err(error) if error.code == ErrorCode::CapacityExceeded));
-        assert!(!a.pending_pairings[&id].resolving);
+        assert!(a.pending_pairings[&id].resolving.is_none());
         assert_eq!(a.trust_store.state(b.device_id).await, None);
         drop(incoming);
         a.shutdown_runtime().await?;
         b.shutdown_runtime().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_pairing_confirmation_does_not_reserve_managed_peer_capacity() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let c_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        let mut c = test_daemon(&c_dir).await?;
+        let (negative_outgoing, negative_incoming) = test_pairing_candidate_pair(&a, &b).await?;
+        let (positive_outgoing, positive_incoming) = test_pairing_candidate_pair(&a, &c).await?;
+        let ConnectionCandidate::Pending(negative_pending, negative_permit) = negative_outgoing
+        else {
+            return Err("negative pairing bypassed".into());
+        };
+        let negative_id = a
+            .register_pending(negative_pending, negative_permit, SessionOrigin::Outbound)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let ConnectionCandidate::Pending(positive_pending, positive_permit) = positive_outgoing
+        else {
+            return Err("positive pairing bypassed".into());
+        };
+        let positive_id = a
+            .register_pending(positive_pending, positive_permit, SessionOrigin::Outbound)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let _remote_pairings = (negative_incoming, positive_incoming);
+
+        let mut index = 0_u64;
+        while a.connectivity.peers.len() < connectivity::MAX_MANAGED_PEERS - 1 {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&index.to_be_bytes());
+            index = index.saturating_add(1);
+            let device_id = DeviceId::from_bytes(bytes);
+            if device_id == a.device_id || device_id == b.device_id || device_id == c.device_id {
+                continue;
+            }
+            assert!(a.connectivity.insert(device_id, Instant::now()));
+        }
+
+        let (negative_reply, _negative_response) = oneshot::channel();
+        a.confirm_pairing(negative_id, false, negative_reply).await;
+        assert_eq!(a.pending_pairings[&negative_id].resolving, Some(false));
+
+        let (positive_reply, _positive_response) = oneshot::channel();
+        a.confirm_pairing(positive_id, true, positive_reply).await;
+        assert_eq!(a.pending_pairings[&positive_id].resolving, Some(true));
+
+        a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        c.shutdown_runtime().await?;
         Ok(())
     }
 
