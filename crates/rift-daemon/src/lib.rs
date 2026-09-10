@@ -2638,6 +2638,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_peer_resumes_suspended_peer_with_healthy_inbound_session() -> TestResult {
+        let a_dir = tempfile::tempdir()?;
+        let b_dir = tempfile::tempdir()?;
+        let mut a = test_daemon(&a_dir).await?;
+        let mut b = test_daemon(&b_dir).await?;
+        trust_test_peer(&a, b.device_id).await?;
+        trust_test_peer(&b, a.device_id).await?;
+        assert!(a.connectivity.insert(b.device_id, Instant::now()));
+        a.connectivity
+            .peers
+            .get_mut(&b.device_id)
+            .ok_or("missing peer")?
+            .suspend();
+        let (outbound, incoming) = test_candidate_pair(&b, &a).await?;
+        let session_id = register_test_candidate(&mut a, incoming, SessionOrigin::Inbound).await?;
+        register_test_candidate(&mut b, outbound, SessionOrigin::Outbound).await?;
+        assert!(a.connectivity.peers[&b.device_id].suspended);
+        assert_eq!(
+            a.start_outbound(b.device_id, false, true)
+                .await
+                .map_err(|e| io::Error::other(format!("{e:?}")))?,
+            Some(session_id)
+        );
+        assert!(!a.connectivity.peers[&b.device_id].suspended);
+        assert_eq!(
+            a.connectivity.peers[&b.device_id].state,
+            ConnectivityState::Connected
+        );
+        assert_eq!(a.connectivity.peers[&b.device_id].due, None);
+        a.shutdown_runtime().await?;
+        b.shutdown_runtime().await?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn managed_peer_capacity_rejects_confirmation_before_any_trust_commit() -> TestResult {
         let a_dir = tempfile::tempdir()?;
         let b_dir = tempfile::tempdir()?;
