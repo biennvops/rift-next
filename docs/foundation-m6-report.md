@@ -1,6 +1,6 @@
 # Foundation Milestone 6 report
 
-## Status: partial wire/streaming checkpoint — M6 is not complete
+## Status: partial source/sequencing checkpoint — M6 is not complete
 
 Base: `b02a77a1c5d671716566809c06373647a200b898`.
 Branch: `feat/foundation-m6-file-transfer`.
@@ -11,6 +11,8 @@ Implementation commits at this checkpoint:
 - `c3194b1`: portable filename validation and immutable metadata in `rift-protocol`.
 - `3ae000a`: transfer control messages, bounded data header, exact vectors, ADR 0014.
 - `5e8f991`: cancellable fixed-buffer engine, architecture policy, and platform smoke lists.
+- `15a63fa`: bounded redacted local source paths and regular-handle metadata preparation.
+- `a009bf0`: explicit logical transfer sequencing and checked attempt generations.
 
 There is no final M6 implementation or merge candidate yet. The supplied untracked
 `PLAN.md` and `REVIEW.md` remain untouched. Dependency and CI changes specified by the
@@ -35,15 +37,16 @@ COM/LPT digit forms are also rejected. Other Unicode remains unnormalized.
 `TransferMetadata` has validated filename, exact length, and raw 32-byte BLAKE3 digest.
 Its private fields and validated deserialization enforce the 1 TiB hard limit; zero
 length is valid. The type carries no local path or filesystem metadata. Actual
-hashing is now implemented in the engine; daemon size policy and regular-file/path
-admission are not implemented yet.
+hashing and already-open regular-file preparation are implemented in the engine.
+The daemon's safe read-only source opener and configured policy wiring remain pending.
 
 Protocol appends discriminants 10–13: Offer, Accept, Terminal, TerminalAck. Terminal
 outcomes and failures are coarse typed enums. Twelve control and two data-header vectors
 were added; an immutable M5 fixture protects every pre-existing vector object. Data
 headers have their own 256-byte bound, fixed receive buffer, exact-consumption decoder,
 and range checks; file payloads never enter control frames. Protocol/runtime sequencing
-requirements are documented, but only codecs are implemented so far.
+requirements are documented. Codecs and the in-memory logical state machine are
+implemented, but no live session yet dispatches transfer control messages.
 
 The new engine revalidates the full source before writing stream bytes, hashes again
 while sending, rehashes receiver staging prefixes, requires exact suffix length and
@@ -57,6 +60,32 @@ A composed duplex benchmark exposed a stack overflow in the initial stack-buffer
 implementation; normal tests now bound future size and execute joined file/duplex
 transfers. A failing always-ready-reader cancellation test additionally led to explicit
 Tokio cooperative-budget consumption. No timeouts or tests were weakened.
+
+`rift-core::SourcePath` is a local-only 4096-byte-bounded UTF-8 absolute native path.
+It rejects NUL, relative paths, and non-UTF-8 native paths. Debug is always redacted;
+there is no Display implementation. Validated Serde is intended only for authenticated
+local IPC/private manifests, never a network field. Path validation performs no I/O,
+canonicalization, or lossy conversion. Core ownership lets IPC and transfer share the
+same value without introducing a forbidden cross-layer dependency.
+
+`prepare_source` validates portable basename and configured size limit, checks the
+actual opened handle is regular before hashing, computes immutable whole-file metadata,
+and rechecks length afterward. It never opens or modifies a source, generates an ID,
+or persists an offer. Its caller must supply a matching read-only handle under bounded
+owned preparation work. This deliberately does not claim to solve special-file or
+path-replacement races in the future runtime opener.
+
+`LogicalTransfer` tracks immutable peer/ID/metadata, direction, and explicit state.
+Incoming permission requires an acceptance-persisted transition; outgoing Accept requires
+an Offer. Repeated offers produce pending/accepted/terminal replay decisions without
+creating another record. A data attempt checks the ID, exact range, accepted offset,
+and exclusive state. Verification precedes incoming completion; terminal acknowledgement
+is illegal before terminal state. Repeated terminal traffic cannot resurrect a settled
+or cancelled transfer. Checked attempt counters cannot wrap; pause invalidates old
+verification, publication, and worker-failure results. The daemon must still fence by
+canonical SessionId, cancel/join workers, and reconcile actual durable partial length.
+Methods named `*_persisted` are logical transitions after caller-owned persistence,
+not a store implementation or evidence of crash-safe behavior.
 
 `rift-transfer` depends only on core/protocol plus standard workspace utility crates.
 Architecture tests reject upward/transport/Prototype 0 reachability, including transitive
@@ -109,7 +138,7 @@ Local logs:
 No production transfer throughput or resume benchmark exists yet. Existing smoke
 success is rot-detection evidence only, not an M6 performance claim.
 
-## Wire/streaming checkpoint verification
+## Wire/streaming checkpoint verification (historical)
 
 Implementation SHA: `5e8f9912be805e98fd13cc945f584807e7ff4611` (not a final M6 SHA).
 Same pinned Rust 1.91.0 toolchain, Apple M1 arm64, macOS 26.6.2 (25G83).
@@ -247,19 +276,67 @@ No observed existing-path regression in these samples; no speedup or threshold i
 claimed from one uncontrolled run. Required 8/64/256 MiB production-vs-Prototype 0 and
 256 MiB durable-resume measurements are still outstanding until the runtime exists.
 
+## Source/sequencing checkpoint verification
+
+Implementation SHA: `a009bf0ed13fc8c72c42c3d8fab4396a4a108b04` (not final M6).
+Pinned Rust 1.91.0; same local host as the prior checkpoint. No dependency, CI,
+network vector, IPC vector, capability-advertisement, or platform policy changes in
+these two implementation commits.
+
+| Check | Result |
+| --- | --- |
+| `cargo xtask verify` after source and state changes | PASS |
+| Core unit tests | PASS: 13 |
+| Transfer unit tests | PASS: 38, plus one ignored measurement |
+| `cargo xtask coverage` | PASS: **83.80%** workspace lines, unchanged floor |
+| `cargo xtask benchmark-smoke` | PASS; still engine-only, not daemon transfer |
+| `git diff --check` | PASS |
+| Hosted CI / Windows execution | Not observed |
+
+Final canonical coverage reports 12,097 lines / 1,960 missed. SourcePath file: 95.35%;
+source preparation: 97.57%; logical state machine: 99.55%; transfer package aggregate:
+97.01%. Coverage fluctuates slightly in unchanged runtime files between executions;
+it is not evidence of unimplemented durability or authorization properties.
+
+Path tests exercise exact byte bounds, Unicode byte counts, absolute/native syntax,
+NUL, non-UTF-8 Unix paths, unchanged local serialization, truncated Postcard, invalid
+wire values, and redacted diagnostics. A Windows-only drive-relative/root-relative
+regression test is present but not executed on this host.
+
+Preparation tests cover empty, tiny, buffer-boundary, exact-limit and oversized files;
+invalid configured limits; directories and `/dev/null` on Unix; portable-name rejection;
+read failures; pre-I/O cancellation; unchanged source contents; and source mutation
+between preparation and sending. Limits and invalid names are checked without moving
+the file cursor into the hashing loop.
+
+State-machine tests cover happy-path sequencing, pending/accepted/terminal duplicate
+offers, immutable metadata conflicts, wrong roles, premature acceptance/data/completion/
+acknowledgement, invalid ranges/IDs, second simultaneous attempts, nonzero resume,
+terminal replay/settlement, cancellation, late worker verification/publication/failure,
+and generation exhaustion without wraparound. They are deterministic and perform no
+network or disk I/O; durable marker ordering remains a required store/runtime test.
+
+Logs:
+
+- `/tmp/rift-m6-source-final-verify.log`
+- `/tmp/rift-m6-source-coverage.log`
+- `/tmp/rift-m6-state-verify.log`
+- `/tmp/rift-m6-state-coverage.log`
+- `/tmp/rift-m6-state-benchmark.log`
+
 ## Outstanding plan execution
 
 All remaining M6 requirements still apply, notably:
 
-1. Implement the explicit transfer state machine and bounded durable store, private
-   source-path/regular-file preparation, accepted/terminal markers, recovery,
-   source identity generation/collision handling, and storage failure-path tests.
+1. Implement the bounded durable store, accepted/terminal markers, recovery into the
+   logical state machine, safe runtime source opening, source identity generation/
+   collision handling, and storage failure-path tests.
 2. Expose data streams only through authorized sessions; preserve the sole control
    owner and capability gating. The protocol codecs alone do not implement this API.
 3. Integrate the bounded daemon registry, preparation/data workers, commands/events,
    generation fences, reconnect/restart replay, revoke/forget, and joined shutdown.
-4. Add validated/redacted local source paths and paginated transfer IPC operations,
-   DTOs, progress events, and exact conformance vectors.
+4. Wire the validated/redacted source path into authenticated SendFile IPC and add
+   paginated transfer operations, DTOs, progress events, and exact conformance vectors.
 5. Exercise mandatory two-daemon authenticated IPC transfer, rejection, cancellation,
    resume, supersession, restart, integrity, capacity, and authorization-race scenarios.
 6. Add ADR 0015 and storage/runtime/recovery documentation; complete the new daemon
