@@ -4,7 +4,14 @@
 //! The caller owns authorization, worker capacity, durable acceptance, attempt
 //! fencing, stream finish/reset, partial-file sync/cleanup, and atomic publication.
 
+mod record;
 mod source;
+
+pub use record::{
+    MAX_TRANSFER_RECORD_LEN, MAX_TRANSFER_RECORD_PAYLOAD_LEN, ManifestSource, TerminalOrigin,
+    TransferManifest, TransferRecord, TransferRecordError, decode_transfer_record,
+    encode_transfer_record,
+};
 mod state;
 mod streaming;
 

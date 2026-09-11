@@ -48,5 +48,6 @@ and contextual offset/length checks. Runtime tests must separately prove authori
 acceptance, durability, cancellation, and bounded owned workers.
 
 No folders, batch transactions, synchronization, compression, delta/chunk hashing,
-arbitrary Save As, or generic plugin framework is part of this decision. Persistence
-and resumption details will be recorded in ADR 0015 alongside their implementation.
+arbitrary Save As, or generic plugin framework is part of this decision. ADR 0015
+defines the private manifest/marker encoding; filesystem persistence and resumption
+recovery remain pending.

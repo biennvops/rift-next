@@ -123,3 +123,13 @@ Worker terminal failures must supply their generation just like successful verif
 Terminal replay is monotonic and cannot turn a cancelled transfer into a completed one.
 These are deterministic in-memory state tests, not proof of durable acceptance, atomic
 publication, trust-race fencing, or cancellation/join behavior in a daemon runtime.
+
+Private transfer records now have an independent 8 KiB payload bound, strict versioned
+Postcard envelope, and BLAKE3 over header plus payload (ADR 0015). Marker digests bind the
+complete immutable manifest, and marker role checks keep acceptance/completion/rejection
+receiver-authoritative. Source paths remain redacted in Debug and codec errors; encoded
+manifest bytes intentionally contain them and must never be logged or sent remotely.
+Codec tests exercise malformed/truncated/oversized/unsupported inputs, every single-byte
+corruption position, validated-domain bypass attempts, marker substitution, and wrong
+roles. This does not implement bounded filesystem reads, atomic persistence, permissions,
+crash reconciliation, or trust-aware startup. Those remain separate mandatory tests.

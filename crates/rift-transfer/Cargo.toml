@@ -7,6 +7,8 @@ publish = false
 
 [dependencies]
 blake3.workspace = true
+postcard.workspace = true
+serde.workspace = true
 rift-core = { path = "../rift-core", version = "=0.1.0" }
 rift-protocol = { path = "../rift-protocol", version = "=0.1.0" }
 thiserror.workspace = true
