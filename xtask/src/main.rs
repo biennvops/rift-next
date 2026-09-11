@@ -97,6 +97,34 @@ fn coverage() -> Result<()> {
 fn benchmark_smoke() -> Result<()> {
     run_cargo(
         &[
+            "test",
+            "--locked",
+            "--package",
+            "rift-daemon",
+            "--lib",
+            "connectivity_benchmark",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+        &[],
+    )?;
+    run_cargo(
+        &[
+            "test",
+            "--locked",
+            "--package",
+            "rift-transport-iroh",
+            "--lib",
+            "device_id_conversion_benchmark",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+        &[],
+    )?;
+    run_cargo(
+        &[
             "run",
             "--locked",
             "--package",

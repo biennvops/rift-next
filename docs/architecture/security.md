@@ -57,5 +57,27 @@ them.
 29. The resident supervisor owns, cancels, and joins every network, pairing, session, and
     IPC task under a bounded shutdown deadline.
 
+30. Known-identity reachability never implies trust. N0 publication/lookup is explicit and
+    independent from relay routing; no address, relay URL, or EndpointAddr becomes durable
+    trust state or enters IPC.
+31. Every application connection requests exactly one purpose after Hello. Only Trusted +
+    AuthorizedSession and Unknown + Pairing are accepted. Remote rejection is coarse and
+    never automatically routes into pairing, including asymmetric forget/revocation.
+32. One canonical authorized session exists per DeviceId. Both peers prefer lower→higher;
+    superseded results cannot create retry loops while the canonical session is healthy.
+33. Only durable Trusted identities enter managed reconnect. A single bounded scheduler,
+    shared bounded outbound registry, rate spacing, and capped jittered backoff prevent
+    unbounded per-peer task/timer creation and tight retry loops. No-route and policy
+    rejection leave no automatic retry deadline.
+34. Cancellation retains outbound capacity until the task is joined. Unique runtime tokens
+    and the forget generation prevent delayed results from restoring stale authorization
+    after revoke, forget, replacement, or shutdown. Final pending/session registration
+    rechecks current durable eligibility and the admission generation.
+35. Local DisconnectSession suspends automatic outbound without mutating trust or banning
+    inbound trusted sessions. Only explicit ConnectPeer clears suspension in this runtime.
+36. Authorized control streams reject duplicate intent/results and premature pairing;
+    every started frame is deadline-bound, while idle connections can remain healthy.
+    Cancelling bootstrap closes the disposable connection; path migration is not loss.
+
 A change affecting an invariant needs targeted failure-path coverage. Aggregate coverage
 and green CI do not by themselves prove that an invariant holds.

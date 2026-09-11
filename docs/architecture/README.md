@@ -1,7 +1,7 @@
 # Rift vNext architecture
 
-Foundation Milestone 4 turns the M1–M3 libraries into one resident process. Prototype 0
-remains architectural evidence and independent regression coverage.
+Foundation Milestone 5 adds purpose-gated known-peer reachability and managed reconnect
+to the M4 resident owner. Prototype 0 remains independent architectural evidence.
 
 ## Workspace ownership
 
@@ -85,14 +85,14 @@ Iroh endpoint addresses, socket/pipe, and task state are recreated every launch.
 
 ## Network admission and live ownership
 
-The M3 admission boundary remains unchanged:
+The M5 purpose gate precedes application admission:
 
 ```text
 BootstrappedConnection (Iroh + identity-bound Hello authenticated)
         |
-        +-- Trusted --> AuthorizedConnection --> bounded session task/registry
-        +-- Unknown --> PairableConnection --> bounded pairing task/registry
-        +-- Revoked --> close and reject
+        +-- explicit AuthorizedSession + Trusted --> canonical AuthorizedConnection
+        +-- explicit Pairing + Unknown --> bounded PairableConnection
+        +-- every other combination --> coarse rejection and close
 ```
 
 Application functionality is reachable only through `AuthorizedConnection`. Display name,
@@ -107,8 +107,14 @@ active session and pending confirmation. Durable revoke/forget closes matching l
 sessions and pairings before returning. Natural disconnect removes only runtime session
 state and does not revoke trust.
 
-M4 advertises `PAIRING_V1`, not `BLOB_TRANSFER_V1`. It persists no address and performs no
-automatic reconnect.
+The daemon advertises `PAIRING_V1`, not `BLOB_TRANSFER_V1`. It persists no addresses.
+`rift-transport-iroh` owns explicit Disabled/N0 lookup and transient MemoryLookup hints;
+relay selection remains independent. One daemon scheduler manages bounded trusted-peer
+retry state and outbound work. Lower DeviceId prefers outbound and higher prefers inbound,
+so cross-dials converge on one canonical session. Intent rejection never falls back to
+pairing. DisconnectSession suspends local automatic outbound until ConnectPeer, without
+rejecting inbound trusted sessions. Reconnect establishes a fresh Hello, purpose gate, and
+SessionId; **feature state replay remains deferred**. See ADRs 0012–0013.
 
 ## Local control boundary
 

@@ -6,11 +6,15 @@
 //! reconnect loop, or insecure relay TLS mode.
 
 use std::{
+    collections::BTreeSet,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+pub use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{
     ConnectingError, Connection, ConnectionError, RecvStream, SendStream, presets,
 };
@@ -18,8 +22,9 @@ use iroh::{Endpoint, RelayMode};
 pub use iroh::{EndpointAddr, RelayUrl, SecretKey, TransportAddr};
 use rift_core::DeviceId;
 use rift_protocol::{
-    ControlChannel, ControlError, ControlMessage, FrameError, HandshakeError, Hello, HelloMetadata,
-    MessageKind, PROTOCOL_VERSION, PairingMessage, exchange_hello_with_timeout,
+    ConnectionPurpose, ControlChannel, ControlError, ControlMessage, FrameError, HandshakeError,
+    Hello, HelloMetadata, MessageKind, PROTOCOL_VERSION, PairingMessage,
+    exchange_hello_with_timeout,
 };
 use thiserror::Error;
 use tokio::time;
@@ -63,9 +68,29 @@ impl RelayConfiguration {
     }
 }
 
+/// External known-identity reachability, independent from relay routing.
+#[derive(Clone, Debug, Default)]
+pub enum AddressLookupConfiguration {
+    /// Do not publish or resolve through external infrastructure.
+    #[default]
+    Disabled,
+    /// Publish and resolve through Number 0's DNS/Pkarr infrastructure.
+    N0,
+    /// Injected native in-memory resolver for hermetic known-identity lookup.
+    /// Its lifetime/contents are owned by the local caller, not persisted by Rift.
+    Memory(MemoryLookup),
+}
+
+/// Maximum ephemeral peer hints retained by one endpoint.
+pub const MAX_PEER_HINTS: usize = 4096;
+/// Maximum paths in one ephemeral peer hint.
+pub const MAX_HINT_PATHS: usize = 32;
+
 /// Small production endpoint configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct EndpointConfig {
+    /// Explicit external lookup selection; memory hints are always available.
+    pub address_lookup: AddressLookupConfiguration,
     /// Relay behavior for the endpoint.
     pub relay: RelayConfiguration,
     /// Optional explicit IP bind address. `None` uses Iroh's normal IP transports.
@@ -79,6 +104,7 @@ pub struct EndpointConfig {
 impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
+            address_lookup: AddressLookupConfiguration::Disabled,
             relay: RelayConfiguration::Disabled,
             bind_addr: None,
             connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
@@ -115,6 +141,36 @@ impl EndpointConfig {
 /// Errors from endpoint, connection, stream, and production bootstrap operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// The peer rejected the requested purpose without disclosing trust state.
+    #[error("remote connection purpose rejected")]
+    IntentRejected,
+    /// Purpose framing failed.
+    #[error("connection intent framing failed: {0}")]
+    IntentFrame(#[source] FrameError),
+    /// A message is not legal during purpose negotiation.
+    #[error("expected {expected} during connection intent, received {received}")]
+    UnexpectedIntentMessage {
+        expected: MessageKind,
+        received: MessageKind,
+    },
+    /// An intent operation was repeated or invoked out of sequence.
+    #[error("connection intent operation is out of sequence")]
+    IntentSequence,
+    /// The public bytes cannot represent an Iroh endpoint identity.
+    #[error("invalid peer device identity")]
+    InvalidDeviceId,
+    /// No configured route source exists for this identity.
+    #[error("no reachability source for peer {0}")]
+    Unresolved(DeviceId),
+    /// The local endpoint cannot dial itself.
+    #[error("cannot connect to the local device")]
+    SelfConnect,
+    /// Ephemeral hint input exceeded a hard resource bound.
+    #[error("peer address hint capacity exceeded")]
+    HintCapacityExceeded,
+    /// An earlier panic invalidated the hint registry.
+    #[error("peer address hint registry is poisoned")]
+    HintRegistryPoisoned,
     /// The caller supplied an unusable endpoint configuration.
     #[error("invalid endpoint configuration: {0}")]
     InvalidConfiguration(&'static str),
@@ -171,12 +227,60 @@ pub enum TransportError {
     ControlTimeout,
 }
 
+impl TransportError {
+    /// Classification only; transport never retries a failed disposable connection.
+    pub fn is_retryable(&self) -> bool {
+        use iroh::endpoint::{ConnectError, ConnectWithOptsError};
+        match self {
+            Self::ConnectTimeout
+            | Self::AcceptTimeout
+            | Self::ControlStreamOpenTimeout
+            | Self::ControlStreamAcceptTimeout
+            | Self::ControlTimeout => true,
+            Self::Connect(ConnectError::Connect {
+                source: ConnectWithOptsError::NoAddress { .. },
+                ..
+            }) => true,
+            Self::Connect(ConnectError::Connecting {
+                source: ConnectingError::ConnectionError { source, .. },
+                ..
+            })
+            | Self::Connect(ConnectError::Connection { source, .. })
+            | Self::ControlStream(source)
+            | Self::AcceptStart(source)
+            | Self::Accept(ConnectingError::ConnectionError { source, .. }) => {
+                retryable_connection_error(source)
+            }
+            Self::Handshake(HandshakeError::HandshakeTimeout) => true,
+            Self::Handshake(HandshakeError::Frame(error))
+            | Self::IntentFrame(error)
+            | Self::PairingFrame(error)
+            | Self::Control(ControlError::Frame(error)) => matches!(
+                error,
+                FrameError::TruncatedLengthPrefix(_)
+                    | FrameError::TruncatedPayload(_)
+                    | FrameError::Write(_)
+            ),
+            _ => false,
+        }
+    }
+}
+
+fn retryable_connection_error(error: &ConnectionError) -> bool {
+    matches!(
+        error,
+        ConnectionError::Reset | ConnectionError::TimedOut | ConnectionError::ApplicationClosed(_)
+    )
+}
+
 /// An Iroh endpoint configured for the production Rift ALPN.
 #[derive(Clone)]
 pub struct RiftEndpoint {
     endpoint: Endpoint,
     device_id: DeviceId,
     config: EndpointConfig,
+    memory_lookup: MemoryLookup,
+    hint_ids: Arc<Mutex<BTreeSet<DeviceId>>>,
 }
 
 impl fmt::Debug for RiftEndpoint {
@@ -199,10 +303,21 @@ impl RiftEndpoint {
         config: EndpointConfig,
     ) -> Result<Self, TransportError> {
         config.validate()?;
+        let memory_lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::Minimal)
+            .address_lookup(memory_lookup.clone())
             .secret_key(secret_key)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(config.relay.as_iroh_mode());
+        if matches!(config.address_lookup, AddressLookupConfiguration::N0) {
+            builder = builder
+                .address_lookup(PkarrPublisher::n0_dns())
+                .address_lookup(PkarrResolver::n0_dns())
+                .address_lookup(DnsAddressLookup::n0_dns());
+        }
+        if let AddressLookupConfiguration::Memory(lookup) = &config.address_lookup {
+            builder = builder.address_lookup(lookup.clone());
+        }
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.clear_ip_transports();
             builder = builder
@@ -220,6 +335,8 @@ impl RiftEndpoint {
             endpoint,
             device_id,
             config,
+            memory_lookup,
+            hint_ids: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -260,11 +377,96 @@ impl RiftEndpoint {
         self.endpoint.is_closed()
     }
 
+    /// Updates an ephemeral route hint, keyed by its embedded authenticated identity.
+    /// This is not trust. The latest snapshot replaces old paths to bound stale state.
+    pub fn remember_peer_addr(&self, peer: EndpointAddr) -> Result<DeviceId, TransportError> {
+        let device_id = device_id_from_endpoint_id(peer.id);
+        if device_id == self.device_id {
+            return Err(TransportError::SelfConnect);
+        }
+        if peer.addrs.len() > MAX_HINT_PATHS {
+            return Err(TransportError::HintCapacityExceeded);
+        }
+        if peer.addrs.is_empty() {
+            return Ok(device_id);
+        }
+        let mut ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        if !ids.contains(&device_id) && ids.len() >= MAX_PEER_HINTS {
+            return Err(TransportError::HintCapacityExceeded);
+        }
+        ids.insert(device_id);
+        let _previous = self.memory_lookup.set_endpoint_info(peer);
+        Ok(device_id)
+    }
+
+    /// Removes an application hint, not trust or an existing Iroh connection/path cache.
+    pub fn forget_peer_addr(&self, device_id: DeviceId) -> Result<(), TransportError> {
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
+        let mut ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        ids.remove(&device_id);
+        let _previous = self.memory_lookup.remove_endpoint_info(endpoint_id);
+        Ok(())
+    }
+
+    /// Whether a fresh identity-only dial has an external lookup or ephemeral hint source.
+    pub fn has_route_source(&self, device_id: DeviceId) -> Result<bool, TransportError> {
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
+        let ids = self
+            .hint_ids
+            .lock()
+            .map_err(|_| TransportError::HintRegistryPoisoned)?;
+        let external = match &self.config.address_lookup {
+            AddressLookupConfiguration::Disabled => false,
+            AddressLookupConfiguration::N0 => true,
+            AddressLookupConfiguration::Memory(lookup) => lookup
+                .get_endpoint_info(endpoint_id)
+                .is_some_and(|info| !info.to_endpoint_addr().addrs.is_empty()),
+        };
+        Ok(external || ids.contains(&device_id))
+    }
+
+    /// Resolves current reachability and authenticates a peer using only its identity.
+    pub async fn connect_device(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<AuthenticatedConnection, TransportError> {
+        if device_id == self.device_id {
+            return Err(TransportError::SelfConnect);
+        }
+        let endpoint_id = endpoint_id_from_device_id(device_id)?;
+        if !self.has_route_source(device_id)? {
+            return Err(TransportError::Unresolved(device_id));
+        }
+        self.dial(EndpointAddr::new(endpoint_id)).await
+    }
+
+    /// Identity-only dial followed by the mandatory authenticated Hello exchange.
+    pub async fn connect_device_and_bootstrap(
+        &self,
+        device_id: DeviceId,
+        metadata: HelloMetadata,
+    ) -> Result<BootstrappedConnection, TransportError> {
+        let connection = self.connect_device(device_id).await?;
+        self.bootstrap(connection, metadata, ControlDirection::Open)
+            .await
+    }
+
     /// Connects to an authenticated Iroh peer using the production ALPN.
     pub async fn connect(
         &self,
         peer: EndpointAddr,
     ) -> Result<AuthenticatedConnection, TransportError> {
+        let device_id = self.remember_peer_addr(peer)?;
+        self.connect_device(device_id).await
+    }
+
+    async fn dial(&self, peer: EndpointAddr) -> Result<AuthenticatedConnection, TransportError> {
         debug!(
             local_device_id = %self.device_id,
             remote_device_id = %device_id_from_endpoint_id(peer.id),
@@ -343,6 +545,7 @@ impl RiftEndpoint {
         metadata: HelloMetadata,
         direction: ControlDirection,
     ) -> Result<BootstrappedConnection, TransportError> {
+        let mut close_guard = BootstrapCloseGuard(Some(connection.connection.clone()));
         let remote_device_id = connection.remote_device_id();
         let control_result = match direction {
             ControlDirection::Open => connection.open_control().await,
@@ -384,13 +587,25 @@ impl RiftEndpoint {
             handshake_outcome = "success",
             "Rift production bootstrap complete"
         );
+        close_guard.0 = None;
         Ok(BootstrappedConnection {
             connection: connection.connection,
             control: Some(control),
             local_device_id: self.device_id,
             peer_hello,
             control_timeout: self.config.handshake_timeout,
+            intent_phase: IntentPhase::Fresh,
         })
+    }
+}
+
+struct BootstrapCloseGuard(Option<Connection>);
+
+impl Drop for BootstrapCloseGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.0 {
+            connection.close(0_u32.into(), b"Rift bootstrap cancelled");
+        }
     }
 }
 
@@ -480,10 +695,22 @@ impl DisposableConnectionHandle {
             .close(0_u32.into(), b"Rift connection closed by runtime owner");
     }
 
+    /// Whether the underlying connection has already terminated.
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
     /// Waits until the underlying disposable connection has terminated.
     pub async fn closed(&self) {
         let _closed_reason = self.connection.closed().await;
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IntentPhase {
+    Fresh,
+    AwaitingDecision,
+    Finished,
 }
 
 /// A successfully Hello-bootstrapped, still-disposable Rift connection.
@@ -493,6 +720,13 @@ pub struct BootstrappedConnection {
     local_device_id: DeviceId,
     peer_hello: Hello,
     control_timeout: Duration,
+    intent_phase: IntentPhase,
+}
+
+impl Drop for BootstrappedConnection {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl fmt::Debug for BootstrappedConnection {
@@ -530,6 +764,168 @@ impl BootstrappedConnection {
     /// Waits until this disposable connection terminates.
     pub async fn closed(&self) {
         let _closed_reason = self.connection.closed().await;
+    }
+
+    /// Dialer gate: sends exactly one purpose and requires the matching coarse result.
+    pub async fn request_intent(
+        &mut self,
+        purpose: ConnectionPurpose,
+    ) -> Result<(), TransportError> {
+        self.require_intent_phase(IntentPhase::Fresh)?;
+        self.intent_phase = IntentPhase::Finished;
+        self.write_intent(ControlMessage::ConnectionIntent { purpose })
+            .await?;
+        match self.read_intent().await? {
+            ControlMessage::ConnectionIntentResult { accepted: true } => Ok(()),
+            ControlMessage::ConnectionIntentResult { accepted: false } => {
+                self.poison();
+                Err(TransportError::IntentRejected)
+            }
+            message => {
+                self.poison();
+                Err(TransportError::UnexpectedIntentMessage {
+                    expected: MessageKind::ConnectionIntentResult,
+                    received: message.kind(),
+                })
+            }
+        }
+    }
+
+    /// Acceptor gate: reads the purpose before the session layer applies trust policy.
+    pub async fn receive_intent(&mut self) -> Result<ConnectionPurpose, TransportError> {
+        self.require_intent_phase(IntentPhase::Fresh)?;
+        self.intent_phase = IntentPhase::AwaitingDecision;
+        match self.read_intent().await? {
+            ControlMessage::ConnectionIntent { purpose } => Ok(purpose),
+            message => {
+                self.poison();
+                Err(TransportError::UnexpectedIntentMessage {
+                    expected: MessageKind::ConnectionIntent,
+                    received: message.kind(),
+                })
+            }
+        }
+    }
+
+    /// Sends a coarse result. Rejection closes after bounded delivery, not a retry.
+    pub async fn send_intent_result(&mut self, accepted: bool) -> Result<(), TransportError> {
+        self.require_intent_phase(IntentPhase::AwaitingDecision)?;
+        self.intent_phase = IntentPhase::Finished;
+        self.write_intent(ControlMessage::ConnectionIntentResult { accepted })
+            .await?;
+        if !accepted {
+            // Immediate QUIC close could discard the result and disguise policy rejection
+            // as a retryable network failure. The rejected dialer closes on receipt.
+            let _closed = time::timeout(self.control_timeout, self.connection.closed()).await;
+            self.poison();
+        }
+        Ok(())
+    }
+
+    fn require_intent_phase(&mut self, phase: IntentPhase) -> Result<(), TransportError> {
+        if self.control.is_none() {
+            return Err(TransportError::ControlConnectionPoisoned);
+        }
+        if self.intent_phase != phase {
+            self.poison();
+            return Err(TransportError::IntentSequence);
+        }
+        Ok(())
+    }
+
+    async fn write_intent(&mut self, message: ControlMessage) -> Result<(), TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        match time::timeout(
+            self.control_timeout,
+            rift_protocol::write_message(&mut control.send, &message),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::IntentFrame(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    async fn read_intent(&mut self) -> Result<ControlMessage, TransportError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(TransportError::ControlConnectionPoisoned)?;
+        match time::timeout(
+            self.control_timeout,
+            rift_protocol::read_message(&mut control.recv),
+        )
+        .await
+        {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(TransportError::IntentFrame(error))
+            }
+            Err(_) => {
+                self.poison();
+                Err(TransportError::ControlTimeout)
+            }
+        }
+    }
+
+    /// Monitors the admitted control stream, allowing only Ping/Pong service.
+    /// Idle sessions have no application idle timeout, but every started frame does.
+    pub async fn serve_authorized_control(&mut self) -> Result<(), TransportError> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            let control = self
+                .control
+                .as_mut()
+                .ok_or(TransportError::ControlConnectionPoisoned)?;
+            let mut first = [0; 1];
+            if let Err(error) = AsyncReadExt::read_exact(&mut control.recv, &mut first).await {
+                self.poison();
+                return Err(TransportError::Control(ControlError::Frame(
+                    FrameError::TruncatedLengthPrefix(error),
+                )));
+            }
+            let mut frame = first.as_slice().chain(&mut control.recv);
+            let received = time::timeout(
+                self.control_timeout,
+                rift_protocol::read_message(&mut frame),
+            )
+            .await;
+            let result = match received {
+                Ok(Ok(ControlMessage::Ping { nonce })) => time::timeout(
+                    self.control_timeout,
+                    rift_protocol::write_message(
+                        &mut control.send,
+                        &ControlMessage::Pong { nonce },
+                    ),
+                )
+                .await
+                .map_err(|_| TransportError::ControlTimeout)
+                .and_then(|result| {
+                    result.map_err(|error| TransportError::Control(ControlError::Frame(error)))
+                }),
+                Ok(Ok(message)) => Err(TransportError::Control(ControlError::UnexpectedMessage {
+                    expected: MessageKind::Ping,
+                    received: message.kind(),
+                })),
+                Ok(Err(error)) => Err(TransportError::Control(ControlError::Frame(error))),
+                Err(_) => Err(TransportError::ControlTimeout),
+            };
+            if let Err(error) = result {
+                self.poison();
+                return Err(error);
+            }
+        }
     }
 
     /// Sends a Ping and waits for the matching Pong before the control deadline.
@@ -654,6 +1050,10 @@ impl BootstrappedConnection {
     }
 }
 
+fn endpoint_id_from_device_id(device_id: DeviceId) -> Result<iroh::EndpointId, TransportError> {
+    iroh::EndpointId::from_bytes(device_id.as_bytes()).map_err(|_| TransportError::InvalidDeviceId)
+}
+
 fn device_id_from_endpoint_id(endpoint_id: iroh::EndpointId) -> DeviceId {
     DeviceId::from_bytes(*endpoint_id.as_bytes())
 }
@@ -694,9 +1094,122 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "measurement executed by cargo xtask benchmark-smoke"]
+    fn device_id_conversion_benchmark() -> Result<(), TransportError> {
+        use std::hint::black_box;
+        let id = device_id_from_endpoint_id(SecretKey::from_bytes(&[7; 32]).public());
+        let iterations = 10_000;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            black_box(endpoint_id_from_device_id(black_box(id))?);
+        }
+        let elapsed = start.elapsed();
+        println!("production.transport.device_id_conversion_iterations={iterations}");
+        println!(
+            "production.transport.device_id_conversion.ops_per_second={:.2}",
+            f64::from(iterations) / elapsed.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_classification_rejects_policy_protocol_and_invariant_failures() {
+        for error in [
+            TransportError::IntentRejected,
+            TransportError::IntentSequence,
+            TransportError::InvalidDeviceId,
+            TransportError::SelfConnect,
+            TransportError::EndpointClosed,
+            TransportError::Handshake(HandshakeError::UnsupportedProtocolVersion(2)),
+            TransportError::Handshake(HandshakeError::IdentityMismatch {
+                authenticated: DeviceId::from_bytes([1; 32]),
+                hello: DeviceId::from_bytes([2; 32]),
+            }),
+            TransportError::IntentFrame(FrameError::FrameTooLarge {
+                actual: 999999,
+                maximum: 1000,
+            }),
+            TransportError::ControlStream(ConnectionError::VersionMismatch),
+        ] {
+            assert!(!error.is_retryable());
+        }
+        for error in [
+            TransportError::ConnectTimeout,
+            TransportError::ControlTimeout,
+            TransportError::ControlStream(ConnectionError::Reset),
+            TransportError::ControlStream(ConnectionError::TimedOut),
+            TransportError::Handshake(HandshakeError::HandshakeTimeout),
+        ] {
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn device_identity_conversion_validates_public_key_bytes() -> Result<(), TransportError> {
+        let public = SecretKey::from_bytes(&[7; 32]).public();
+        assert_eq!(
+            endpoint_id_from_device_id(device_id_from_endpoint_id(public))?,
+            public
+        );
+        let invalid = (0..=255)
+            .map(|byte| DeviceId::from_bytes([byte; 32]))
+            .find(|id| {
+                matches!(
+                    endpoint_id_from_device_id(*id),
+                    Err(TransportError::InvalidDeviceId)
+                )
+            });
+        assert!(invalid.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hint_peer_capacity_rejects_without_eviction_and_updates_at_capacity()
+    -> Result<(), TransportError> {
+        let endpoint = RiftEndpoint::bind(SecretKey::generate(), EndpointConfig::direct()).await?;
+        {
+            let mut ids = endpoint
+                .hint_ids
+                .lock()
+                .map_err(|_| TransportError::HintRegistryPoisoned)?;
+            for index in 0..MAX_PEER_HINTS {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                ids.insert(DeviceId::from_bytes(bytes));
+            }
+        }
+        let other = SecretKey::generate().public();
+        let addr = EndpointAddr::from_parts(
+            other,
+            [TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 1234)))],
+        );
+        assert!(matches!(
+            endpoint.remember_peer_addr(addr.clone()),
+            Err(TransportError::HintCapacityExceeded)
+        ));
+        endpoint.forget_peer_addr(device_id_from_endpoint_id(other))?;
+        {
+            let mut ids = endpoint
+                .hint_ids
+                .lock()
+                .map_err(|_| TransportError::HintRegistryPoisoned)?;
+            ids.pop_first();
+        }
+        endpoint.remember_peer_addr(addr.clone())?;
+        endpoint.remember_peer_addr(addr)?;
+        assert!(endpoint.has_route_source(device_id_from_endpoint_id(other))?);
+        endpoint.close().await;
+        Ok(())
+    }
+
+    #[test]
     fn direct_configuration_has_no_relay_or_insecure_tls_setting() {
         let config = EndpointConfig::direct();
         assert_eq!(config.relay, RelayConfiguration::Disabled);
+        assert!(matches!(
+            config.address_lookup,
+            AddressLookupConfiguration::Disabled
+        ));
         assert_eq!(
             config.bind_addr,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))

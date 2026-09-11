@@ -450,16 +450,14 @@ async fn two_daemon_pairing_restart_and_live_revocation_flow_through_ipc() -> Te
 }
 
 #[tokio::test]
-async fn active_session_bounds_reject_new_connections_without_eviction() -> TestResult {
+async fn duplicate_dial_keeps_canonical_session_even_at_global_capacity() -> TestResult {
     tokio::time::timeout(Duration::from_secs(20), async {
         let first_directory = TempDir::new()?;
         let second_directory = TempDir::new()?;
         let mut first_config = test_config(&first_directory, "Bound A");
         let mut second_config = test_config(&second_directory, "Bound B");
         first_config.max_active_sessions = 1;
-        first_config.max_sessions_per_peer = 1;
         second_config.max_active_sessions = 1;
-        second_config.max_sessions_per_peer = 1;
         let first = RunningDaemon::spawn(Daemon::start(first_config).await?);
         let second = RunningDaemon::spawn(Daemon::start(second_config).await?);
         let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
@@ -467,12 +465,12 @@ async fn active_session_bounds_reject_new_connections_without_eviction() -> Test
         let (first_session, _second_session) =
             pair_through_ipc(&first, &second, &mut first_client, &mut second_client).await?;
 
-        assert!(
+        assert_eq!(
             first
                 .handle
                 .connect_authenticated(second.handle.endpoint_addr())
-                .await
-                .is_err()
+                .await?,
+            first_session.session_id
         );
         let Response::Sessions { sessions } =
             first_client.request(Request::ListSessions {}).await?
@@ -748,4 +746,342 @@ async fn forget_racing_pairing_confirmation_cannot_leave_trust_or_authorization(
 #[test]
 fn pairing_attempt_ids_are_runtime_local_values() {
     assert_ne!(PairingAttemptId(1), PairingAttemptId(2));
+}
+
+async fn connectivity(handle: &DaemonHandle) -> TestResult<Vec<rift_ipc::PeerConnectivityInfo>> {
+    let Response::PeerConnectivity { page } = handle
+        .request(Request::ListPeerConnectivity {
+            after: None,
+            limit: 128,
+        })
+        .await?
+    else {
+        return Err("unexpected connectivity response".into());
+    };
+    Ok(page.entries)
+}
+
+impl IpcClient {
+    async fn connectivity_changed(
+        &mut self,
+        state: rift_ipc::ConnectivityState,
+    ) -> TestResult<rift_ipc::PeerConnectivityInfo> {
+        loop {
+            if let Some(index) = self.events.iter().position(|event| {
+                matches!(event,
+                Event::PeerConnectivityChanged { connectivity } if connectivity.state == state)
+            }) && let Event::PeerConnectivityChanged { connectivity } = self.events.remove(index)
+            {
+                return Ok(connectivity);
+            }
+            match read_json_frame::<_, ServerMessage>(&mut self.stream).await? {
+                ServerMessage::Event { event } => self.events.push(event),
+                message => {
+                    return Err(io::Error::other(format!(
+                        "unexpected message waiting for connectivity: {message:?}"
+                    ))
+                    .into());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn whole_connection_loss_reconnects_automatically_without_pairing() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let first = RunningDaemon::start(&first_directory, "Reconnect A").await?;
+        let second = RunningDaemon::start(&second_directory, "Reconnect B").await?;
+        first
+            .handle
+            .remember_peer_addr(second.handle.endpoint_addr())
+            .await?;
+        second
+            .handle
+            .remember_peer_addr(first.handle.endpoint_addr())
+            .await?;
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        let (old_a, old_b) =
+            pair_through_ipc(&first, &second, &mut first_client, &mut second_client).await?;
+        first
+            .handle
+            .session_handle_for_test(old_a.session_id)
+            .await?
+            .close();
+        let (new_a, new_b) = tokio::try_join!(
+            first_client.session_opened(),
+            second_client.session_opened()
+        )?;
+        assert_ne!(old_a.session_id, new_a.session_id);
+        assert_ne!(old_b.session_id, new_b.session_id);
+        assert_eq!(new_a.device_id, second.handle.device_id());
+        assert_eq!(new_b.device_id, first.handle.device_id());
+        for handle in [&first.handle, &second.handle] {
+            let Response::Sessions { sessions } = handle.request(Request::ListSessions {}).await?
+            else {
+                return Err("wrong sessions response".into());
+            };
+            assert_eq!(sessions.len(), 1);
+            let Response::PendingPairings { pairings } =
+                handle.request(Request::ListPendingPairings {}).await?
+            else {
+                return Err("wrong pairing response".into());
+            };
+            assert!(pairings.is_empty());
+            assert_eq!(connectivity(handle).await?.len(), 1);
+        }
+        assert!(
+            !first_client
+                .events
+                .iter()
+                .chain(&second_client.events)
+                .any(|event| matches!(event, Event::PairingPending { .. }))
+        );
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn asymmetric_forget_blocks_automatic_session_reconnect_without_pairing_or_hot_loop()
+-> TestResult {
+    use rift_ipc::{ConnectivityFailure, ConnectivityState};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let first = RunningDaemon::start(&first_directory, "Asymmetric A").await?;
+        let second = RunningDaemon::start(&second_directory, "Asymmetric B").await?;
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        pair_through_ipc(&first, &second, &mut first_client, &mut second_client).await?;
+        second_client
+            .request(Request::ForgetPeer {
+                device_id: first.handle.device_id(),
+            })
+            .await?;
+        let blocked = first_client
+            .connectivity_changed(ConnectivityState::Blocked)
+            .await?;
+        assert_eq!(
+            blocked.last_failure,
+            Some(ConnectivityFailure::PurposeRejected)
+        );
+        assert_eq!(blocked.retry_in_ms, None);
+        let snapshot = connectivity(&first.handle).await?;
+        assert_eq!(snapshot, vec![blocked]);
+        let Response::PendingPairings { pairings } = second_client
+            .request(Request::ListPendingPairings {})
+            .await?
+        else {
+            return Err("wrong pairing response".into());
+        };
+        assert!(pairings.is_empty());
+        assert!(
+            !second_client
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PairingPending { .. }))
+        );
+        assert_trusted_page(
+            first_client
+                .request(Request::ListPeers {
+                    after: None,
+                    limit: 128,
+                })
+                .await?,
+            second.handle.device_id(),
+        )?;
+        assert!(connectivity(&second.handle).await?.is_empty());
+        // No timer is armed for the rejection; repeated observation does not advance attempts.
+        assert_eq!(connectivity(&first.handle).await?, snapshot);
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disconnect_suspends_local_outbound_and_identity_only_connect_resumes_it() -> TestResult {
+    use rift_ipc::ConnectivityState;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let first = RunningDaemon::start(&first_directory, "Suspend A").await?;
+        let second = RunningDaemon::start(&second_directory, "Suspend B").await?;
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        let (old_a, _) =
+            pair_through_ipc(&first, &second, &mut first_client, &mut second_client).await?;
+        first_client
+            .request(Request::DisconnectSession {
+                session_id: old_a.session_id,
+            })
+            .await?;
+        let snapshot = connectivity(&first.handle).await?;
+        assert_eq!(snapshot[0].state, ConnectivityState::Suspended);
+        assert_eq!(snapshot[0].retry_in_ms, None);
+        // B has no hint, so it settles Unresolved instead of racing the local suspension.
+        second_client
+            .connectivity_changed(ConnectivityState::Unresolved)
+            .await?;
+        let Response::PeerConnected { session_id, .. } = first_client
+            .request(Request::ConnectPeer {
+                device_id: second.handle.device_id(),
+            })
+            .await?
+        else {
+            return Err("wrong ConnectPeer response".into());
+        };
+        assert_ne!(session_id, old_a.session_id);
+        assert_eq!(
+            connectivity(&first.handle).await?[0].state,
+            ConnectivityState::Connected
+        );
+        let Response::PeerConnected {
+            session_id: same_id,
+            ..
+        } = first_client
+            .request(Request::ConnectPeer {
+                device_id: second.handle.device_id(),
+            })
+            .await?
+        else {
+            return Err("wrong connected response".into());
+        };
+        assert_eq!(same_id, session_id);
+        assert_trusted_page(
+            first_client
+                .request(Request::ListPeers {
+                    after: None,
+                    limit: 128,
+                })
+                .await?,
+            second.handle.device_id(),
+        )?;
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn identity_only_pairing_ipc_requires_unknown_routable_peer_and_explicit_confirmation()
+-> TestResult {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let first = RunningDaemon::start(&first_directory, "IPC A").await?;
+        let second = RunningDaemon::start(&second_directory, "IPC B").await?;
+        let peer_id = second.handle.device_id();
+        assert!(matches!(first.handle.request(Request::BeginPairing { device_id: peer_id }).await, Err(DaemonHandleError::Operation(error)) if error.code == ErrorCode::PeerUnresolved));
+        assert!(matches!(first.handle.request(Request::ConnectPeer { device_id: peer_id }).await, Err(DaemonHandleError::Operation(error)) if error.code == ErrorCode::PeerNotTrusted));
+        assert!(matches!(first.handle.request(Request::BeginPairing { device_id: first.handle.device_id() }).await, Err(DaemonHandleError::Operation(error)) if error.code == ErrorCode::InvalidRequest));
+        first.handle.remember_peer_addr(second.handle.endpoint_addr()).await?;
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        let Response::PairingStarted { attempt_id } = first_client.request(Request::BeginPairing { device_id: peer_id }).await? else { return Err("wrong BeginPairing response".into()); };
+        let first_pending = first_client.pairing_pending().await?;
+        let second_pending = second_client.pairing_pending().await?;
+        assert_eq!(attempt_id, first_pending.attempt_id);
+        assert_eq!(first_pending.verification_code, second_pending.verification_code);
+        assert!(connectivity(&first.handle).await?.is_empty());
+        let (a, b) = tokio::try_join!(
+            first_client.request(Request::ConfirmPairing { attempt_id, accepted: true }),
+            second_client.request(Request::ConfirmPairing { attempt_id: second_pending.attempt_id, accepted: true }),
+        )?;
+        assert!(matches!(a, Response::PairingResolved { accepted: true, .. }));
+        assert!(matches!(b, Response::PairingResolved { accepted: true, .. }));
+        assert!(matches!(first.handle.request(Request::BeginPairing { device_id: peer_id }).await, Err(DaemonHandleError::Operation(error)) if error.code == ErrorCode::PeerAlreadyTrusted));
+        first.handle.request(Request::RevokePeer { device_id: peer_id }).await?;
+        assert!(matches!(first.handle.request(Request::BeginPairing { device_id: peer_id }).await, Err(DaemonHandleError::Operation(error)) if error.code == ErrorCode::PeerNotTrusted));
+        drop(first_client); drop(second_client);
+        first.shutdown().await?; second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn injected_memory_lookup_reconnects_by_identity_after_daemon_restart() -> TestResult {
+    use rift_transport_iroh::{AddressLookupConfiguration, MemoryLookup};
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let first_directory = TempDir::new()?;
+        let second_directory = TempDir::new()?;
+        let lookup = MemoryLookup::new();
+        let mut first_config = test_config(&first_directory, "Restart A");
+        first_config.address_lookup = AddressLookupConfiguration::Memory(lookup.clone());
+        let mut second_config = test_config(&second_directory, "Restart B");
+        second_config.address_lookup = AddressLookupConfiguration::Memory(lookup.clone());
+        let first = RunningDaemon::spawn(Daemon::start(first_config.clone()).await?);
+        let second = RunningDaemon::spawn(Daemon::start(second_config.clone()).await?);
+        lookup.add_endpoint_info(first.handle.endpoint_addr());
+        lookup.add_endpoint_info(second.handle.endpoint_addr());
+        let first_id = first.handle.device_id();
+        let second_id = second.handle.device_id();
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        pair_through_ipc(&first, &second, &mut first_client, &mut second_client).await?;
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+
+        let first_daemon = Daemon::start(first_config).await?;
+        let second_daemon = Daemon::start(second_config).await?;
+        assert_eq!(first_daemon.handle().device_id(), first_id);
+        assert_eq!(second_daemon.handle().device_id(), second_id);
+        let _previous = lookup.set_endpoint_info(first_daemon.handle().endpoint_addr());
+        let _previous = lookup.set_endpoint_info(second_daemon.handle().endpoint_addr());
+        let first = RunningDaemon::spawn(first_daemon);
+        let second = RunningDaemon::spawn(second_daemon);
+        // Read state via the control handle, then use an authenticated event stream for
+        // whichever daemon has not completed automatic startup dialing yet.
+        let mut first_client = IpcClient::authenticate(&first.descriptor).await?;
+        if connectivity(&first.handle).await?[0].session_id.is_none() {
+            first_client
+                .connectivity_changed(rift_ipc::ConnectivityState::Connected)
+                .await?;
+        }
+        let mut second_client = IpcClient::authenticate(&second.descriptor).await?;
+        if connectivity(&second.handle).await?[0].session_id.is_none() {
+            second_client
+                .connectivity_changed(rift_ipc::ConnectivityState::Connected)
+                .await?;
+        }
+        for handle in [&first.handle, &second.handle] {
+            let Response::PendingPairings { pairings } =
+                handle.request(Request::ListPendingPairings {}).await?
+            else {
+                return Err("wrong pairing response".into());
+            };
+            assert!(pairings.is_empty());
+            assert_eq!(
+                connectivity(handle).await?[0].state,
+                rift_ipc::ConnectivityState::Connected
+            );
+        }
+        drop(first_client);
+        drop(second_client);
+        first.shutdown().await?;
+        second.shutdown().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
 }

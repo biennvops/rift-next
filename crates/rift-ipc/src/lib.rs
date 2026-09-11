@@ -70,7 +70,7 @@ impl fmt::Debug for ClientMessage {
     }
 }
 
-/// Runtime-management operations available in Foundation M4.
+/// Runtime-management operations available through local IPC v1.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -109,6 +109,12 @@ pub enum Request {
         /// Runtime-local session handle.
         session_id: SessionId,
     },
+    /// Starts explicit attended pairing to an unknown identity.
+    BeginPairing { device_id: DeviceId },
+    /// Resumes/dials a trusted peer, or returns its current canonical session.
+    ConnectPeer { device_id: DeviceId },
+    /// Returns a bounded DeviceId-cursor page of trusted-peer connectivity.
+    ListPeerConnectivity { after: Option<DeviceId>, limit: u16 },
 }
 
 /// Messages sent by the daemon after local authentication succeeds.
@@ -189,6 +195,15 @@ pub enum Response {
         /// Closed runtime-local session handle.
         session_id: SessionId,
     },
+    /// Pairing setup reached a local confirmation attempt.
+    PairingStarted { attempt_id: PairingAttemptId },
+    /// A canonical session is available for the trusted peer.
+    PeerConnected {
+        device_id: DeviceId,
+        session_id: SessionId,
+    },
+    /// Bounded trusted-peer connectivity page.
+    PeerConnectivity { page: PeerConnectivityPage },
 }
 
 /// Stable local lifecycle states exposed by status.
@@ -250,6 +265,74 @@ pub struct PeerPage {
     /// Current page entries.
     pub entries: Vec<PeerInfo>,
     /// Exclusive cursor for another page, or `None` at the end.
+    pub next_cursor: Option<DeviceId>,
+}
+
+/// Runtime-only known-peer connectivity; never persisted as trust or addresses.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityState {
+    /// Eligible for scheduling.
+    Disconnected,
+    /// Resolving and establishing the authenticated connection.
+    Connecting,
+    /// A canonical authorized session is healthy.
+    Connected,
+    /// Waiting for the next bounded retry deadline.
+    Backoff,
+    /// Local automatic outbound reconnect is suspended until ConnectPeer.
+    Suspended,
+    /// No external lookup or transient hint is available.
+    Unresolved,
+    /// Nonretryable policy/protocol failure requires explicit local action.
+    Blocked,
+}
+
+/// Stable bounded diagnostic category, never a raw Iroh error or address.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityFailure {
+    /// No route source is configured.
+    Unresolved,
+    /// Temporary connection/lookup/liveness failure.
+    Network,
+    /// The peer rejected the explicit purpose.
+    PurposeRejected,
+    /// Incompatible or malformed network protocol behavior.
+    Protocol,
+    /// Local durable trust no longer permits authorization.
+    NotTrusted,
+    /// A configured resource bound prevented admission.
+    Capacity,
+    /// Shutdown or explicit invalidation cancelled work.
+    Cancelled,
+}
+
+/// Bounded local presentation of one durable trusted peer's runtime connectivity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConnectivityInfo {
+    /// Durable identity, not an address.
+    pub device_id: DeviceId,
+    /// Current runtime state.
+    pub state: ConnectivityState,
+    /// Canonical session if present.
+    pub session_id: Option<SessionId>,
+    /// Consecutive failures/short flaps, reset only after stability.
+    pub retry_attempt: u32,
+    /// Saturating time remaining until the next retry.
+    pub retry_in_ms: Option<u64>,
+    /// Stable last failure category.
+    pub last_failure: Option<ConnectivityFailure>,
+}
+
+/// DeviceId-ordered connectivity page, capped like durable peer pages.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConnectivityPage {
+    /// At most MAX_PEER_PAGE_SIZE entries.
+    pub entries: Vec<PeerConnectivityInfo>,
+    /// Exclusive cursor, absent at end.
     pub next_cursor: Option<DeviceId>,
 }
 
@@ -329,6 +412,8 @@ pub enum SessionCloseReason {
     Forgotten,
     /// Runtime shutdown closed owned work.
     Shutdown,
+    /// A deterministic canonical connection replaced this session.
+    Superseded,
 }
 
 /// Bounded asynchronous daemon events.
@@ -372,6 +457,8 @@ pub enum Event {
     },
     /// The daemon stopped accepting new operations.
     DaemonShuttingDown,
+    /// Deduplicated connectivity state transition; countdowns do not emit ticks.
+    PeerConnectivityChanged { connectivity: PeerConnectivityInfo },
 }
 
 /// Stable operation-error categories for local clients.
@@ -398,6 +485,12 @@ pub enum ErrorCode {
     ShuttingDown,
     /// An internal owned task failed.
     Internal,
+    /// No transient hint or enabled resolver can reach the identity.
+    PeerUnresolved,
+    /// Remote purpose rejection is not a retryable network failure.
+    PurposeRejected,
+    /// Protocol incompatibility/sequencing is not automatically retried.
+    ProtocolRejected,
 }
 
 /// One bounded failed response.
@@ -707,6 +800,44 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_schemas_are_strict_and_maximum_page_fits_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for value in [
+            serde_json::json!({"type":"begin_pairing","device_id":[]}),
+            serde_json::json!({"type":"connect_peer","device_id":vec![1;32],"address":"127.0.0.1"}),
+            serde_json::json!({"type":"list_peer_connectivity","after":null,"limit":65536}),
+            serde_json::json!({"type":"begin_pairing"}),
+        ] {
+            assert!(serde_json::from_value::<Request>(value).is_err());
+        }
+        let info = PeerConnectivityInfo {
+            device_id: device(255),
+            state: ConnectivityState::Backoff,
+            session_id: Some(SessionId(u64::MAX)),
+            retry_attempt: u32::MAX,
+            retry_in_ms: Some(u64::MAX),
+            last_failure: Some(ConnectivityFailure::PurposeRejected),
+        };
+        let mut value = serde_json::to_value(&info)?;
+        value["address"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<PeerConnectivityInfo>(value).is_err());
+        let response = ServerMessage::Response {
+            id: u64::MAX,
+            result: Response::PeerConnectivity {
+                page: PeerConnectivityPage {
+                    entries: vec![info; usize::from(MAX_PEER_PAGE_SIZE)],
+                    next_cursor: Some(device(255)),
+                },
+            },
+        };
+        let frame = encode_json_frame(&response)?;
+        assert!(frame.len() - 4 <= MAX_IPC_FRAME_LEN);
+        let roundtrip: ServerMessage = serde_json::from_slice(&frame[4..])?;
+        assert_eq!(roundtrip, response);
+        Ok(())
+    }
+
+    #[test]
     fn encoding_checks_limit_and_prefix_before_returning_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         let message = ClientMessage::Authenticate {
@@ -788,6 +919,15 @@ mod tests {
             "forget_peer_request",
             "pairing_pending_event",
             "session_opened_event",
+            "begin_pairing_request",
+            "connect_peer_request",
+            "list_peer_connectivity_request",
+            "pairing_started_response",
+            "peer_connected_response",
+            "peer_connectivity_response",
+            "peer_connectivity_changed_event",
+            "session_superseded_event",
+            "purpose_rejected_error",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
