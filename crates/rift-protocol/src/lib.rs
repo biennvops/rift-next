@@ -16,6 +16,13 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
+mod transfer;
+
+pub use transfer::{
+    MAX_TRANSFER_BYTES, MAX_TRANSFER_FILE_NAME_LEN, TransferFileName, TransferMetadata,
+    TransferMetadataError,
+};
+
 /// The production Rift protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
 
