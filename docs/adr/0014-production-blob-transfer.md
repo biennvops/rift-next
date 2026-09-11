@@ -1,6 +1,6 @@
 # ADR 0014: Production single-file blob transfer
 
-Status: Accepted (wire contract implemented; runtime integration pending)
+Status: Accepted (wire contract and streaming mechanics implemented; runtime integration pending)
 
 ## Context
 
