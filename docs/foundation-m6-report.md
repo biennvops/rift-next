@@ -1,6 +1,6 @@
 # Foundation Milestone 6 report
 
-## Status: partial source/sequencing checkpoint — M6 is not complete
+## Status: partial private-record checkpoint — M6 is not complete
 
 Base: `b02a77a1c5d671716566809c06373647a200b898`.
 Branch: `feat/foundation-m6-file-transfer`.
@@ -13,6 +13,8 @@ Implementation commits at this checkpoint:
 - `5e8f991`: cancellable fixed-buffer engine, architecture policy, and platform smoke lists.
 - `15a63fa`: bounded redacted local source paths and regular-handle metadata preparation.
 - `a009bf0`: explicit logical transfer sequencing and checked attempt generations.
+- `d60b6e4`: bounded checksummed manifests/markers and ADR 0015.
+- `4880a88`: bounded cancellable reads from already-open state-file handles.
 
 There is no final M6 implementation or merge candidate yet. The supplied untracked
 `PLAN.md` and `REVIEW.md` remain untouched. Dependency and CI changes specified by the
@@ -276,7 +278,7 @@ No observed existing-path regression in these samples; no speedup or threshold i
 claimed from one uncontrolled run. Required 8/64/256 MiB production-vs-Prototype 0 and
 256 MiB durable-resume measurements are still outstanding until the runtime exists.
 
-## Source/sequencing checkpoint verification
+## Source/sequencing checkpoint verification (historical)
 
 Implementation SHA: `a009bf0ed13fc8c72c42c3d8fab4396a4a108b04` (not final M6).
 Pinned Rust 1.91.0; same local host as the prior checkpoint. No dependency, CI,
@@ -324,6 +326,58 @@ Logs:
 - `/tmp/rift-m6-state-coverage.log`
 - `/tmp/rift-m6-state-benchmark.log`
 
+## Private-record checkpoint verification
+
+Implementation SHA: `4880a88d37e72ba38011da8ec90320343f103184` (not final M6).
+Same pinned Rust 1.91.0 and local host as above; no hosted CI or Windows execution.
+Transfer now uses the existing workspace Postcard and Serde dependencies; the lockfile
+only adds those two dependency edges, without any version changes.
+
+ADR 0015 defines a private `RIFTXFER` envelope: version 1, big-endian payload length,
+strict Postcard payload of at most 8192 bytes, and BLAKE3 over header plus payload.
+Complete files are at most 8238 bytes. Manifest fields are ID, peer, metadata, and a
+role enum that contains a redacted source path only for outgoing transfers. Accepted
+and terminal markers bind the complete immutable manifest digest. Terminal origin
+records whether recovery should replay a local terminal decision or acknowledge a
+peer outcome. Binding and role checks are not evidence of durable acceptance or
+publication; no filesystem store or logical recovery constructor exists yet.
+
+The already-open record reader checks its 14-byte header before body allocation or
+reads, consumes no more than one extra EOF-probe byte, and applies per-partial-read
+cancellation/idle control. It does not open paths, enforce file type/permissions,
+enumerate directories, mutate files, or grant trust/recovery authorization.
+
+| Check | Result |
+| --- | --- |
+| `cargo xtask verify` after codec and bounded-reader changes | PASS |
+| Record unit tests | PASS: 11 |
+| Transfer unit tests | PASS: 49, plus one ignored benchmark |
+| `cargo xtask coverage` | PASS: **83.92%**, unchanged floor |
+| Record implementation line coverage | **98.13%** |
+| `git diff --check` | PASS |
+| Hosted CI / Windows execution | Not observed |
+
+Coverage: 12,204 workspace lines / 1,963 missed. These changes add no payload streaming
+or hashing algorithm changes; existing performance comparisons above remain historical,
+not measurements of a durable production transfer runtime.
+
+Tests cover all record/status/origin variants, independent marker discriminant bytes,
+maximum valid manifest fields, every truncated prefix and single-byte corruption
+position, oversized declarations, exact-bound/trailing payloads, unsupported versions
+and enums, domain-validation bypass attempts, source redaction, every manifest binding
+field, and wrong-role markers. Reader tests cover real file round trips, read errors,
+pre-body oversized rejection, bounded trailing-byte probes, truncation/corruption,
+header/body/EOF stalls, pre-cancellation/owner loss, blocked cancellation, and slow
+partial progress that legitimately outlasts the idle deadline. An initial reader
+verification caught a missing public re-export; it was fixed without suppressing lint.
+
+Logs:
+
+- `/tmp/rift-m6-record-verify.log`
+- `/tmp/rift-m6-record-coverage.log`
+- `/tmp/rift-m6-record-reader-verify.log`
+- `/tmp/rift-m6-record-reader-coverage.log`
+
 ## Outstanding plan execution
 
 All remaining M6 requirements still apply, notably:
@@ -339,8 +393,9 @@ All remaining M6 requirements still apply, notably:
    paginated transfer operations, DTOs, progress events, and exact conformance vectors.
 5. Exercise mandatory two-daemon authenticated IPC transfer, rejection, cancellation,
    resume, supersession, restart, integrity, capacity, and authorization-race scenarios.
-6. Add ADR 0015 and storage/runtime/recovery documentation; complete the new daemon
-   dependency edges, production/resume benchmarks, hosted CI evidence, and final report.
+6. Extend ADR 0015 with implemented storage/runtime/recovery guarantees; complete the
+   daemon dependency edges, production/resume benchmarks, hosted CI evidence, and final
+   report.
 
 Do not enable `BLOB_TRANSFER_V1` based on this checkpoint: there is no daemon transfer
 runtime, durable acceptance/recovery, or end-to-end authorized payload integration yet.
