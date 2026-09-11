@@ -115,3 +115,11 @@ path. Checking a path's type before opening is not sufficient to prevent replace
 with a special file; the future platform-specific opener still needs that failure-path
 coverage. Successful preparation is not authorization, a stable source snapshot,
 or permission to offer before persisting immutable metadata.
+
+Logical transfer sequencing now rejects preacceptance data, wrong transfer IDs, impossible
+ranges, second simultaneous data attempts, conflicting immutable metadata, premature
+local completion/acknowledgement, wrong-role operations, and stale-generation results.
+Worker terminal failures must supply their generation just like successful verification.
+Terminal replay is monotonic and cannot turn a cancelled transfer into a completed one.
+These are deterministic in-memory state tests, not proof of durable acceptance, atomic
+publication, trust-race fencing, or cancellation/join behavior in a daemon runtime.

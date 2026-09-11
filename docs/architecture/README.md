@@ -162,3 +162,25 @@ See [daemon runtime](../daemon/runtime.md), [IPC v1](../ipc/v1.md), and ADRs 000
 
 See [security invariants](security.md), [deferred decisions](deferred.md), and accepted
 [architecture decisions](../adr/).
+
+## M6 logical sequencing foundation
+
+`rift-transfer::LogicalTransfer` owns one immutable `(DeviceId, TransferId, metadata)`
+and an explicit sender/receiver state. It handles offer/accept sequencing, duplicate
+offer decisions, exclusive data attempts, verification-before-completion, pause/reoffer,
+local terminal replay, peer terminal settlement, and acknowledgement. Every transition
+returns a typed error rather than silently repairing illegal state.
+
+Attempt generations are checked without wrapping. Pause invalidates old results before
+a replacement attempt can be registered. Successful receive verification, publication
+completion, and worker failures must carry the current generation. These local checks do
+not replace the daemon's canonical SessionId/trust-generation fences or its obligation
+to cancel and join the old worker before reusing resources.
+
+Methods named `*_persisted` are post-durability state transitions, not disk writes. The
+owner must validate the proposed transition and persist under its mutation/generation
+boundary before exposing it or sending the corresponding control message. No durable
+store, recovery constructor, daemon registry, authenticated data wrapper, or transfer IPC
+is implemented yet. A pending incoming decision survives connection loss without
+becoming accepted. A paused accepted receiver needs its actual durable partial length
+reconciled before restarting; sender byte counters never decide resume offset.
