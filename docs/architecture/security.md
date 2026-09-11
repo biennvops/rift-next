@@ -133,3 +133,10 @@ Codec tests exercise malformed/truncated/oversized/unsupported inputs, every sin
 corruption position, validated-domain bypass attempts, marker substitution, and wrong
 roles. This does not implement bounded filesystem reads, atomic persistence, permissions,
 crash reconciliation, or trust-aware startup. Those remain separate mandatory tests.
+
+The already-open record reader now enforces the file byte-read bound itself. Tests prove
+oversized headers consume only 14 bytes, trailing content consumes at most one extra
+byte, and truncated/corrupt records fail closed. Header/body/EOF stalls time out; blocked
+reads observe cancellation; slow partial reads continue beyond the idle-timeout duration.
+The store must still safely open and validate private regular-file handles and bound
+record-directory enumeration before calling this helper.

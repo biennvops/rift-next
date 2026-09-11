@@ -10,7 +10,7 @@ mod source;
 pub use record::{
     MAX_TRANSFER_RECORD_LEN, MAX_TRANSFER_RECORD_PAYLOAD_LEN, ManifestSource, TerminalOrigin,
     TransferManifest, TransferRecord, TransferRecordError, decode_transfer_record,
-    encode_transfer_record,
+    encode_transfer_record, read_transfer_record,
 };
 mod state;
 mod streaming;

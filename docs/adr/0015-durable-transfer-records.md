@@ -76,3 +76,9 @@ Windows explicit data-directory ACL model remain mandatory for the future store.
 
 No filesystem operations, atomic creation, permission changes, durable markers, startup
 recovery, or daemon transfer capability are implemented by this format checkpoint.
+
+The already-open-handle `read_transfer_record` helper implements the byte-read bound:
+read the fixed 14-byte header, validate it, allocate at most 8238 bytes, read the exact
+body/checksum, then probe at most one byte for EOF. Every partial read observes owner
+cancellation and resets its progress-idle deadline; there is no total timeout. This is
+not a safe path opener, regular-file/private-permission check, or directory scanner.

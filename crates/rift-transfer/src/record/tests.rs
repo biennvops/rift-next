@@ -356,3 +356,136 @@ fn marker_roles_are_receiver_authoritative_but_do_not_establish_durability() -> 
     }
     Ok(())
 }
+
+fn control() -> Result<(tokio::sync::watch::Sender<bool>, AttemptControl), TransferIoError> {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    Ok((
+        sender,
+        AttemptControl::new(receiver, std::time::Duration::from_secs(1))?,
+    ))
+}
+
+#[tokio::test]
+async fn bounded_reader_rejects_oversized_declarations_without_reading_body() -> TestResult {
+    let valid = encode_transfer_record(&TransferRecord::Manifest(manifest()?))?;
+    let (_owner, mut control) = control()?;
+    for length in [8193_u32, u32::MAX] {
+        let mut bytes = valid.clone();
+        bytes[10..14].copy_from_slice(&length.to_be_bytes());
+        let mut reader = std::io::Cursor::new(bytes);
+        assert_eq!(
+            read_transfer_record(&mut reader, &mut control).await,
+            Err(TransferRecordError::TooLarge)
+        );
+        assert_eq!(reader.position(), HEADER_LEN as u64);
+    }
+    let mut trailing = valid.clone();
+    trailing.extend_from_slice(&[0; 1024]);
+    let mut reader = std::io::Cursor::new(trailing);
+    assert_eq!(
+        read_transfer_record(&mut reader, &mut control).await,
+        Err(TransferRecordError::Length)
+    );
+    assert_eq!(reader.position(), valid.len() as u64 + 1);
+    for length in 0..valid.len() {
+        assert_eq!(
+            read_transfer_record(&mut &valid[..length], &mut control).await,
+            Err(TransferRecordError::Length)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_reader_round_trips_real_private_records_and_detects_corruption() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("manifest");
+    let record = TransferRecord::Manifest(manifest()?);
+    let bytes = encode_transfer_record(&record)?;
+    tokio::fs::write(&path, &bytes).await?;
+    let mut file = tokio::fs::File::open(&path).await?;
+    let (_owner, mut control) = control()?;
+    assert_eq!(read_transfer_record(&mut file, &mut control).await?, record);
+    let mut corrupt = bytes;
+    corrupt[HEADER_LEN] ^= 1;
+    assert_eq!(
+        read_transfer_record(&mut corrupt.as_slice(), &mut control).await,
+        Err(TransferRecordError::Checksum)
+    );
+    let mut write_only = tokio::fs::File::options().write(true).open(&path).await?;
+    assert!(matches!(
+        read_transfer_record(&mut write_only, &mut control).await,
+        Err(TransferRecordError::Io(TransferIoError::LocalIo(_)))
+    ));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_reader_cancels_and_bounds_stalled_header_body_and_eof() -> TestResult {
+    use tokio::io::AsyncWriteExt;
+    let bytes = encode_transfer_record(&TransferRecord::Manifest(manifest()?))?;
+    for prefix_len in [0, HEADER_LEN, bytes.len()] {
+        let (mut reader, mut writer) = tokio::io::duplex(256);
+        writer.write_all(&bytes[..prefix_len]).await?;
+        let (_owner, mut control) = control()?;
+        assert_eq!(
+            read_transfer_record(&mut reader, &mut control).await,
+            Err(TransferRecordError::Io(TransferIoError::IdleTimeout))
+        );
+    }
+    let (owner, mut control) = control()?;
+    owner.send(true)?;
+    let mut reader = std::io::Cursor::new(&bytes);
+    assert_eq!(
+        read_transfer_record(&mut reader, &mut control).await,
+        Err(TransferRecordError::Io(TransferIoError::Cancelled))
+    );
+    assert_eq!(reader.position(), 0);
+    owner.send(false)?;
+    drop(owner);
+    assert_eq!(
+        read_transfer_record(&mut reader, &mut control).await,
+        Err(TransferRecordError::Io(TransferIoError::Cancelled))
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_partial_record_reads_reset_the_idle_deadline() -> TestResult {
+    use tokio::io::AsyncWriteExt;
+    let record = TransferRecord::Manifest(manifest()?);
+    let bytes = encode_transfer_record(&record)?;
+    let (mut reader, mut writer) = tokio::io::duplex(1);
+    let (_owner, mut control) = control()?;
+    let before = tokio::time::Instant::now();
+    let send = async {
+        for chunk in bytes.chunks(7) {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            writer.write_all(chunk).await?;
+        }
+        writer.shutdown().await
+    };
+    let (result, sent) = tokio::join!(read_transfer_record(&mut reader, &mut control), send);
+    sent?;
+    assert_eq!(result?, record);
+    assert!(before.elapsed() > std::time::Duration::from_secs(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_record_read_is_cancelled_and_joined_by_its_owner() -> TestResult {
+    let (mut reader, _writer) = tokio::io::duplex(1);
+    let (owner, mut control) = control()?;
+    let mut read = std::pin::pin!(read_transfer_record(&mut reader, &mut control));
+    tokio::select! {
+        biased;
+        result = read.as_mut() => return Err(format!("record read unexpectedly returned {result:?}").into()),
+        () = std::future::ready(()) => {}
+    }
+    owner.send(true)?;
+    assert_eq!(
+        read.await,
+        Err(TransferRecordError::Io(TransferIoError::Cancelled))
+    );
+    Ok(())
+}

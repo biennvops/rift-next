@@ -4,6 +4,9 @@ use rift_core::{DeviceId, SourcePath, TransferId};
 use rift_protocol::{TransferMetadata, TransferTerminalStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::{AttemptControl, TransferIoError};
 
 /// Maximum Postcard payload length for any manifest or monotonic marker.
 pub const MAX_TRANSFER_RECORD_PAYLOAD_LEN: usize = 8 * 1024;
@@ -136,17 +139,8 @@ pub fn encode_transfer_record(record: &TransferRecord) -> Result<Vec<u8>, Transf
 /// read an untrusted file to an unbounded Vec before invoking this function.
 pub fn decode_transfer_record(bytes: &[u8]) -> Result<TransferRecord, TransferRecordError> {
     let header = bytes.get(..HEADER_LEN).ok_or(TransferRecordError::Length)?;
-    if &header[..8] != MAGIC {
-        return Err(TransferRecordError::Magic);
-    }
-    if u16::from_be_bytes([header[8], header[9]]) != VERSION {
-        return Err(TransferRecordError::Version);
-    }
-    let length = u32::from_be_bytes([header[10], header[11], header[12], header[13]]) as usize;
-    if length > MAX_TRANSFER_RECORD_PAYLOAD_LEN {
-        return Err(TransferRecordError::TooLarge);
-    }
-    if length == 0 || bytes.len() != HEADER_LEN + length + CHECKSUM_LEN {
+    let length = payload_length(header)?;
+    if bytes.len() != HEADER_LEN + length + CHECKSUM_LEN {
         return Err(TransferRecordError::Length);
     }
     let checksum_start = HEADER_LEN + length;
@@ -161,9 +155,78 @@ pub fn decode_transfer_record(bytes: &[u8]) -> Result<TransferRecord, TransferRe
     Ok(record)
 }
 
+fn payload_length(header: &[u8]) -> Result<usize, TransferRecordError> {
+    if &header[..8] != MAGIC {
+        return Err(TransferRecordError::Magic);
+    }
+    if u16::from_be_bytes([header[8], header[9]]) != VERSION {
+        return Err(TransferRecordError::Version);
+    }
+    let length = u32::from_be_bytes([header[10], header[11], header[12], header[13]]) as usize;
+    if length > MAX_TRANSFER_RECORD_PAYLOAD_LEN {
+        return Err(TransferRecordError::TooLarge);
+    }
+    if length == 0 {
+        return Err(TransferRecordError::Length);
+    }
+    Ok(length)
+}
+
+/// Reads exactly one bounded record from an already-open private state file.
+///
+/// Header limits are checked before allocating or reading the body. At most one
+/// extra byte is read to reject trailing file contents. Cancellation or a partial
+/// read error invalidates this operation: restart only after seeking/reopening the
+/// file, not at the interrupted cursor. Each partial read resets the idle deadline.
+///
+/// The caller must validate that the handle is a regular private file, reject
+/// symlinks/nonregular state entries, enforce store record counts, and own/join
+/// the work. This routine opens no paths and grants no recovery authorization.
+pub async fn read_transfer_record<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    control: &mut AttemptControl,
+) -> Result<TransferRecord, TransferRecordError> {
+    let mut header = [0; HEADER_LEN];
+    read_record_bytes(reader, &mut header, control).await?;
+    let length = payload_length(&header)?;
+    let mut bytes = vec![0; HEADER_LEN + length + CHECKSUM_LEN];
+    bytes[..HEADER_LEN].copy_from_slice(&header);
+    read_record_bytes(reader, &mut bytes[HEADER_LEN..], control).await?;
+    let mut extra = [0];
+    let count = control
+        .step(reader.read(&mut extra))
+        .await?
+        .map_err(|error| TransferIoError::LocalIo(error.kind()))?;
+    if count != 0 {
+        return Err(TransferRecordError::Length);
+    }
+    decode_transfer_record(&bytes)
+}
+
+async fn read_record_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut bytes: &mut [u8],
+    control: &mut AttemptControl,
+) -> Result<(), TransferRecordError> {
+    while !bytes.is_empty() {
+        let count = control
+            .step(reader.read(bytes))
+            .await?
+            .map_err(|error| TransferIoError::LocalIo(error.kind()))?;
+        if count == 0 {
+            return Err(TransferRecordError::Length);
+        }
+        bytes = &mut bytes[count..];
+    }
+    Ok(())
+}
+
 /// Fail-closed private record errors, without raw payload bytes or path diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum TransferRecordError {
+    /// Local file I/O, cancellation, or the per-read idle deadline failed.
+    #[error("transfer record read failed: {0}")]
+    Io(#[from] TransferIoError),
     /// An incomplete, empty, or incorrectly sized complete envelope.
     #[error("transfer record length mismatch")]
     Length,
