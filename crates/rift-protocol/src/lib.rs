@@ -6,7 +6,7 @@
 
 use std::{fmt, io, time::Duration};
 
-use rift_core::DeviceId;
+use rift_core::{DeviceId, TransferId};
 pub use rift_core::{MAX_DEVICE_NAME_LEN, MAX_PLATFORM_LEN};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -16,11 +16,17 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
+mod data;
 mod transfer;
 
+pub use data::{
+    DataHeaderError, DataStreamHeader, MAX_DATA_STREAM_HEADER_LEN, decode_data_header,
+    encode_data_header, read_data_header, write_data_header,
+};
+
 pub use transfer::{
-    MAX_TRANSFER_BYTES, MAX_TRANSFER_FILE_NAME_LEN, TransferFileName, TransferMetadata,
-    TransferMetadataError,
+    MAX_TRANSFER_BYTES, MAX_TRANSFER_FILE_NAME_LEN, TransferFailureCode, TransferFileName,
+    TransferMetadata, TransferMetadataError, TransferTerminalStatus,
 };
 
 /// The production Rift protocol version.
@@ -444,6 +450,32 @@ pub enum ControlMessage {
     ConnectionIntent { purpose: ConnectionPurpose },
     /// Coarse admission result; never carries the remote trust database reason.
     ConnectionIntentResult { accepted: bool },
+    /// Offers immutable file metadata; never carries file bytes or a source path.
+    TransferOffer {
+        /// The logical transfer, stable across connection replacement.
+        transfer_id: TransferId,
+        /// The immutable file description.
+        metadata: TransferMetadata,
+    },
+    /// Announces durable local acceptance and a receiver-authoritative offset.
+    TransferAccept {
+        /// The accepted logical transfer.
+        transfer_id: TransferId,
+        /// The durable partial-file length; checked against metadata by the runtime.
+        offset: u64,
+    },
+    /// A replayable terminal outcome, persisted before transmission.
+    TransferTerminal {
+        /// The terminal logical transfer.
+        transfer_id: TransferId,
+        /// A coarse outcome without local filesystem details.
+        status: TransferTerminalStatus,
+    },
+    /// Acknowledges a terminal outcome so durable protocol state can be settled.
+    TransferTerminalAck {
+        /// The settled logical transfer.
+        transfer_id: TransferId,
+    },
 }
 
 impl ControlMessage {
@@ -460,6 +492,10 @@ impl ControlMessage {
             Self::PairingReveal { .. } => MessageKind::PairingReveal,
             Self::ConnectionIntent { .. } => MessageKind::ConnectionIntent,
             Self::ConnectionIntentResult { .. } => MessageKind::ConnectionIntentResult,
+            Self::TransferOffer { .. } => MessageKind::TransferOffer,
+            Self::TransferAccept { .. } => MessageKind::TransferAccept,
+            Self::TransferTerminal { .. } => MessageKind::TransferTerminal,
+            Self::TransferTerminalAck { .. } => MessageKind::TransferTerminalAck,
         }
     }
 
@@ -602,6 +638,14 @@ pub enum MessageKind {
     ConnectionIntent,
     /// A coarse connection purpose result.
     ConnectionIntentResult,
+    /// An immutable single-file offer.
+    TransferOffer,
+    /// A durable acceptance and resume offset.
+    TransferAccept,
+    /// A terminal transfer outcome.
+    TransferTerminal,
+    /// A terminal outcome acknowledgement.
+    TransferTerminalAck,
 }
 
 impl fmt::Display for MessageKind {
@@ -617,6 +661,10 @@ impl fmt::Display for MessageKind {
             Self::PairingReveal => "PairingReveal",
             Self::ConnectionIntent => "ConnectionIntent",
             Self::ConnectionIntentResult => "ConnectionIntentResult",
+            Self::TransferOffer => "TransferOffer",
+            Self::TransferAccept => "TransferAccept",
+            Self::TransferTerminal => "TransferTerminal",
+            Self::TransferTerminalAck => "TransferTerminalAck",
         };
         formatter.write_str(name)
     }
@@ -1112,6 +1160,25 @@ mod tests {
         alpn_hex: String,
         vectors: Vec<ConformanceVector>,
         pairing_code_vectors: Vec<PairingCodeVector>,
+        data_header_vectors: Vec<DataHeaderVector>,
+    }
+
+    #[derive(Deserialize)]
+    struct DataHeaderVector {
+        name: String,
+        message: HeaderVectorMessage,
+        postcard_payload_hex: String,
+        frame_hex: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum HeaderVectorMessage {
+        BlobV1 {
+            transfer_id_hex: String,
+            offset: u64,
+            remaining_len: u64,
+        },
     }
 
     #[derive(Deserialize)]
@@ -1176,6 +1243,23 @@ mod tests {
         ConnectionIntentResult {
             accepted: bool,
         },
+        TransferOffer {
+            transfer_id_hex: String,
+            file_name: String,
+            byte_len: u64,
+            blake3_hex: String,
+        },
+        TransferAccept {
+            transfer_id_hex: String,
+            offset: u64,
+        },
+        TransferTerminal {
+            transfer_id_hex: String,
+            status: TransferTerminalStatus,
+        },
+        TransferTerminalAck {
+            transfer_id_hex: String,
+        },
     }
 
     fn vector_bytes<const LENGTH: usize>(value: &str) -> Result<[u8; LENGTH], String> {
@@ -1216,6 +1300,38 @@ mod tests {
             VectorMessage::ConnectionIntentResult { accepted } => {
                 ControlMessage::ConnectionIntentResult { accepted }
             }
+            VectorMessage::TransferOffer {
+                transfer_id_hex,
+                file_name,
+                byte_len,
+                blake3_hex,
+            } => ControlMessage::TransferOffer {
+                transfer_id: transfer_id_hex.parse()?,
+                metadata: TransferMetadata::new(
+                    TransferFileName::new(&file_name)?,
+                    byte_len,
+                    vector_bytes(&blake3_hex)?,
+                )?,
+            },
+            VectorMessage::TransferAccept {
+                transfer_id_hex,
+                offset,
+            } => ControlMessage::TransferAccept {
+                transfer_id: transfer_id_hex.parse()?,
+                offset,
+            },
+            VectorMessage::TransferTerminal {
+                transfer_id_hex,
+                status,
+            } => ControlMessage::TransferTerminal {
+                transfer_id: transfer_id_hex.parse()?,
+                status,
+            },
+            VectorMessage::TransferTerminalAck { transfer_id_hex } => {
+                ControlMessage::TransferTerminalAck {
+                    transfer_id: transfer_id_hex.parse()?,
+                }
+            }
             VectorMessage::Ping { nonce } => ControlMessage::Ping { nonce },
             VectorMessage::Pong { nonce } => ControlMessage::Pong { nonce },
             VectorMessage::PairingRequest {
@@ -1251,6 +1367,32 @@ mod tests {
             },
         };
         Ok(message)
+    }
+
+    #[test]
+    fn all_m1_m5_vector_objects_remain_byte_for_byte_unchanged()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let baseline = include_str!("../tests/fixtures/v1-m5-vectors.json");
+        let current = include_str!("../../../docs/protocol/v1-vectors.json");
+        let prefix = baseline
+            .split_once("\n  ],\n  \"pairing_code_vectors\"")
+            .ok_or("missing baseline vector boundary")?
+            .0;
+        assert!(current.starts_with(prefix));
+        let old: serde_json::Value = serde_json::from_str(baseline)?;
+        let new: serde_json::Value = serde_json::from_str(current)?;
+        let old_pairing = baseline
+            .split_once("\"pairing_code_vectors\": ")
+            .ok_or("missing baseline pairing vectors")?
+            .1
+            .trim_end();
+        let old_pairing = old_pairing
+            .strip_suffix('}')
+            .ok_or("missing baseline terminator")?
+            .trim_end();
+        assert!(current.contains(old_pairing));
+        assert_eq!(old["pairing_code_vectors"], new["pairing_code_vectors"]);
+        Ok(())
     }
 
     #[test]
@@ -1290,6 +1432,32 @@ mod tests {
                 vector.name
             );
             assert_eq!(decode_message(&frame)?, message, "{} decode", vector.name);
+        }
+        for vector in vectors.data_header_vectors {
+            let HeaderVectorMessage::BlobV1 {
+                transfer_id_hex,
+                offset,
+                remaining_len,
+            } = vector.message;
+            let header = DataStreamHeader::BlobV1 {
+                transfer_id: transfer_id_hex.parse()?,
+                offset,
+                remaining_len,
+            };
+            let frame = encode_data_header(&header)?;
+            assert_eq!(
+                hex::encode(&frame[4..]),
+                vector.postcard_payload_hex,
+                "{} payload",
+                vector.name
+            );
+            assert_eq!(
+                hex::encode(&frame),
+                vector.frame_hex,
+                "{} frame",
+                vector.name
+            );
+            assert_eq!(decode_data_header(&frame)?, header);
         }
         for vector in vectors.pairing_code_vectors {
             let initiator_device_id =

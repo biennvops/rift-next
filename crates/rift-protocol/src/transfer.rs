@@ -153,9 +153,170 @@ pub enum TransferMetadataError {
     FileTooLarge,
 }
 
+/// Replayable terminal outcomes. Variant order is part of protocol v1.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TransferTerminalStatus {
+    /// Exact length/hash verified and the received file durably published.
+    Completed,
+    /// The receiver declined the offer.
+    Rejected,
+    /// Either peer cancelled the logical transfer.
+    Cancelled,
+    /// A nonretryable transfer failure, without local diagnostic details.
+    Failed(TransferFailureCode),
+}
+
+/// Stable coarse failures. Variant order is part of protocol v1.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TransferFailureCode {
+    /// The received content did not match the immutable digest.
+    Integrity,
+    /// The sender's file no longer matched the immutable metadata.
+    SourceChanged,
+    /// A local I/O operation failed.
+    Io,
+    /// A bounded resource could not be acquired.
+    Resource,
+    /// The transfer violated its framing or sequencing contract.
+    Protocol,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn messages() -> Result<Vec<crate::ControlMessage>, TransferMetadataError> {
+        use crate::ControlMessage;
+        let transfer_id = rift_core::TransferId::from_bytes([0x12; 16]);
+        let mut messages = vec![
+            ControlMessage::TransferOffer {
+                transfer_id,
+                metadata: TransferMetadata::new(
+                    TransferFileName::new("file.txt")?,
+                    65536,
+                    [0xab; 32],
+                )?,
+            },
+            ControlMessage::TransferAccept {
+                transfer_id,
+                offset: 0,
+            },
+            ControlMessage::TransferAccept {
+                transfer_id,
+                offset: 32768,
+            },
+            ControlMessage::TransferTerminalAck { transfer_id },
+        ];
+        for status in [
+            TransferTerminalStatus::Completed,
+            TransferTerminalStatus::Rejected,
+            TransferTerminalStatus::Cancelled,
+            TransferTerminalStatus::Failed(TransferFailureCode::Integrity),
+            TransferTerminalStatus::Failed(TransferFailureCode::SourceChanged),
+            TransferTerminalStatus::Failed(TransferFailureCode::Io),
+            TransferTerminalStatus::Failed(TransferFailureCode::Resource),
+            TransferTerminalStatus::Failed(TransferFailureCode::Protocol),
+        ] {
+            messages.push(ControlMessage::TransferTerminal {
+                transfer_id,
+                status,
+            });
+        }
+        Ok(messages)
+    }
+
+    #[tokio::test]
+    async fn transfer_messages_are_not_pairing_and_round_trip_one_frame_at_a_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::*;
+        for message in messages()? {
+            let (discriminant, name) = match &message {
+                ControlMessage::TransferOffer { .. } => (10, "TransferOffer"),
+                ControlMessage::TransferAccept { .. } => (11, "TransferAccept"),
+                ControlMessage::TransferTerminal { .. } => (12, "TransferTerminal"),
+                ControlMessage::TransferTerminalAck { .. } => (13, "TransferTerminalAck"),
+                _ => return Err("unexpected fixture message".into()),
+            };
+            let mut wire = encode_message(&message)?;
+            assert_eq!(wire[4], discriminant);
+            assert_eq!(message.kind().to_string(), name);
+            assert_eq!(message.clone().into_pairing(), Err(message.kind()));
+            assert_eq!(decode_message(&wire)?, message);
+            let mut written = Vec::new();
+            write_message(&mut written, &message).await?;
+            assert_eq!(written, wire);
+            wire.extend_from_slice(&encode_message(&ControlMessage::Ping { nonce: 42 })?);
+            let mut reader = wire.as_slice();
+            assert_eq!(read_message(&mut reader).await?, message);
+            assert_eq!(
+                read_message(&mut reader).await?,
+                ControlMessage::Ping { nonce: 42 }
+            );
+            assert!(reader.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_and_trailing_transfer_messages_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for message in messages()? {
+            let payload = postcard::to_stdvec(&message)?;
+            for length in 0..payload.len() {
+                let mut wire = (length as u32).to_be_bytes().to_vec();
+                wire.extend_from_slice(&payload[..length]);
+                assert!(crate::decode_message(&wire).is_err());
+            }
+            let mut wire = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            wire.push(0);
+            assert!(matches!(
+                crate::decode_message(&wire),
+                Err(crate::FrameError::TrailingPayload { remaining: 1 })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_terminal_failure_and_message_discriminants_are_rejected() {
+        let mut terminal = vec![12];
+        terminal.extend_from_slice(&[0; 16]);
+        for suffix in [&[4][..], &[3, 5], &[3, 255], &[255]] {
+            let mut payload = terminal.clone();
+            payload.extend_from_slice(suffix);
+            let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            assert!(matches!(
+                crate::decode_message(&wire),
+                Err(crate::FrameError::Decode(_))
+            ));
+        }
+        assert!(matches!(
+            crate::decode_message(&[0, 0, 0, 1, 14]),
+            Err(crate::FrameError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn raw_offer_cannot_bypass_metadata_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        for (name, length) in [
+            ("a".repeat(256), 0_u64),
+            ("../escape".to_owned(), 0),
+            ("a".to_owned(), MAX_TRANSFER_BYTES + 1),
+        ] {
+            let mut payload = vec![10];
+            payload.extend_from_slice(&[0; 16]);
+            payload.extend_from_slice(&postcard::to_stdvec(&(name, length, [0_u8; 32]))?);
+            let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            assert!(matches!(
+                crate::decode_message(&wire),
+                Err(crate::FrameError::Decode(_))
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn portable_names_and_utf8_byte_boundary() -> Result<(), Box<dyn std::error::Error>> {
