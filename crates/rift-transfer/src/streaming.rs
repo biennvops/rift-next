@@ -37,7 +37,10 @@ impl AttemptControl {
         })
     }
 
-    async fn step<F, T>(&mut self, operation: F) -> Result<io::Result<T>, TransferIoError>
+    pub(crate) async fn step<F, T>(
+        &mut self,
+        operation: F,
+    ) -> Result<io::Result<T>, TransferIoError>
     where
         F: Future<Output = io::Result<T>>,
     {

@@ -101,3 +101,17 @@ Engine success is not durable completion. Its caller must still own authorizatio
 acceptance, worker capacity/generation, shutdown/reset, joined work, partial-file
 flush/sync, and cleanup or atomic publication. Those runtime responsibilities and
 related race/recovery tests are not implemented by this checkpoint.
+
+Source preparation now validates the already-open handle as a regular file and checks
+configured size before hashing. Core's `SourcePath` bounds local paths to 4096 UTF-8
+bytes, rejects NUL/nonabsolute/non-UTF-8 input, and always redacts Debug. Its Serde
+representation is intentionally local-only for authenticated IPC/private manifests;
+it is not a field of any network message. Native absolute-path syntax is evaluated
+on the local platform, with no filesystem access or lossy path conversion.
+
+The preparation helper does not open paths. The runtime must acquire a read-only
+handle under owned, bounded preparation work and ensure it corresponds to the supplied
+path. Checking a path's type before opening is not sufficient to prevent replacement
+with a special file; the future platform-specific opener still needs that failure-path
+coverage. Successful preparation is not authorization, a stable source snapshot,
+or permission to offer before persisting immutable metadata.

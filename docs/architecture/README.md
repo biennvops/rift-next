@@ -25,7 +25,7 @@ rift-core           rift-trust   rift-protocol
 Crate responsibilities are:
 
 ```text
-rift-core             platform-independent identity and trust domain types
+rift-core             identity/trust domain types and bounded local source-path values
 rift-protocol         bounded production network v1 and pairing transcript
 rift-transfer         transport-independent fixed-buffer hashing and payload mechanics
 rift-transport-iroh   authenticated Iroh endpoint/control integration

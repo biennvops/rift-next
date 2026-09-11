@@ -2,14 +2,18 @@
 //!
 //! Cryptographic device identity is represented by [`DeviceId`]. Durable trust
 //! decisions use that identity as their only key. These types contain no transport,
-//! operating-system, or secret-key storage details.
+//! secret-key storage details. Local source paths are lexically validated using
+//! native path syntax without filesystem access.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod source_path;
 mod transfer_id;
+
+pub use source_path::{MAX_SOURCE_PATH_LEN, SourcePath, SourcePathError};
 
 pub use transfer_id::{TRANSFER_ID_LEN, TransferId, TransferIdError};
 
