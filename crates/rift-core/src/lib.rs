@@ -9,6 +9,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod transfer_id;
+
+pub use transfer_id::{TRANSFER_ID_LEN, TransferId, TransferIdError};
+
 /// The byte length of a Rift device identity.
 pub const DEVICE_ID_LEN: usize = 32;
 
