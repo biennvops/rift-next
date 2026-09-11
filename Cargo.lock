@@ -2883,6 +2883,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-transfer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "rift-core",
+ "rift-protocol",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "rift-transport-iroh"
 version = "0.1.0"
 dependencies = [

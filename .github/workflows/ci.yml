@@ -61,6 +61,7 @@ jobs:
           cargo test --all-features
           -p rift-core
           -p rift-protocol
+          -p rift-transfer
           -p rift-transport-iroh
           -p rift-trust
           -p rift-session
@@ -82,6 +83,7 @@ jobs:
           cargo test --all-features
           -p rift-core
           -p rift-protocol
+          -p rift-transfer
           -p rift-transport-iroh
           -p rift-trust
           -p rift-session

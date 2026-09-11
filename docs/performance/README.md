@@ -106,3 +106,26 @@ encode/decode round trip and its frame size. It uses the same iteration argument
 M4 ListPeers JSON baseline. Report old/new metrics separately: M5-only paths have no M4
 implementation against which to claim a speedup. Keep power/load/compiler/profile and
 all benchmark parameters with the result. No new benchmark dependency is required.
+
+## M6 streaming-engine checkpoint measurements
+
+Until the daemon transfer runtime exists, `benchmark-smoke` additionally runs an
+**engine-only**, non-QUIC measurement:
+
+```bash
+cargo test --locked -p rift-transfer --lib streaming_benchmark -- --ignored --nocapture
+cargo test --locked --release -p rift-transfer --lib streaming_benchmark -- --ignored --nocapture
+```
+
+It creates an 8 MiB zero-filled source with a fixed 64 KiB buffer, measures a separate
+whole-source prehash, then sends through a bounded 64 KiB Tokio duplex stream into a
+real temporary file at offsets 0 and 4 MiB. It reports separate prefix-rehash and
+sync times. `attempt_with_revalidation_seconds` includes the sender's mandatory
+whole-source revalidation, prefix rehashing on both sides, suffix I/O, and integrity
+verification. It is deliberately **not** labeled payload-only throughput, a daemon
+transfer benchmark, atomic-publication time, or a Prototype 0 comparison. Normal tests
+also run a synthetic 64 MiB stream that records every I/O buffer request size.
+
+The planned matched production-vs-Prototype 0 and durable-resume measurements remain
+required when the runtime exists. Do not substitute this engine-only fixture for
+those end-to-end measurements. No timing thresholds are enforced.

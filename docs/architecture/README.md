@@ -27,6 +27,7 @@ Crate responsibilities are:
 ```text
 rift-core             platform-independent identity and trust domain types
 rift-protocol         bounded production network v1 and pairing transcript
+rift-transfer         transport-independent fixed-buffer hashing and payload mechanics
 rift-transport-iroh   authenticated Iroh endpoint/control integration
 rift-trust            durable identity-keyed trust/revocation journal
 rift-session          pairing state machine and authorization boundary
@@ -41,6 +42,7 @@ The permitted internal production dependency direction is:
 
 ```text
 rift-protocol       -> rift-core
+rift-transfer       -> rift-core, rift-protocol
 rift-transport-iroh -> rift-core, rift-protocol
 rift-trust          -> rift-core
 rift-session        -> rift-core, rift-protocol, rift-transport-iroh, rift-trust
@@ -49,6 +51,12 @@ rift-ipc            -> rift-core
 rift-daemon         -> rift-core, rift-identity, rift-ipc, rift-session,
                        rift-transport-iroh, rift-trust
 ```
+
+The M6 transfer mechanics are a foundation only: no daemon/runtime integration or
+durable store is implemented yet. `rift-transfer` has no dependency or transitive
+reachability to Iroh, transport, session, trust, identity, IPC, daemon, or Prototype 0.
+Other lower production crates cannot reach upward into transfer. Its generic Tokio
+I/O functions spawn no work and confer no authorization, acceptance, or publication.
 
 `rift-identity` and `rift-transport-iroh` are the only production crates with a direct Iroh
 dependency, exactly pinned to `=1.0.3`. `rift-identity` owns storage only; endpoint creation

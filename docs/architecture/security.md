@@ -81,3 +81,23 @@ them.
 
 A change affecting an invariant needs targeted failure-path coverage. Aggregate coverage
 and green CI do not by themselves prove that an invariant holds.
+
+## M6 streaming foundation checkpoint
+
+The new protocol codecs and transfer mechanics do not enable application admission.
+Blob capability remains unadvertised until the daemon runtime and durable recovery
+exist. Transfer messages are rejected by pairing-only conversion; existing authorized
+sessions still reject unsolicited transfer traffic rather than dispatching it.
+
+The transfer engine never chooses paths, opens network streams, spawns workers,
+publishes outputs, or records Completed. Hashing, sends, and receives request at most
+64 KiB per payload I/O. Per-operation cancellation/idle checks and cooperative budget
+consumption prevent an always-ready synthetic source from monopolizing the worker.
+Source revalidation and receive-prefix rehashing bind each successful attempt to the
+whole immutable digest. Stream reset, short clean FIN, extra bytes, local I/O failure,
+and hash mismatch remain distinct results.
+
+Engine success is not durable completion. Its caller must still own authorization,
+acceptance, worker capacity/generation, shutdown/reset, joined work, partial-file
+flush/sync, and cleanup or atomic publication. Those runtime responsibilities and
+related race/recovery tests are not implemented by this checkpoint.

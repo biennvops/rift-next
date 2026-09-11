@@ -8,6 +8,7 @@ members = [
     "crates/rift-protocol",
     "crates/rift-session",
     "crates/rift-spike",
+    "crates/rift-transfer",
     "crates/rift-transport-iroh",
     "crates/rift-trust",
     "xtask",
