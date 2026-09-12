@@ -10,5 +10,9 @@ hex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+postcard.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -2778,7 +2778,9 @@ name = "rift-core"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "postcard",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -2878,6 +2880,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rift-transfer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "postcard",
+ "rift-core",
+ "rift-protocol",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

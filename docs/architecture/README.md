@@ -25,8 +25,9 @@ rift-core           rift-trust   rift-protocol
 Crate responsibilities are:
 
 ```text
-rift-core             platform-independent identity and trust domain types
+rift-core             identity/trust domain types and bounded local source-path values
 rift-protocol         bounded production network v1 and pairing transcript
+rift-transfer         transport-independent fixed-buffer hashing and payload mechanics
 rift-transport-iroh   authenticated Iroh endpoint/control integration
 rift-trust            durable identity-keyed trust/revocation journal
 rift-session          pairing state machine and authorization boundary
@@ -41,6 +42,7 @@ The permitted internal production dependency direction is:
 
 ```text
 rift-protocol       -> rift-core
+rift-transfer       -> rift-core, rift-protocol
 rift-transport-iroh -> rift-core, rift-protocol
 rift-trust          -> rift-core
 rift-session        -> rift-core, rift-protocol, rift-transport-iroh, rift-trust
@@ -49,6 +51,12 @@ rift-ipc            -> rift-core
 rift-daemon         -> rift-core, rift-identity, rift-ipc, rift-session,
                        rift-transport-iroh, rift-trust
 ```
+
+The M6 transfer mechanics are a foundation only: no daemon/runtime integration or
+durable store is implemented yet. `rift-transfer` has no dependency or transitive
+reachability to Iroh, transport, session, trust, identity, IPC, daemon, or Prototype 0.
+Other lower production crates cannot reach upward into transfer. Its generic Tokio
+I/O functions spawn no work and confer no authorization, acceptance, or publication.
 
 `rift-identity` and `rift-transport-iroh` are the only production crates with a direct Iroh
 dependency, exactly pinned to `=1.0.3`. `rift-identity` owns storage only; endpoint creation
@@ -154,3 +162,25 @@ See [daemon runtime](../daemon/runtime.md), [IPC v1](../ipc/v1.md), and ADRs 000
 
 See [security invariants](security.md), [deferred decisions](deferred.md), and accepted
 [architecture decisions](../adr/).
+
+## M6 logical sequencing foundation
+
+`rift-transfer::LogicalTransfer` owns one immutable `(DeviceId, TransferId, metadata)`
+and an explicit sender/receiver state. It handles offer/accept sequencing, duplicate
+offer decisions, exclusive data attempts, verification-before-completion, pause/reoffer,
+local terminal replay, peer terminal settlement, and acknowledgement. Every transition
+returns a typed error rather than silently repairing illegal state.
+
+Attempt generations are checked without wrapping. Pause invalidates old results before
+a replacement attempt can be registered. Successful receive verification, publication
+completion, and worker failures must carry the current generation. These local checks do
+not replace the daemon's canonical SessionId/trust-generation fences or its obligation
+to cancel and join the old worker before reusing resources.
+
+Methods named `*_persisted` are post-durability state transitions, not disk writes. The
+owner must validate the proposed transition and persist under its mutation/generation
+boundary before exposing it or sending the corresponding control message. No durable
+store, recovery constructor, daemon registry, authenticated data wrapper, or transfer IPC
+is implemented yet. A pending incoming decision survives connection loss without
+becoming accepted. A paused accepted receiver needs its actual durable partial length
+reconciled before restarting; sender byte counters never decide resume offset.

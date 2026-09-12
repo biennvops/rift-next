@@ -81,3 +81,73 @@ them.
 
 A change affecting an invariant needs targeted failure-path coverage. Aggregate coverage
 and green CI do not by themselves prove that an invariant holds.
+
+## M6 streaming foundation checkpoint
+
+The new protocol codecs and transfer mechanics do not enable application admission.
+Blob capability remains unadvertised until the daemon runtime and durable recovery
+exist. Transfer messages are rejected by pairing-only conversion; existing authorized
+sessions still reject unsolicited transfer traffic rather than dispatching it.
+
+The transfer engine never chooses paths, opens network streams, spawns workers,
+publishes outputs, or records Completed. Hashing, sends, and receives request at most
+64 KiB per payload I/O. Per-operation cancellation/idle checks and cooperative budget
+consumption prevent an always-ready synthetic source from monopolizing the worker.
+Source revalidation and receive-prefix rehashing bind each successful attempt to the
+whole immutable digest. Stream reset, short clean FIN, extra bytes, local I/O failure,
+and hash mismatch remain distinct results.
+
+Engine success is not durable completion. Its caller must still own authorization,
+acceptance, worker capacity/generation, shutdown/reset, joined work, partial-file
+flush/sync, and cleanup or atomic publication. Those runtime responsibilities and
+related race/recovery tests are not implemented by this checkpoint.
+
+Source preparation now validates the already-open handle as a regular file and checks
+configured size before hashing. Core's `SourcePath` bounds local paths to 4096 UTF-8
+bytes, rejects NUL/nonabsolute/non-UTF-8 input, and always redacts Debug. Its Serde
+representation is intentionally local-only for authenticated IPC/private manifests;
+it is not a field of any network message. Native absolute-path syntax is evaluated
+on the local platform, with no filesystem access or lossy path conversion.
+
+The preparation helper does not open paths. The runtime must acquire a read-only
+handle under owned, bounded preparation work and ensure it corresponds to the supplied
+path. Checking a path's type before opening is not sufficient to prevent replacement
+with a special file; the future platform-specific opener still needs that failure-path
+coverage. Successful preparation is not authorization, a stable source snapshot,
+or permission to offer before persisting immutable metadata.
+
+Logical transfer sequencing now rejects preacceptance data, wrong transfer IDs, impossible
+ranges, second simultaneous data attempts, conflicting immutable metadata, premature
+local completion/acknowledgement, wrong-role operations, and stale-generation results.
+Worker terminal failures must supply their generation just like successful verification.
+Terminal replay is monotonic and cannot turn a cancelled transfer into a completed one.
+These are deterministic in-memory state tests, not proof of durable acceptance, atomic
+publication, trust-race fencing, or cancellation/join behavior in a daemon runtime.
+
+Private transfer records now have an independent 8 KiB payload bound, strict versioned
+Postcard envelope, and BLAKE3 over header plus payload (ADR 0015). Marker digests bind the
+complete immutable manifest, and marker role checks keep acceptance/completion/rejection
+receiver-authoritative. Source paths remain redacted in Debug and codec errors; encoded
+manifest bytes intentionally contain them and must never be logged or sent remotely.
+Codec tests exercise malformed/truncated/oversized/unsupported inputs, every single-byte
+corruption position, validated-domain bypass attempts, marker substitution, and wrong
+roles. This does not implement bounded filesystem reads, atomic persistence, permissions,
+crash reconciliation, or trust-aware startup. Those remain separate mandatory tests.
+
+The already-open record reader now enforces the file byte-read bound itself. Tests prove
+oversized headers consume only 14 bytes, trailing content consumes at most one extra
+byte, and truncated/corrupt records fail closed. Header/body/EOF stalls time out; blocked
+reads observe cancellation; slow partial reads continue beyond the idle-timeout duration.
+The store must still safely open and validate private regular-file handles and bound
+record-directory enumeration before calling this helper.
+
+The read-only transfer store scanner enforces 4096 total / 64 per-peer durable records
+and at most three known files in each canonical ID directory. It returns no partial
+snapshot on corruption, invalid IDs/names/kinds, mismatched marker bindings, or inconsistent
+acceptance/completion/rejection. Unix mode/link-count checks and Windows reparse rejection
+apply before opening records; size checks precede bounded reads. It requires caller-owned
+private ancestors and no concurrent mutation, not adversarial same-user filesystem access.
+Tests exercise actual hard count limits, private mode failures, symlink/hardlink/nonregular
+entries, corrupted/truncated/oversized files, marker semantic failures, and cancellation.
+This snapshot is not authorization or proof of output integrity: trust and partial/final
+file reconciliation remain mandatory before daemon readiness and replay.
