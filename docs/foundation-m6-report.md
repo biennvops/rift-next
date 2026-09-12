@@ -1,6 +1,6 @@
 # Foundation Milestone 6 report
 
-## Status: partial private-record checkpoint — M6 is not complete
+## Status: partial read-only store checkpoint — M6 is not complete
 
 Base: `b02a77a1c5d671716566809c06373647a200b898`.
 Branch: `feat/foundation-m6-file-transfer`.
@@ -15,6 +15,7 @@ Implementation commits at this checkpoint:
 - `a009bf0`: explicit logical transfer sequencing and checked attempt generations.
 - `d60b6e4`: bounded checksummed manifests/markers and ADR 0015.
 - `4880a88`: bounded cancellable reads from already-open state-file handles.
+- `7b66d68`: bounded read-only private state snapshot validation.
 
 There is no final M6 implementation or merge candidate yet. The supplied untracked
 `PLAN.md` and `REVIEW.md` remain untouched. Dependency and CI changes specified by the
@@ -326,7 +327,7 @@ Logs:
 - `/tmp/rift-m6-state-coverage.log`
 - `/tmp/rift-m6-state-benchmark.log`
 
-## Private-record checkpoint verification
+## Private-record checkpoint verification (historical)
 
 Implementation SHA: `4880a88d37e72ba38011da8ec90320343f103184` (not final M6).
 Same pinned Rust 1.91.0 and local host as above; no hosted CI or Windows execution.
@@ -378,13 +379,65 @@ Logs:
 - `/tmp/rift-m6-record-reader-verify.log`
 - `/tmp/rift-m6-record-reader-coverage.log`
 
+## Read-only store checkpoint verification
+
+Implementation SHA: `7b66d68c543b3f596543557117dc50bf8c748f63` (not final M6).
+Same pinned Rust 1.91.0 and local host as earlier checkpoints. No dependency, CI,
+network/IPC vector, or capability advertisement changes in this implementation.
+
+`scan_transfer_state` incrementally validates an existing `transfers/state` directory,
+with hard bounds of 4096 total records, 64 per peer (including terminal receipts), and
+three known files per canonical transfer-ID directory. It checks record kind against
+filename, manifest ID against directory, marker bindings/roles, and incoming Completed
+requiring acceptance / Rejected prohibiting acceptance. The entire scan must pass before
+any bounded, ID-sorted `StoredTransfer` snapshot is returned.
+
+Unix directory/file permissions must be exactly 0700/0600. Symlinks, Windows reparse
+points, nonregular records, and Unix multiply-linked files fail closed. Size is checked
+before reading; the bounded codec reader checks framing, checksum, and exact EOF.
+Unix opened-file device/inode must match pre-open metadata. Private ancestors and
+exclusive mutation ownership are explicit caller preconditions; this is not a sandbox
+against concurrent same-user filesystem replacement. Every asynchronous filesystem step
+observes cancellation/idle control. The scanner performs no writes or repairs and opens
+no source or payload files.
+
+| Check | Result |
+| --- | --- |
+| `cargo xtask verify` | PASS |
+| New scanner tests | PASS: 9 |
+| Transfer unit tests | PASS: 58, plus one ignored benchmark |
+| `cargo xtask coverage` | PASS: **84.11%**, unchanged floor |
+| Scanner implementation line coverage | **97.59%** |
+| `git diff --check` | PASS |
+| Hosted CI / Windows execution | Not observed |
+
+Coverage reports 12,370 workspace lines / 1,965 missed. Tests exercise the actual hard
+4096-record and 64-per-peer boundaries, not reduced test-only capacities. They cover
+empty/sorted/pending/accepted/terminal snapshots, unchanged file contents, missing and
+noncanonical/unknown entries, wrong IDs/kinds/bindings, invalid acceptance/terminal
+combinations, corruption/truncation/oversized files, cancellation/owner loss, Unix mode
+failures, symlinks (including dangling links), hardlinks, and nonregular record entries.
+No scanner performance threshold or durable runtime benchmark is claimed.
+
+Logs:
+
+- `/tmp/rift-m6-store-scan-verify.log`
+- `/tmp/rift-m6-store-scan-coverage.log`
+
+This remains read-only structural validation, not startup recovery or permission to
+replay. Trust reconciliation, actual partial/final content validation, logical recovery,
+atomic no-overwrite writes, sync ordering, cleanup, and runtime wiring are still pending.
+Unknown temporary artifacts currently fail closed; the forthcoming atomic writer must
+define and test crash-artifact handling explicitly rather than silently skipping them.
+
 ## Outstanding plan execution
 
 All remaining M6 requirements still apply, notably:
 
-1. Implement the bounded durable store, accepted/terminal markers, recovery into the
-   logical state machine, safe runtime source opening, source identity generation/
-   collision handling, and storage failure-path tests.
+1. Implement atomic private store writes and accepted/terminal persistence, crash-artifact
+   handling, trust and partial/final reconciliation, recovery into the logical state
+   machine, safe runtime source opening, source identity generation/collision handling,
+   and storage failure-path tests. The bounded read-only scanner is implemented.
 2. Expose data streams only through authorized sessions; preserve the sole control
    owner and capability gating. The protocol codecs alone do not implement this API.
 3. Integrate the bounded daemon registry, preparation/data workers, commands/events,
