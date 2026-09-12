@@ -1370,29 +1370,52 @@ mod tests {
     }
 
     #[test]
-    fn all_m1_m5_vector_objects_remain_byte_for_byte_unchanged()
+    fn all_m1_m5_vector_objects_remain_unchanged()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let baseline = include_str!("../tests/fixtures/v1-m5-vectors.json");
         let current = include_str!("../../../docs/protocol/v1-vectors.json");
-        let prefix = baseline
-            .split_once("\n  ],\n  \"pairing_code_vectors\"")
-            .ok_or("missing baseline vector boundary")?
-            .0;
-        assert!(current.starts_with(prefix));
+        assert_legacy_vectors_unchanged(baseline, current)
+    }
+
+    fn assert_legacy_vectors_unchanged(
+        baseline: &str,
+        current: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let old: serde_json::Value = serde_json::from_str(baseline)?;
         let new: serde_json::Value = serde_json::from_str(current)?;
-        let old_pairing = baseline
-            .split_once("\"pairing_code_vectors\": ")
-            .ok_or("missing baseline pairing vectors")?
-            .1
-            .trim_end();
-        let old_pairing = old_pairing
-            .strip_suffix('}')
-            .ok_or("missing baseline terminator")?
-            .trim_end();
-        assert!(current.contains(old_pairing));
-        assert_eq!(old["pairing_code_vectors"], new["pairing_code_vectors"]);
+        let old_vectors = old
+            .get("vectors")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing baseline vectors")?;
+        let new_vectors = new
+            .get("vectors")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing current vectors")?;
+        assert!(
+            new_vectors.len() >= old_vectors.len(),
+            "current vector list is shorter than the M1-M5 baseline"
+        );
+        assert_eq!(
+            &new_vectors[..old_vectors.len()],
+            old_vectors.as_slice(),
+            "M1-M5 vector objects changed"
+        );
+        assert_eq!(
+            old.get("pairing_code_vectors")
+                .ok_or("missing baseline pairing vectors")?,
+            new.get("pairing_code_vectors")
+                .ok_or("missing current pairing vectors")?,
+            "M1-M5 pairing vector objects changed"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn legacy_vector_compatibility_accepts_windows_line_endings()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let baseline = include_str!("../tests/fixtures/v1-m5-vectors.json").replace('\n', "\r\n");
+        let current = include_str!("../../../docs/protocol/v1-vectors.json").replace('\n', "\r\n");
+        assert_legacy_vectors_unchanged(&baseline, &current)
     }
 
     #[test]
