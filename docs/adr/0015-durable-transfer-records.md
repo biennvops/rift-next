@@ -1,6 +1,6 @@
 # ADR 0015: Bounded private transfer records
 
-Status: Accepted (record encoding implemented; filesystem store and recovery pending)
+Status: Accepted (record encoding and read-only scan implemented; writes and recovery pending)
 
 ## Context
 
@@ -74,11 +74,43 @@ Checksums detect accidental corruption, not malicious local disk modification, a
 provide neither encryption nor authenticity. Unix private permissions and the existing
 Windows explicit data-directory ACL model remain mandatory for the future store.
 
-No filesystem operations, atomic creation, permission changes, durable markers, startup
-recovery, or daemon transfer capability are implemented by this format checkpoint.
+The initial format checkpoint did not implement filesystem operations. The read-only
+scan below adds validation, not atomic creation, permission changes, durable marker
+writes, startup recovery, or daemon transfer capability.
 
 The already-open-handle `read_transfer_record` helper implements the byte-read bound:
 read the fixed 14-byte header, validate it, allocate at most 8238 bytes, read the exact
 body/checksum, then probe at most one byte for EOF. Every partial read observes owner
 cancellation and resets its progress-idle deadline; there is no total timeout. This is
 not a safe path opener, regular-file/private-permission check, or directory scanner.
+
+## Read-only startup scan
+
+`scan_transfer_state` now validates an existing private `transfers/state` directory
+without creating, repairing, removing, or publishing anything. It incrementally enumerates
+at most 4096 canonical transfer-ID directories and admits at most 64 records per peer,
+including terminal receipts. Each directory may contain only `manifest`, `accepted`, and
+`terminal`; record kind must match its filename and manifest ID must match its directory.
+Unknown entries (including incomplete temporary artifacts) fail closed. The forthcoming
+atomic writer must define explicit crash-artifact handling before integration; the scanner
+does not silently discard state or treat a missing directory as an empty store.
+
+The scan validates marker binding/roles and additionally rejects incoming Completed
+without acceptance or incoming Rejected with acceptance. It returns a sorted bounded
+snapshot only after the entire scan succeeds. A `StoredTransfer` is structurally validated
+state, not an authorized transfer or proof that completed payload bytes exist or match.
+The daemon must reconcile trust and actual partial/final output before restoring the
+logical machine, publishing readiness, or sending any replay message.
+
+Unix directories and files must be exactly 0700 and 0600, respectively. Symbolic links,
+nonregular records, Windows reparse points, and Unix multiply-linked record files are
+rejected. File size is checked before reading, and the bounded reader independently
+checks framing and EOF. Unix opened-file device/inode must match pre-open metadata.
+The private ancestor directories and exclusive mutation ownership are caller preconditions:
+this does not make path-based opening safe against concurrent same-user filesystem
+replacement. Windows continues relying on the existing explicit directory ACL model.
+
+Every directory/file operation uses the owner's cancellation/idle control. There is no
+unbounded `collect` of directory entries, task spawning, path logging, source/payload
+opening, or upward dependency on daemon/session/trust. Filesystem writes, atomic persistence,
+payload reconciliation, and daemon startup integration are still pending.

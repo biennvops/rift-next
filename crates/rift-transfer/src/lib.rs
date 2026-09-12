@@ -13,7 +13,13 @@ pub use record::{
     encode_transfer_record, read_transfer_record,
 };
 mod state;
+mod store;
 mod streaming;
+
+pub use store::{
+    MAX_DURABLE_TRANSFERS, MAX_DURABLE_TRANSFERS_PER_PEER, StoredTransfer, TransferStoreError,
+    scan_transfer_state,
+};
 
 pub use source::{SourcePreparationError, prepare_source};
 pub use state::{

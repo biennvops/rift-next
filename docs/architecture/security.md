@@ -140,3 +140,14 @@ byte, and truncated/corrupt records fail closed. Header/body/EOF stalls time out
 reads observe cancellation; slow partial reads continue beyond the idle-timeout duration.
 The store must still safely open and validate private regular-file handles and bound
 record-directory enumeration before calling this helper.
+
+The read-only transfer store scanner enforces 4096 total / 64 per-peer durable records
+and at most three known files in each canonical ID directory. It returns no partial
+snapshot on corruption, invalid IDs/names/kinds, mismatched marker bindings, or inconsistent
+acceptance/completion/rejection. Unix mode/link-count checks and Windows reparse rejection
+apply before opening records; size checks precede bounded reads. It requires caller-owned
+private ancestors and no concurrent mutation, not adversarial same-user filesystem access.
+Tests exercise actual hard count limits, private mode failures, symlink/hardlink/nonregular
+entries, corrupted/truncated/oversized files, marker semantic failures, and cancellation.
+This snapshot is not authorization or proof of output integrity: trust and partial/final
+file reconciliation remain mandatory before daemon readiness and replay.
